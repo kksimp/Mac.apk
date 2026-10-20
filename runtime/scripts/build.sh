@@ -312,8 +312,8 @@ mkdir -p "$BIN/tools"
 # effort -- offline, the table-only fallback below still stages, loudly.
 if [[ ! -f "$FULL_FW_APK" && "${MACAPK_NO_FW_BUILD:-0}" != 1 ]]; then
     echo "[build] platform resource apk not built yet; building it from AOSP (android-16.0.0_r2) ..."
-    if ! "$RT_DIR/../scripts/build_framework_res.sh" --api 36 --tag android-16.0.0_r2 --version-name 16 \
-            > "$BUILD/framework-res-build.log" 2>&1; then
+    if ! ( "$RT_DIR/../scripts/build_framework_res.sh" --api 36 --tag android-16.0.0_r2 --version-name 16 \
+            > "$BUILD/framework-res-build.log" 2>&1 ); then
         echo "[build] WARN: scripts/build_framework_res.sh failed (see $BUILD/framework-res-build.log)"
     fi
 fi
@@ -321,7 +321,7 @@ if [[ -f "$FULL_FW_APK" ]]; then
     cp -f "$FULL_FW_APK" "$BIN/tools/framework-res.apk"
     echo "[build] staged bin/tools/framework-res.apk (FULL API-36 platform apk, $(du -h "$BIN/tools/framework-res.apk" | cut -f1))"
 else
-    APKTOOL_KEG_JAR="$(ls -t /opt/homebrew/Cellar/apktool/*/libexec/apktool_*.jar 2>/dev/null | head -1)"
+    APKTOOL_KEG_JAR="$( (ls -t /opt/homebrew/Cellar/apktool/*/libexec/apktool_*.jar 2>/dev/null || true) | head -1 )"
     if [[ -n "$APKTOOL_KEG_JAR" && -f "$APKTOOL_KEG_JAR" ]] \
        && unzip -p "$APKTOOL_KEG_JAR" prebuilt/android-framework.jar > "$BIN/tools/framework-res.apk.tmp" 2>/dev/null \
        && [[ -s "$BIN/tools/framework-res.apk.tmp" ]]; then
@@ -371,6 +371,11 @@ cmake --build . --target macapk-runtime -- -j
 
 echo "[build] Building APK stub dylib..."
 cmake --build . --target macapk-app-stub -- -j
+
+echo "[build] Building Skia Metal bridge..."
+cmake --build . --target macapk-skia-metal -- -j
+ditto libmacapk-skia-metal.dylib "$BIN/libmacapk-skia-metal.dylib"
+codesign --force --sign - "$BIN/libmacapk-skia-metal.dylib"
 
 # Stage with ditto, NEVER cp (v1.0.943 staleness lane). cp overwrites the
 # destination IN PLACE (same inode). macOS caches code-signature info by inode
@@ -485,6 +490,12 @@ for lib in libGLESv2.dylib libEGL.dylib libvulkan.dylib libMoltenVK.dylib; do
         ditto "$lib" "$BIN/$lib"
     fi
 done
+SKIA_DYLIB="$RT_DIR/../thirdparty/skia-prebuilt/lib/libskiko-macos-arm64.dylib"
+if [[ ! -f "$SKIA_DYLIB" ]]; then
+    echo "[build] ERROR: missing committed Skia AGSL runtime: $SKIA_DYLIB" >&2
+    exit 1
+fi
+ditto "$SKIA_DYLIB" "$BIN/libskiko-macos-arm64.dylib"
 if [[ -f MoltenVK_icd.json ]]; then
     cp MoltenVK_icd.json "$BIN/MoltenVK_icd.json"
 fi
@@ -668,6 +679,8 @@ sync_payload_into() {  # $1 = a launcher bundle's Contents dir
         "$BIN/libMoltenVK.dylib:Resources/libMoltenVK.dylib" \
         "$BIN/MoltenVK_icd.json:Resources/MoltenVK_icd.json" \
         "$BIN/macapk_default_icon.png:Resources/macapk_default_icon.png" \
+        "$BIN/libskiko-macos-arm64.dylib:Resources/libskiko-macos-arm64.dylib" \
+        "$BIN/libmacapk-skia-metal.dylib:Resources/libmacapk-skia-metal.dylib" \
         "$BIN/macapk-translator:bin/macapk-translator" \
         "$BIN/libmacapk-bionic-shim.dylib:bin/libmacapk-bionic-shim.dylib" \
         "$BIN/macapk-elfexec:bin/macapk-elfexec" \

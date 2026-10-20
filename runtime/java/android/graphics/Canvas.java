@@ -83,7 +83,7 @@ public class Canvas {
         BufferedImage layerImage;  // the offscreen layer drawn into
         float         alpha;       // 0..1 composite alpha
         int           awtRule = AlphaComposite.SRC_OVER; // PorterDuff composite rule (Lottie mattes)
-        java.awt.Rectangle clipDev; // device-space saveLayer bounds to clip a non-SRC_OVER composite to (null = none)
+        java.awt.Shape clipDev; // effective device-space saveLayer clip, including parent clipping
         // MACAPK_FRAMESPEED_LAYER (see LayerPool below): the device rect outside
         // which this layer provably holds only transparent pixels (null = the
         // gate is off: composite the whole layer, as before), and the pool entry
@@ -639,24 +639,24 @@ public class Canvas {
     private int pushLayer(float alpha01, int awtRule, float l, float t, float r, float b) {
         return pushLayer(alpha01, awtRule, l, t, r, b, false);
     }
-    /** Layer setup with an explicit PorterDuff composite rule + saveLayer bounds.
-     *  A non-SRC_OVER rule (Lottie matte) forces a real offscreen buffer even at
-     *  alpha 255 AND captures the device-space bounds so restore() can clip the
-     *  composite to the matte region. If the bounds are degenerate (no rect), the
-     *  non-SRC_OVER rule is unsafe (it would clear the whole canvas), so we fall
-     *  back to SRC_OVER. */
+    /** Layer setup with an explicit Porter-Duff rule. Non-SrcOver rules require an offscreen
+     *  even at full alpha; restore clips their composite to the intersection of the saveLayer
+     *  bounds, the parent clip and the device so a foreground mask cannot erase unrelated UI. */
     private int pushLayer(float alpha01, int awtRule, float l, float t, float r, float b, boolean forceLayer) {
         if (g == null || image == null) return save();
-        java.awt.Rectangle clipDev = null;
+        java.awt.Shape clipDev = null;
         if (awtRule != AlphaComposite.SRC_OVER) {
+            java.awt.geom.Area region = new java.awt.geom.Area(
+                new java.awt.Rectangle(0, 0, image.getWidth(), image.getHeight()));
             if (r > l && b > t) {
-                try {
-                    clipDev = g.getTransform()
-                        .createTransformedShape(new java.awt.geom.Rectangle2D.Float(l, t, r - l, b - t))
-                        .getBounds();
-                } catch (Throwable ignored) { clipDev = null; }
+                region.intersect(new java.awt.geom.Area(g.getTransform().createTransformedShape(
+                    new java.awt.geom.Rectangle2D.Float(l, t, r - l, b - t))));
             }
-            if (clipDev == null) awtRule = AlphaComposite.SRC_OVER; // no bounds -> unsafe to mask; degrade
+            java.awt.Shape parentClip = g.getClip();
+            if (parentClip != null) {
+                region.intersect(new java.awt.geom.Area(g.getTransform().createTransformedShape(parentClip)));
+            }
+            clipDev = region;
         }
         // Ordinary SRC_OVER-at-full-alpha degenerates to a plain save() (a real
         // matte never does, because awtRule != SRC_OVER keeps it off this path)
@@ -720,17 +720,21 @@ public class Canvas {
         return txStack.size();
     }
 
-    /** The Java2D AlphaComposite rule for a saveLayer paint's PorterDuff
-     *  xfermode, or SRC_OVER when there is none / it is not a PorterDuffXfermode.
-     *  Modes with no AWT AlphaComposite equivalent (ADD/MULTIPLY/SCREEN/OVERLAY/
-     *  DARKEN/LIGHTEN) fall back to SRC_OVER. */
+    /** Porter-Duff rule used when restoring a saved layer. Modern BlendMode takes precedence
+     *  over the legacy Xfermode, exactly as it does for primitive/bitmap draws. */
     private static int awtRuleForPaint(Paint paint) {
         if (paint == null) return AlphaComposite.SRC_OVER;
         try {
-            android.graphics.Xfermode xm = paint.getXfermode();
-            if (xm instanceof android.graphics.PorterDuffXfermode pdx) {
-                android.graphics.PorterDuff.Mode m = pdx.getMode();
-                if (m == null) return AlphaComposite.SRC_OVER;
+            android.graphics.BlendMode blendMode = paint.getBlendMode();
+            android.graphics.PorterDuff.Mode m;
+            if (blendMode != null) {
+                m = blendMode.toPorterDuffModeOrNull();
+            } else {
+                android.graphics.Xfermode xm = paint.getXfermode();
+                m = xm instanceof android.graphics.PorterDuffXfermode
+                    ? ((android.graphics.PorterDuffXfermode) xm).getMode() : null;
+            }
+            if (m != null) {
                 switch (m) {
                     case CLEAR:    return AlphaComposite.CLEAR;
                     case SRC:      return AlphaComposite.SRC;
@@ -3042,12 +3046,15 @@ public class Canvas {
                 java.awt.AlphaComposite.SRC_OVER, ca));
         }
         BufferedImage src = bitmapAsImage(rec);
-        // v1.0.434: approximate a graphicsLayer RenderEffect blur (Material3
-        // scrim / glassmorphism) with a java.awt box-blur ConvolveOp over the
-        // recorded layer bitmap. No-op for the common no-effect case.
+        // Apply the immutable Skia ImageFilter DAG to this node's recorded source. The
+        // legacy software blur remains only for effects without a native filter.
         RenderEffect re = node.macapkRenderEffect();
         if (src != null && re != null && re.macapkIsBlur()) {
-            src = blurImage(src, Math.max(re.macapkBlurRadiusX(), re.macapkBlurRadiusY()));
+            if (re.hasSkiaFilter()) {
+                src = macapkApplySkiaFilter(src, re.getNativeFilter());
+            } else {
+                src = blurImage(src, Math.max(re.macapkBlurRadiusX(), re.macapkBlurRadiusY()));
+            }
         }
         if (RenderNode.macapkStats) {
             // "Did the replay reach any pixels?" -- after position + transform
@@ -3169,7 +3176,11 @@ public class Canvas {
                 dl.replay(new Canvas(off));
                 BufferedImage src = bitmapAsImage(off);
                 if (src == null) return;
-                src = blurImage(src, Math.max(re.macapkBlurRadiusX(), re.macapkBlurRadiusY()));
+                if (re.hasSkiaFilter()) {
+                    src = macapkApplySkiaFilter(src, re.getNativeFilter());
+                } else {
+                    src = blurImage(src, Math.max(re.macapkBlurRadiusX(), re.macapkBlurRadiusY()));
+                }
                 // The layer paint's alpha times the node alpha, in 8 bits, as
                 // hwui's layerNeedsPaint does: paint->setAlpha(alpha() * multiplier).
                 final Paint lp = node.macapkLayerPaint();
@@ -3177,14 +3188,17 @@ public class Canvas {
                 if (la <= 0) return;
                 macapkTraceBlit("rendernode-layer", off, "pos=" + node.getLeft() + "," + node.getTop()
                     + " " + node.getWidth() + "x" + node.getHeight() + " alpha=" + a);
-                java.awt.Composite old = null;
-                if (la < 255) {
-                    old = g.getComposite();
-                    g.setComposite(java.awt.AlphaComposite.getInstance(
-                        java.awt.AlphaComposite.SRC_OVER, la / 255f));
+                java.awt.Composite old = g.getComposite();
+                java.awt.Composite composite = bitmapRuleFor(lp);
+                if (composite == null) composite = java.awt.AlphaComposite.SrcOver;
+                if (composite instanceof java.awt.AlphaComposite ac) {
+                    composite = java.awt.AlphaComposite.getInstance(ac.getRule(), la / 255f);
+                } else if (composite instanceof BlendComposite bc) {
+                    composite = bc.withAlpha(la);
                 }
+                g.setComposite(composite);
                 g.drawImage(src, 0, 0, null);
-                if (old != null) g.setComposite(old);
+                g.setComposite(old);
                 if (RenderNode.macapkStats) RenderNode.sStReplayOk.incrementAndGet();
                 return;
             }
@@ -4524,6 +4538,9 @@ public class Canvas {
                 // the first so the fill is approximately right rather than blank.
                 return awtPaintForShader(((ComposeShader) shader).macapkA(), p);
             }
+            if (shader instanceof RuntimeShader) {
+                return new MacApkRuntimeShaderPaint((RuntimeShader) shader, p);
+            }
         } catch (Throwable t) {
             // Degenerate gradient geometry / bad fractions -> solid-color fallback.
         }
@@ -5375,6 +5392,32 @@ public class Canvas {
             op.filter(src, dst);
             return dst;
         } catch (Throwable t) { return src; }
+    }
+    private static BufferedImage macapkApplySkiaFilter(BufferedImage src, long filterPtr) {
+        if (src == null || filterPtr == 0 || !com.macapk.graphics.MacApkSkia.isAvailable()) return src;
+        int w = src.getWidth();
+        int h = src.getHeight();
+        if (w <= 0 || h <= 0) return src;
+        try {
+            int[] inPixels = null;
+            java.awt.image.Raster raster = src.getRaster();
+            if (src.getType() == BufferedImage.TYPE_INT_ARGB
+                    && raster.getDataBuffer() instanceof java.awt.image.DataBufferInt
+                    && raster.getDataBuffer().getOffset() == 0
+                    && raster.getDataBuffer().getNumBanks() == 1
+                    && raster.getSampleModelTranslateX() == 0 && raster.getSampleModelTranslateY() == 0
+                    && raster.getSampleModel() instanceof java.awt.image.SinglePixelPackedSampleModel
+                    && ((java.awt.image.SinglePixelPackedSampleModel) raster.getSampleModel()).getScanlineStride() == w) {
+                inPixels = ((java.awt.image.DataBufferInt) raster.getDataBuffer()).getData();
+            }
+            if (inPixels == null) inPixels = src.getRGB(0, 0, w, h, null, 0, w);
+            BufferedImage dst = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
+            int[] outPixels = ((java.awt.image.DataBufferInt) dst.getRaster().getDataBuffer()).getData();
+            if (com.macapk.graphics.MacApkSkia.applyFilter(filterPtr, inPixels, w, h, outPixels)) return dst;
+        } catch (Throwable t) {
+            System.err.println("[W] macapkApplySkiaFilter error: " + t);
+        }
+        return src;
     }
     /** Composite for a bitmap blit: the paint's blend mode, modulated by the paint alpha (so a
      *  Coil/Glide cross-fade, whose paint alpha ramps 0..255, actually fades).

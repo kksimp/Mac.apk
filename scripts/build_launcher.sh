@@ -338,7 +338,7 @@ if [ -x "$RUNTIME_BIN" ]; then
     #   libMoltenVK       the Vulkan ICD (Vulkan-over-Metal); the loader
     #                     dlopens it via MoltenVK_icd.json (see below).
     # The last two are optional so a Metal-only ANGLE build still bundles.
-    for libname in libGLESv2.dylib libEGL.dylib libvulkan.dylib libMoltenVK.dylib; do
+    for libname in libGLESv2.dylib libEGL.dylib libvulkan.dylib libMoltenVK.dylib libskiko-macos-arm64.dylib libmacapk-skia-metal.dylib; do
         if [ -f "$RUNTIME_BIN_DIR/$libname" ]; then
             cp "$RUNTIME_BIN_DIR/$libname" "$RESOURCES_DIR/$libname"
             echo "  Bundled Resources/$libname: $(du -h "$RESOURCES_DIR/$libname" | cut -f1)"

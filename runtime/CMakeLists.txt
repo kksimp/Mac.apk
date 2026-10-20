@@ -458,3 +458,10 @@ set_target_properties(macapk-app-stub PROPERTIES
     OUTPUT_NAME "macapk-app-stub"
     PREFIX "lib"
     SUFFIX ".dylib")
+
+# Offscreen Skia Metal interop. Loaded beside libskiko by the framework so JNI
+# ownership is the same for standalone Java pixel checks and the native runtime.
+add_library(macapk-skia-metal SHARED src/skia_metal_bridge.mm)
+target_include_directories(macapk-skia-metal PRIVATE "${JAVA_HOME}/include" "${JAVA_HOME}/include/darwin")
+target_link_libraries(macapk-skia-metal PRIVATE "-framework Foundation" "-framework Metal")
+set_target_properties(macapk-skia-metal PROPERTIES INSTALL_NAME_DIR "@rpath")

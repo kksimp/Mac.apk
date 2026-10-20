@@ -260,6 +260,13 @@ else
          "scripts/build_angle.sh  # ~30-60 min, ~25 GB pulled by depot_tools"
 fi
 
+if [[ -f "$PROJ_ROOT/thirdparty/skia-prebuilt/lib/libskiko-macos-arm64.dylib" ]]; then
+    ok "Skia AGSL: committed macOS arm64 runtime present"
+else
+    miss "Skia AGSL runtime missing" \
+         "Restore thirdparty/skia-prebuilt/lib/libskiko-macos-arm64.dylib from this repository"
+fi
+
 # --------------------------------------------------------------------
 section "Optional but recommended"
 # --------------------------------------------------------------------

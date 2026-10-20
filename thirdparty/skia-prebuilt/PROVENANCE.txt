@@ -1,0 +1,61 @@
+Skiko/Skia runtime for Mac.apk AGSL support
+
+Source artifact:
+  Maven: org.jetbrains.skiko:skiko-awt-runtime-macos-arm64:0.150.2
+  File:  libskiko-macos-arm64.dylib
+  Artifact URL:
+    https://repo.maven.apache.org/maven2/org/jetbrains/skiko/skiko-awt-runtime-macos-arm64/0.150.2/skiko-awt-runtime-macos-arm64-0.150.2.jar
+  Original dylib SHA-256 (checksum entry inside that jar):
+    680e40272519123174e97630c92549e2672a3f4deca1744f30f4a472af64b744
+  Skiko project: https://github.com/JetBrains/skiko
+  Skiko v0.150.2 source commit: caed3841b8725429bb9b9805ff162a40eb7bce47
+  Skiko license: Apache-2.0; see LICENSE-SKIKO.txt and NOTICE-SKIKO.txt.
+
+Skia source dependency:
+  Skiko v0.150.2 skiko/gradle.properties pins dependencies.skia=m150-a3f509bf52.
+  Skia tag commit: a3f509bf52564dc8b27940bebe599d77ac0c4ae3
+  Project: https://github.com/JetBrains/skia/tree/m150-a3f509bf52
+  Skia license: BSD-3-Clause; see LICENSE-SKIA.txt.
+
+Local staging change:
+  Mach-O install name changed from ./libskiko-macos-arm64.dylib to
+  @rpath/libskiko-macos-arm64.dylib, then ad-hoc signed. Code and data sections
+  are otherwise the Maven artifact's bytes.
+
+Staged SHA-256:
+  a4969df53851c418a5f0d79f98cb1d4ff252675a3f5a9eed3570c5282bae8b8b
+
+License retrieval provenance:
+  LICENSE-SKIKO.txt and NOTICE-SKIKO.txt are unchanged copies of LICENSE and
+  NOTICE at the Skiko source commit above, fetched from raw.githubusercontent.com.
+  LICENSE-SKIA.txt is an unchanged copy of LICENSE at the Skia source commit
+  above, fetched from raw.githubusercontent.com.
+  thirdparty/framework-res/LICENSE was absent when these notices were added;
+  no locally generated resource-build license was reused for Skiko.
+
+  THIRD_PARTY_NOTICES.txt preserves upstream texts for the static macOS JVM
+  dependencies listed by Skiko v0.150.2 skiko/build.gradle.kts: ICU, HarfBuzz,
+  libpng, libjpeg-turbo (including README.ijg), WebP, zlib, Expat, DNG SDK and
+  Piex; it also includes Wuffs and its Skia integration notice for image decode.
+  Each section records its exact source URL or archive member. Gitiles TEXT
+  responses were base64-decoded, not rewritten or replaced by guessed licenses.
+
+  HarfBuzz, libpng, WebP and zlib texts came from the pinned upstream archive:
+    https://github.com/JetBrains/skia/releases/download/m150-a3f509bf52/Skia-m150-a3f509bf52-macos-Release-arm64.zip
+  Archive SHA-256 (matches the GitHub release asset digest):
+    76b4983295cf50cbc955ff111ac9211a5057fe1d13a8552431b8d559a5a19584
+  Other dependency texts came from the revisions pinned in that Skia commit's
+  DEPS file, or from its own third_party integration files. This archive was
+  used only to retrieve license texts; the shipped dylib comes from Maven.
+
+Scope and reproducibility caveats:
+  The Skia version and static-dependency inventory are derived from the pinned
+  upstream Skiko release sources, not an independent reproducible build or a
+  binary-level inventory. Upstream permits platform-specific dependency
+  overrides; no claim is made that these source settings attest every byte of
+  the published binary. The Maven runtime jar supplies no complete aggregate
+  third-party notice, so the source notices are retained here explicitly.
+  Upgrading the dylib requires refreshing the source pins and these notices.
+  Homebrew Brotli is a separate JRE dependency, not this prebuilt's provenance;
+  gen_third_party_notices.sh reads its MIT license from the linked Brotli keg.
+

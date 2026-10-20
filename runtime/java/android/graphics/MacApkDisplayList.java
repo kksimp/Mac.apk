@@ -546,6 +546,10 @@ final class MacApkDisplayList {
         PaintSnap(Paint p) {
             paint = snap(p);
             Shader s = (paint != null) ? paint.getShader() : null;
+            if (s instanceof RuntimeShader && !TEST_SHADER_BYREF) {
+                s = ((RuntimeShader) s).macapkSnapshot();
+                paint.setShader(s);
+            }
             if (s != null && !TEST_SHADER_BYREF) {
                 Matrix m = new Matrix();
                 shader = s;

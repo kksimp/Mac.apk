@@ -2266,6 +2266,17 @@ public final class Bitmap implements android.os.Parcelable {
         return config == Config.RGB_565 || config == Config.ALPHA_8
                 || config == Config.ARGB_4444;
     }
+    public byte[] macapkAlphaBytes() {
+        int n = width * height;
+        byte[] bytes = new byte[n];
+        int[] src = macapkArgbBuffer();
+        if (src != null) {
+            for (int i = 0; i < n && i < src.length; i++) {
+                bytes[i] = (byte) ((src[i] >>> 24) & 0xff);
+            }
+        }
+        return bytes;
+    }
     public int getPixel(int x, int y) {
         checkRecycled("Can't call getPixel() on a recycled bitmap");
         checkHardware("unable to getPixel(), "

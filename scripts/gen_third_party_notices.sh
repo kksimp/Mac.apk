@@ -5,9 +5,9 @@
 # third-party component that SHIPS inside Mac.apk.app -- the redistribution
 # obligation the DMG carries. Each component's text comes from its OWN source
 # tree where that is a plain file (ANGLE, MoltenVK, Vulkan headers, Capstone,
-# libpng from the Homebrew keg), and from a canonical embedded copy for the two
-# whose text is not a readable file in our checkout (BouncyCastle's licence
-# lives in a .class; the AOSP/Apache-2.0 pointer). OpenJDK is NOT reproduced
+# libpng and Brotli from the Homebrew kegs), from pinned upstream license/notice
+# copies alongside the Skiko/Skia prebuilt, and from a canonical embedded copy
+# for BouncyCastle (whose licence lives in a .class). OpenJDK is NOT reproduced
 # here: it ships its own complete `Contents/Resources/jre/legal/` tree, which
 # is the notice, and this file points at it.
 #
@@ -85,6 +85,24 @@ in-process embedding Mac.apk relies on. Source: https://openjdk.org/ ."
 notices are listed in the ANGLE source tree's THIRD_PARTY_LICENSES. Source:
 https://chromium.googlesource.com/angle/angle ."
 
+  # Skiko embeds Skia and its static dependencies; retaining only the binding's
+  # Apache licence would omit Skia's BSD notice and the bundled codec notices.
+  emit "Skiko 0.150.2 (libskiko-macos-arm64.dylib) -- JNI bridge to Skia" \
+       "Apache-2.0" "$ROOT/thirdparty/skia-prebuilt/LICENSE-SKIKO.txt" \
+"Source: https://github.com/JetBrains/skiko/tree/v0.150.2 .
+Local change: Mach-O install name changed to @rpath/libskiko-macos-arm64.dylib,
+then ad-hoc signed. Upstream NOTICE follows:"
+  cat "$ROOT/thirdparty/skia-prebuilt/NOTICE-SKIKO.txt"
+  printf '\n\n'
+
+  emit "Skia m150-a3f509bf52 (embedded in libskiko) -- CPU runtime-shader rasterization" \
+       "BSD-3-Clause" "$ROOT/thirdparty/skia-prebuilt/LICENSE-SKIA.txt" \
+"Source: https://github.com/JetBrains/skia/tree/m150-a3f509bf52 .
+Skia's external dependencies retain their own terms, reproduced below; the
+BSD identifier above applies to Skia itself, not to every dependency."
+  cat "$ROOT/thirdparty/skia-prebuilt/THIRD_PARTY_NOTICES.txt"
+  printf '\n\n'
+
   # MoltenVK + the Vulkan loader -- Vulkan on Metal, under ANGLE's Vulkan backend.
   emit "MoltenVK (libMoltenVK.dylib) -- Vulkan over Metal" \
        "Apache-2.0" \
@@ -136,6 +154,11 @@ Source: https://github.com/nothings/stb ."
 (www.freetype.org). All rights reserved. FreeType is dual-licensed (FTL or
 GPLv2); Mac.apk uses it under the FreeType License (FTL), reproduced below.
 Source: https://freetype.org/ ."
+  emit "Brotli $(kver brotli) (jre/lib/libbrotlidec.1.dylib, libbrotlicommon.1.dylib) -- decoder used by FreeType" \
+       "MIT" \
+       "$(keg brotli)/LICENSE" \
+"Source: https://github.com/google/brotli ."
+
 
   emit "HarfBuzz $(kver harfbuzz) (jre/lib/libharfbuzz.0.dylib) -- text shaping" \
        "MIT" \
@@ -221,7 +244,7 @@ SOFTWARE."
   # framework file resources), built from AOSP source. No Google binary.
   emit "Android Open Source Project -- platform resources (tools/framework-res.apk)" \
        "Apache-2.0" \
-       "$(first "$ROOT/thirdparty/framework-res/LICENSE")" \
+       "$(first "$ROOT/thirdparty/framework-res/LICENSE" "$ROOT/thirdparty/skia-prebuilt/LICENSE-SKIKO.txt")" \
 "framework-res.apk is the Android platform resource table and its file
 resources, compiled from AOSP source (frameworks/base/core/res), Apache-2.0.
 It contains no Google-signed or Google-proprietary binary. Full licence text:

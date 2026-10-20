@@ -79,11 +79,12 @@
 #
 # ---- JDK 25 (measured 2026-09-26, docs/jdk25-move-and-aot-cache_2026-09-26.md) ----
 # The module list above holds unchanged: jdeps --print-module-deps --multi-release 25
-# gives the same sets for all three jars, the java.desktop native closure below is the
-# same ten Homebrew dylibs, and jdk.crypto.ec still links (an empty module since JDK 22
-# moved SunEC into java.base; harmless). Size, same recipe: 21.0.11 = 55.2 MB,
-# 25.0.2 = 56.3 MB before the closure copy (+1.1 MB, all libjvm). --strip-debug would
-# take 25 to 51.2 MB (JDK classes lose line numbers only); not applied.
+# gives the same sets for all three jars; the java.desktop native closure below now
+# has twelve Homebrew dylibs (including FreeType's Brotli decoder/common pair), and
+# jdk.crypto.ec still links (an empty module since JDK 22 moved SunEC into java.base;
+# harmless). Size, same recipe: 21.0.11 = 55.2 MB, 25.0.2 = 56.3 MB before the closure
+# copy (+1.1 MB, all libjvm). --strip-debug would take 25 to 51.2 MB (JDK classes lose
+# line numbers only); not applied.
 #
 # ---- MACAPK_JRE_BAKE_PATCHES=<runtime lib dir> (opt-in; default output unchanged) --
 # Bakes the compiled java_base_patch/ + jdk_unsupported_patch/ under that lib dir INTO
@@ -192,9 +193,10 @@ echo "  Staged JRE at $DEST: $(du -sh "$DEST" | cut -f1) (JDK $(macapk_jdk_versi
 # freetype are not leaves) adds: freetype -> libpng (same libpng16.16,
 # reused); harfbuzz -> freetype (already covered) + glib + graphite2;
 # glib -> gettext + pcre2. gettext, pcre2 and graphite2 are leaves (system
-# libs only). That's the full closure -- ten dylibs total.
+# libs only). Current Homebrew FreeType also links Brotli's decoder/common pair,
+# so those two are part of the closure as well.
 #
-# All ten get copied into the SAME directory as their dependents
+# All closure members get copied into the SAME directory as their dependents
 # (jre/lib/, flat -- matching the JDK's own layout convention for these
 # natives) rather than a subdirectory, because every native lib the JDK
 # ships already carries an `@loader_path/.` LC_RPATH (verified: even
@@ -202,7 +204,7 @@ echo "  Staged JRE at $DEST: $(du -sh "$DEST" | cut -f1) (JDK $(macapk_jdk_versi
 # everything lives in one directory, that ALREADY-PRESENT rpath resolves
 # every @rpath/<name> reference with no new rpath entries needed on the
 # four original files. Freshly-copied Homebrew dylibs don't carry that
-# rpath yet, so it's added to those ten explicitly.
+# rpath yet, so it's added to those twelve explicitly.
 JRE_LIB="$DEST/lib"
 JDESKTOP_NATIVE_CLOSURE="
 /opt/homebrew/opt/giflib/lib/libgif.dylib
@@ -215,6 +217,8 @@ JDESKTOP_NATIVE_CLOSURE="
 /opt/homebrew/opt/graphite2/lib/libgraphite2.3.dylib
 /opt/homebrew/opt/gettext/lib/libintl.8.dylib
 /opt/homebrew/opt/pcre2/lib/libpcre2-8.0.dylib
+/opt/homebrew/opt/brotli/lib/libbrotlidec.1.dylib
+/opt/homebrew/opt/brotli/lib/libbrotlicommon.1.dylib
 "
 
 # Pass 1: copy each closure member into jre/lib/, give it an @rpath id, and
@@ -242,10 +246,10 @@ if [ "$missing_any" -eq 1 ]; then
     echo "  WARN: java.desktop native closure incomplete (see above); skipping its relink pass." >&2
 else
     # Pass 2: rewrite every reference to a closure member -- in the four
-    # ORIGINAL jlink-provided natives AND in the ten copies just made
+    # ORIGINAL jlink-provided natives AND in the closure copies just made
     # (harfbuzz references freetype+glib+graphite2; freetype references
-    # libpng; glib references gettext+pcre2) -- from its Homebrew absolute
-    # path to @rpath/<name>.
+    # libpng+brotli; brotlidec references brotlicommon; glib references
+    # gettext+pcre2) -- from its Homebrew absolute path to @rpath/<name>.
     all_targets="lib/libsplashscreen.dylib lib/libjavajpeg.dylib lib/libfontmanager.dylib lib/liblcms.dylib"
     while IFS= read -r src; do
         [ -z "$src" ] && continue
@@ -269,5 +273,5 @@ $JDESKTOP_NATIVE_CLOSURE
 EOF
         codesign --force --sign - --timestamp=none "$f" 2>/dev/null || true
     done
-    echo "  Relinked java.desktop's native closure (giflib, jpeg-turbo, libpng, harfbuzz, freetype, little-cms2, glib, graphite2, gettext, pcre2) to @rpath"
+    echo "  Relinked java.desktop's native closure (giflib, jpeg-turbo, libpng, harfbuzz, freetype, little-cms2, glib, graphite2, gettext, pcre2, brotli) to @rpath"
 fi

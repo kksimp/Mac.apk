@@ -5229,6 +5229,8 @@ public enum RuntimeInstall {
     /// than as a staging error.
     static let payload: [String] = [
         "Resources/macapk-runtime",
+        "Resources/libskiko-macos-arm64.dylib",
+        "Resources/libmacapk-skia-metal.dylib",
         "Resources/libGLESv2.dylib",
         "Resources/libEGL.dylib",
         "Resources/libvulkan.dylib",
@@ -5355,6 +5357,8 @@ public enum RuntimeInstall {
     /// Capstone-less build has no translator) exactly as build.sh treats them.
     static let requiredPayload: Set<String> = [
         "Resources/macapk-runtime",
+        "Resources/libskiko-macos-arm64.dylib",
+        "Resources/libmacapk-skia-metal.dylib",
         "lib/android-framework.jar",
         "lib/macapk-loader.jar",
     ]

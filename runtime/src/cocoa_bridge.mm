@@ -932,6 +932,7 @@ extern "C" void* CocoaWebViewHostView(void) {
 // fully stopped, "resume" needs no special-case code: the next tick after
 // visibility flips back on just falls through to the unmodified body.
 static std::atomic<bool> g_window_hidden{false};
+extern "C" void macapk_power_window_hidden(bool hidden);   // power_assertion_bridge.mm
 // Wall-clock (CACurrentMediaTime) of the last throttled tick let through
 // while hidden. Reset to 0 on every visible->hidden transition so the FIRST
 // tick of a NEW hidden spell always fires immediately rather than waiting
@@ -981,6 +982,7 @@ static void macapk_update_window_hidden_state(const char* reason) {
     bool visible = w.isVisible
                 && ((w.occlusionState & NSWindowOcclusionStateVisible) != 0);
     bool wasHidden = g_window_hidden.exchange(!visible);
+    if (wasHidden == visible) macapk_power_window_hidden(!visible);   // drop/retake the keep-screen-on assertion
     if (visible && wasHidden) {
         g_hidden_throttle_last = 0.0;   // next hidden spell starts unthrottled
         std::fprintf(stderr,

@@ -1639,7 +1639,12 @@ public class View implements android.graphics.drawable.Drawable.Callback,
                 < computeVerticalScrollRange() ? 1.0f : 0.0f;
     }
     private boolean mKeepScreenOn;
-    public void setKeepScreenOn(boolean keepOn) { mKeepScreenOn = keepOn; }
+    /** AOSP View.setKeepScreenOn: only an ATTACHED view keeps the display on
+     *  (ViewRootImpl reads AttachInfo.mKeepScreenOn from the visible tree). */
+    public void setKeepScreenOn(boolean keepOn) {
+        mKeepScreenOn = keepOn;
+        if (macapkAttached) android.os.MacApkKeepAwake.screen(this, keepOn);
+    }
     public boolean getKeepScreenOn() { return mKeepScreenOn; }
     /** AOSP setContextClickable/isContextClickable (View.java:12262) and
      *  setFilterTouchesWhenObscured/getFilterTouchesWhenObscured (:12431).
@@ -1899,6 +1904,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         // view whose listeners were registered while detached benefits). Guarded so
         // a throwing observer merge cannot abort the attach walk.
         try { getViewTreeObserver(); } catch (Throwable ignored) {}
+        if (mKeepScreenOn) android.os.MacApkKeepAwake.screen(this, true);
         try {
             onAttachedToWindow();
         } catch (Throwable t) {
@@ -2028,6 +2034,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         macapkTraceComposeAttach("DETACH", macapkAttached);
         if (!macapkAttached) return;
         macapkAttached = false;
+        if (mKeepScreenOn) android.os.MacApkKeepAwake.screen(this, false);
         try { onDetachedFromWindow(); } catch (Throwable ignored) {}
         if (attachStateChangeListeners != null) {
             for (OnAttachStateChangeListener l :

@@ -40,7 +40,7 @@ public class PowerManager {
     public static final int RELEASE_FLAG_WAIT_FOR_NO_PROXIMITY = 0x1;
     public static final int RELEASE_FLAG_TIMEOUT                = 0x10000;
     public PowerManager() {}
-    public WakeLock newWakeLock(int levelAndFlags, String tag) { return new WakeLock(tag); }
+    public WakeLock newWakeLock(int levelAndFlags, String tag) { return new WakeLock(levelAndFlags, tag); }
     public boolean isScreenOn() { return true; }
     public boolean isInteractive() { return true; }
     // Power-save mode: macOS doesn't expose Android's battery-saver
@@ -276,7 +276,9 @@ public class PowerManager {
         private final Runnable mReleaser = () -> release(PowerManager.RELEASE_FLAG_TIMEOUT);
 
         public WakeLock() { this("WakeLock"); }
+        private int mFlags;   // newWakeLock level + flags; PARTIAL keeps the CPU, SCREEN_* the display
         WakeLock(String tag) { mTag = (tag != null) ? tag : "WakeLock"; }
+        WakeLock(int flags, String tag) { this(tag); mFlags = flags; }
 
         public void setReferenceCounted(boolean value) {
             synchronized (mLock) {
@@ -307,6 +309,7 @@ public class PowerManager {
                 // observed in between.
                 mHandler.removeCallbacks(mReleaser);
                 mHeld = true;
+                MacApkKeepAwake.wakeLock(this, mFlags, true);
             }
         }
 
@@ -325,6 +328,7 @@ public class PowerManager {
                 if (!mRefCounted || mInternalCount == 0) {
                     mHandler.removeCallbacks(mReleaser);
                     mHeld = false;
+                    MacApkKeepAwake.wakeLock(this, mFlags, false);
                 }
                 if (mRefCounted && mExternalCount < 0) {
                     throw new RuntimeException("WakeLock under-locked " + mTag);

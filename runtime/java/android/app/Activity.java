@@ -279,6 +279,8 @@ public class Activity extends ContextThemeWrapper
     public final void macapkFinishNow() {
         if (finished) return;
         finished = true;
+        // A finished activity's window no longer keeps the screen on.
+        try { android.os.MacApkKeepAwake.screen(getWindow(), false); } catch (Throwable ignored) {}
         com.macapk.loader.ActivityHost.onActivityFinished(this);
         // AOSP: once a finishing activity that was started FOR A RESULT is torn
         // down, the framework ships its result back to the starter

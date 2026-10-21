@@ -215,7 +215,9 @@ private func beginRunLog(runtime: URL, identity: String,
     var st = stat()
     if fstat(2, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG { return nil }
     let dir = runLogDirectory(runtime: runtime)
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    // Logs hold app output and paths: owner-only (0700 dir, 0600 files).
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                             attributes: [.posixPermissions: 0o700])
     rotateRunLog(dir: dir, identity: identity)
     // v1.0.1650: HotSpot crash dumps land in this same dir and nothing rotated
     // them (InstallCore.swift JvmCrashDumpPrune; MACAPK_HSERR_PRUNE=0 = off).
@@ -223,7 +225,7 @@ private func beginRunLog(runtime: URL, identity: String,
     let path = dir.appendingPathComponent("app_\(identity).log").path
     // O_APPEND so the runtime's writes -- and any child process that inherits
     // these descriptors -- append atomically instead of racing on one offset.
-    let fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+    let fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o600)
     guard fd >= 0 else {
         stubLog("WARN: cannot open run log \(path) (errno \(errno)); "
                 + "this launch will leave no diagnostic trail")

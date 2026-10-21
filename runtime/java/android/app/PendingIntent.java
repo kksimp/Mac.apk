@@ -46,22 +46,97 @@ public final class PendingIntent implements Parcelable {
 
     private PendingIntent() {}
 
+    /** The identity of a token: AOSP PendingIntentRecord.Key (android14
+     *  services/core/java/com/android/server/am/PendingIntentRecord.java
+     *  :77-160) -- operation type, request code, the creation flags minus the
+     *  three lookup-only ones, and the Intent compared with filterEquals
+     *  (action, data, type, identifier, package, component, categories; NOT
+     *  extras). For getActivities AOSP keys on the last Intent. */
+    private static final int LOOKUP_ONLY_FLAGS =
+        FLAG_NO_CREATE | FLAG_CANCEL_CURRENT | FLAG_UPDATE_CURRENT;
+
+    private static final class Key {
+        final int type, requestCode, flags;
+        final Intent intent;
+        Key(int type, int requestCode, int flags, Intent intent) {
+            this.type = type;
+            this.requestCode = requestCode;
+            this.flags = flags & ~LOOKUP_ONLY_FLAGS;
+            this.intent = intent;
+        }
+        @Override public boolean equals(Object o) {
+            if (!(o instanceof Key)) return false;
+            Key k = (Key) o;
+            if (type != k.type || requestCode != k.requestCode || flags != k.flags) return false;
+            if (intent == null) return k.intent == null;
+            return k.intent != null && intent.filterEquals(k.intent);
+        }
+        @Override public int hashCode() {
+            int h = 31 * (31 * type + requestCode) + flags;
+            return 31 * h + (intent == null ? 0 : intent.filterHashCode());
+        }
+    }
+
+    private Key key() { return new Key(type, requestCode, flags, getIntent()); }
+
+    /** Live tokens by Key: ActivityManagerService.mIntentSenderRecords, which
+     *  is what makes FLAG_NO_CREATE / FLAG_UPDATE_CURRENT / FLAG_CANCEL_CURRENT
+     *  mean anything. Weak like AOSP's, so a token nobody holds is dropped. */
+    private static final java.util.HashMap<Key, java.lang.ref.WeakReference<PendingIntent>>
+        sLive = new java.util.HashMap<>();
+
+    private static PendingIntent liveLocked(Key k) {
+        java.lang.ref.WeakReference<PendingIntent> ref = sLive.get(k);
+        PendingIntent p = ref == null ? null : ref.get();
+        if (p == null || p.canceled) {
+            sLive.remove(k);
+            return null;
+        }
+        return p;
+    }
+
+    /** AOSP ActivityManagerService.getIntentSenderLocked (android14
+     *  PendingIntentController.getIntentSender :111-170): an existing token
+     *  for the same Key is returned (extras replaced under UPDATE_CURRENT),
+     *  or cancelled under CANCEL_CURRENT; NO_CREATE returns the existing
+     *  token or null; otherwise a new token is registered. The Intents are
+     *  copied, as AOSP's travel through a Parcel, so a caller mutating its
+     *  Intent afterwards changes neither the token nor its Key. */
     private static PendingIntent make(int type, Context c, int requestCode,
                                       Intent intent, Intent[] intents, int flags) {
-        // FLAG_NO_CREATE asks "return null if no matching PendingIntent
-        // already exists". We don't keep a process-wide registry of
-        // existing tokens, so under FLAG_NO_CREATE we honestly report
-        // "none exists" by returning null -- matching the AOSP contract
-        // for callers probing for a prior registration.
-        if ((flags & FLAG_NO_CREATE) != 0) return null;
-        PendingIntent p = new PendingIntent();
-        p.type = type;
-        p.creatorContext = c;
-        p.requestCode = requestCode;
-        p.intent = intent;
-        p.intents = intents;
-        p.flags = flags;
-        return p;
+        if (intent != null) intent = new Intent(intent);
+        if (intents != null) {
+            Intent[] copy = new Intent[intents.length];
+            for (int i = 0; i < intents.length; i++)
+                copy[i] = intents[i] == null ? null : new Intent(intents[i]);
+            intents = copy;
+        }
+        Intent keyIntent = intent != null ? intent
+            : (intents != null && intents.length > 0 ? intents[intents.length - 1] : null);
+        Key k = new Key(type, requestCode, flags, keyIntent);
+        synchronized (sLive) {
+            PendingIntent existing = liveLocked(k);
+            if (existing != null) {
+                if ((flags & FLAG_CANCEL_CURRENT) == 0) {
+                    if ((flags & FLAG_UPDATE_CURRENT) != 0) {
+                        if (existing.intent != null) existing.intent.replaceExtras(intent);
+                        if (intents != null) existing.intents = intents;
+                    }
+                    return existing;
+                }
+                existing.cancel();
+            }
+            if ((flags & FLAG_NO_CREATE) != 0) return null;
+            PendingIntent p = new PendingIntent();
+            p.type = type;
+            p.creatorContext = c;
+            p.requestCode = requestCode;
+            p.intent = intent;
+            p.intents = intents;
+            p.flags = flags & ~LOOKUP_ONLY_FLAGS;
+            sLive.put(k, new java.lang.ref.WeakReference<>(p));
+            return p;
+        }
     }
 
     // AOSP: getActivity has both 4-arg and 5-arg (with Bundle options) overloads.
@@ -262,7 +337,14 @@ public final class PendingIntent implements Parcelable {
         if (handler != null) handler.post(r); else r.run();
     }
 
-    public void cancel() { canceled = true; }
+    public void cancel() {
+        synchronized (sLive) {
+            canceled = true;
+            Key k = key();
+            java.lang.ref.WeakReference<PendingIntent> ref = sLive.get(k);
+            if (ref != null && (ref.get() == this || ref.get() == null)) sLive.remove(k);
+        }
+    }
 
     /** AOSP API-31+ -- returns an IntentSender that wraps this token.
      *  IntentSender simply re-dispatches through this PendingIntent. */
@@ -290,22 +372,15 @@ public final class PendingIntent implements Parcelable {
         if (this == o) return true;
         if (!(o instanceof PendingIntent)) return false;
         PendingIntent p = (PendingIntent) o;
-        // AOSP equality keys on the underlying IIntentSender token; two
-        // PendingIntents are equal when they would perform the same
-        // operation with the same request code. We approximate with
-        // type + requestCode + intent component/action.
-        if (type != p.type || requestCode != p.requestCode) return false;
-        Intent a = getIntent(), b = p.getIntent();
-        if (a == null) return b == null;
-        if (b == null) return false;
-        return java.util.Objects.equals(a.getComponent(), b.getComponent())
-            && java.util.Objects.equals(a.getAction(), b.getAction());
+        // AOSP equality is the IIntentSender token, and one token exists per
+        // PendingIntentRecord.Key (see make()). Comparing Keys gives the same
+        // answer here and also for a copy that came back through a Parcel.
+        // Before, only component + action were compared, so two alarms whose
+        // Intents differed only in data URI (or categories, type, package)
+        // were "equal" and AlarmManager's cancel-before-schedule removed one.
+        return key().equals(p.key());
     }
-    @Override public int hashCode() {
-        Intent i = getIntent();
-        return java.util.Objects.hash(type, requestCode,
-            i == null ? null : i.getComponent(), i == null ? null : i.getAction());
-    }
+    @Override public int hashCode() { return key().hashCode(); }
 
     // ---- Parcelable ----
     //
@@ -359,6 +434,15 @@ public final class PendingIntent implements Parcelable {
             p.intent = s.readTypedObject(Intent.CREATOR);
             p.intents = s.createTypedArray(Intent.CREATOR);
             p.canceled = s.readInt() != 0;
+            // AOSP unparcels the same binder, i.e. the same token: hand back
+            // the live one so cancel() / UPDATE_CURRENT on either side is seen
+            // by both.
+            if (!p.canceled) {
+                synchronized (sLive) {
+                    PendingIntent live = liveLocked(p.key());
+                    if (live != null) return live;
+                }
+            }
             return p;
         }
         @Override public PendingIntent[] newArray(int size) { return new PendingIntent[size]; }

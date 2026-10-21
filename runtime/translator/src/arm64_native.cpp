@@ -2402,6 +2402,17 @@ static bool host_dylib_is_private_crypto(void* addr) {
         || std::strncmp(base, "libssl", 6) == 0;
 }
 
+// True when `addr` is owned by a Cocoa framework bundle (.../Foo.framework/...).
+// A framework export can never satisfy an Android ELF import: those are
+// ObjC/Swift app-facing implementations, not a Bionic substitute, and dlsym
+// (RTLD_DEFAULT) walks EVERY image in the process. dladdr on a guest ELF
+// mmap'd by arm64_native returns 0, so this only classifies host dylibs.
+static bool host_addr_in_framework(void* addr) {
+    Dl_info di;
+    if (!addr || !dladdr(addr, &di) || !di.dli_fname) return false;
+    return std::strstr(di.dli_fname, ".framework/") != nullptr;
+}
+
 // Defined in bionic_shim.cpp (same dylib). Returns a dl_iterate_phdr trampoline
 // that lives INSIDE the libdl.so both /proc/self/maps and dl_iterate_phdr enumerate,
 // so pairip's anti-hook "which module owns dl_iterate_phdr" check passes honestly;
@@ -2816,6 +2827,32 @@ void* Image::resolve_external(const std::string& name, uint8_t bind) {
     // the owning dylib, no package name; the game fleet imports zero crypto
     // symbols, so it is unaffected either way.
     if (void* p = dlsym(RTLD_DEFAULT, name.c_str())) {
+        // A framework-owned hit is an accident of the global dlsym walk, not a
+        // resolution. Prefer any loaded guest ELF definition instead; without
+        // this, an import whose name collides with a framework export executes
+        // Apple code under the Android ABI. Observed with an obfuscated
+        // single-letter import: the framework happened to export the same
+        // name, so the first call jumped into it and died on SIGILL. /usr/lib
+        // hits keep their priority deliberately -- __cxa_throw and _Unwind_*
+        // must stay on the host libc++abi for cross-frame unwinding.
+        if (host_addr_in_framework(p)) {
+            for (Image* img : loaded_images()) {
+                if (img == this) continue;
+                if (void* g = img->lookup(name.c_str())) {
+                    static std::atomic<int> n_fw{0};
+                    if (n_fw.fetch_add(1) < 64) {
+                        Dl_info di;
+                        std::fprintf(stderr,
+                            "[arm64-native] %s: '%s' -> guest %s "
+                            "(refused host framework %s)\n",
+                            dbg_name_, name.c_str(), img->name(),
+                            (dladdr(p, &di) && di.dli_fname) ? di.dli_fname
+                                                             : "?framework?");
+                    }
+                    return g;
+                }
+            }
+        }
         if (host_dylib_is_private_crypto(p)) {
             for (Image* img : loaded_images()) {
                 if (img == this) continue;

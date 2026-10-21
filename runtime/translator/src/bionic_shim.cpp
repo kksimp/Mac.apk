@@ -16,6 +16,7 @@
 // As we run real APKs through the translator we expand the surface
 // here, file by file, instead of writing per-app shims.
 
+#include <type_traits>
 #include <algorithm>       // std::min / std::max (arena W^X page union)
 #include <array>
 #include <atomic>
@@ -26813,10 +26814,47 @@ extern "C" ssize_t __macapk_arm64_recvfrom(int fd, void* buf, size_t n, int flag
     return rc;
 }
 
+// IPPROTO_TCP option names. Linux (include/uapi/linux/tcp.h) and Darwin
+// (<netinet/tcp.h>) agree only on the first two; the rest used to pass through
+// raw, so Linux TCP_KEEPIDLE 4 landed on Darwin TCP_NOPUSH 4 and KEEPINTVL 5 /
+// KEEPCNT 6 hit nothing sensible:
+//   option              Linux   Darwin
+//   TCP_NODELAY           1       0x01
+//   TCP_MAXSEG            2       0x02
+//   TCP_CORK              3       TCP_NOPUSH 0x04  (closest analogue; FreeBSD folds them too)
+//   TCP_KEEPIDLE          4       TCP_KEEPALIVE 0x10
+//   TCP_KEEPINTVL         5       0x101
+//   TCP_KEEPCNT           6       0x102
+//   TCP_USER_TIMEOUT     18       TCP_RXT_CONNDROPTIME 0x80 (Linux ms, Darwin seconds)
+// Anything else (TCP_INFO 11, TCP_QUICKACK 12, TCP_CONGESTION 13, ...) has no
+// Darwin counterpart and is refused with ENOPROTOOPT rather than aliasing an
+// unrelated Darwin option. MACAPK_TCP_OPTMAP=0 restores the raw pass-through.
+static bool macapk_tcp_optmap_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_TCP_OPTMAP");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+static constexpr int kLinuxTcpUserTimeout = 18;
+// Darwin optname for a Linux IPPROTO_TCP optname, or -1 when unmapped.
+static int tcp_optname_lin2mac(int lin) {
+    switch (lin) {
+        case 1:  return 0x01;    // TCP_NODELAY
+        case 2:  return 0x02;    // TCP_MAXSEG
+        case 3:  return 0x04;    // TCP_CORK -> TCP_NOPUSH
+        case 4:  return 0x10;    // TCP_KEEPIDLE -> TCP_KEEPALIVE
+        case 5:  return 0x101;   // TCP_KEEPINTVL
+        case 6:  return 0x102;   // TCP_KEEPCNT
+        case kLinuxTcpUserTimeout: return 0x80;   // TCP_RXT_CONNDROPTIME
+        default: return -1;
+    }
+}
+
 // setsockopt/getsockopt: translate the SOL_SOCKET level + SO_* optname. Other
 // levels (IPPROTO_TCP=6, IPPROTO_IP=0, IPPROTO_IPV6=41 -- identical numbers on
-// both) and their optnames pass through; the common ones Mono uses there
-// (TCP_NODELAY=1) match macOS, and net-trace flags any that don't.
+// both) keep their level; IPPROTO_TCP optnames go through tcp_optname_lin2mac
+// above, and net-trace flags any that don't map.
 extern "C" int __macapk_arm64_setsockopt(int fd, int level, int optname,
                                            const void* val, socklen_t len) {
     int mlevel = optname_level_to_mac(level);
@@ -26828,7 +26866,20 @@ extern "C" int __macapk_arm64_setsockopt(int fd, int level, int optname,
         int t = ip_optname_lin2mac(level, optname);
         if (t >= 0) mopt = t;
     }
-    int rc = ::setsockopt(fd, mlevel, mopt, val, len);
+    int rc;
+    if (level == 6 /*IPPROTO_TCP*/ && macapk_tcp_optmap_on()) {
+        mopt = tcp_optname_lin2mac(optname);
+        if (mopt < 0) { errno = errno_mac2lin(ENOPROTOOPT); return -1; }
+        if (optname == kLinuxTcpUserTimeout && val && len >= sizeof(int)) {
+            int ms = *static_cast<const int*>(val);
+            int sec = ms <= 0 ? 0 : (ms + 999) / 1000;   // Linux ms -> Darwin seconds, round up
+            rc = ::setsockopt(fd, mlevel, mopt, &sec, sizeof(sec));
+        } else {
+            rc = ::setsockopt(fd, mlevel, mopt, val, len);
+        }
+    } else {
+        rc = ::setsockopt(fd, mlevel, mopt, val, len);
+    }
     int e = errno;
     if (net_trace_on() && g_net_trace_n.fetch_add(1) < net_trace_cap()) {
         std::fprintf(stderr,
@@ -26851,7 +26902,24 @@ extern "C" int __macapk_arm64_getsockopt(int fd, int level, int optname,
         int t = ip_optname_lin2mac(level, optname);
         if (t >= 0) mopt = t;
     }
-    int rc = ::getsockopt(fd, mlevel, mopt, val, len);
+    int rc;
+    if (level == 6 /*IPPROTO_TCP*/ && macapk_tcp_optmap_on()) {
+        mopt = tcp_optname_lin2mac(optname);
+        if (mopt < 0) { errno = errno_mac2lin(ENOPROTOOPT); return -1; }
+        if (optname == kLinuxTcpUserTimeout && val && len && *len >= sizeof(int)) {
+            int sec = 0;
+            socklen_t sl = sizeof(sec);
+            rc = ::getsockopt(fd, mlevel, mopt, &sec, &sl);
+            if (rc == 0) {
+                *static_cast<int*>(val) = sec * 1000;   // Darwin seconds -> Linux ms
+                *len = sizeof(int);
+            }
+        } else {
+            rc = ::getsockopt(fd, mlevel, mopt, val, len);
+        }
+    } else {
+        rc = ::getsockopt(fd, mlevel, mopt, val, len);
+    }
     int e = errno;
     // SO_ERROR (Linux SOL_SOCKET/4) returns the pending socket error as a raw
     // OS errno in *val -- a macOS number that the guest will compare against
@@ -28081,10 +28149,59 @@ static int macapk_oal_mutex_unlock(int32_t* m) {
 // memory at most a single +1 increment on the recipient's offset 0,
 // which is far below the threshold (lens[i] >= 16) that triggers the
 // inflate_table crash.
+// Static RECURSIVE / ERRORCHECK initialisers. Bionic (libc/include/pthread.h):
+//   PTHREAD_MUTEX_INITIALIZER               { { ((0 & 3) << 14) } }  == 0      (all-zero)
+//   PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP  { { ((1 & 3) << 14) } }  == 0x4000
+//   PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP { { ((2 & 3) << 14) } }  == 0x8000
+// i.e. the type rides in bits 14-15 of the first int and every other byte is
+// zero. Those two are neither magic-stamped nor all-zero, so ensure_valid used
+// to answer EINVAL for them (the ARM32 lane honours the same pattern, see
+// arm32_mutex_type_enabled). Returns the Bionic type (1 recursive, 2
+// errorcheck) for an UNSTAMPED mutex of exactly that shape, else 0. Our own
+// futex word m[0] is 0/1/2 (or an odd mach port name when owner-aware), so a
+// live mutex can never read 0x4000/0x8000. MACAPK_ARM64_MUTEX_STATIC_INIT=0
+// restores the old EINVAL.
+static bool macapk_arm64_mutex_static_init_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_ARM64_MUTEX_STATIC_INIT");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+static inline int32_t macapk_arm64_mutex_static_type(const int32_t* m) {
+    if (!macapk_arm64_mutex_static_init_on()) return 0;
+    const int32_t w = __atomic_load_n(&m[0], __ATOMIC_RELAXED);
+    if (w != 0x4000 && w != 0x8000) return 0;
+    for (int i = 1; i < 10; ++i) {
+        if (__atomic_load_n(&m[i], __ATOMIC_RELAXED) != 0) return 0;
+    }
+    return w == 0x4000 ? 1 : 2;
+}
 static inline bool macapk_arm64_mutex_ensure_valid(int32_t* m) {
     if (uint32_t(__atomic_load_n(&m[kMutexMagicSlot], __ATOMIC_RELAXED))
             == kMacApkMutexMagic) {
         return true;
+    }
+    if (const int32_t st = macapk_arm64_mutex_static_type(m)) {
+        // First use of a static recursive/errorcheck mutex. Claim the lazy init by
+        // CAS-ing the type slot (0 -> st); only the winner rewrites the futex word
+        // and stamps the magic (release), so a concurrent first locker either wins
+        // or waits for the stamp. The type slot is written BEFORE the magic, and
+        // the magic is what every other path keys on.
+        int32_t expected = 0;
+        if (__atomic_compare_exchange_n(&m[kMutexTypeSlot], &expected, st, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            __atomic_store_n(&m[0], 0, __ATOMIC_RELAXED);
+            __atomic_store_n(&m[kMutexMagicSlot], int32_t(kMacApkMutexMagic),
+                             __ATOMIC_RELEASE);
+            return true;
+        }
+        for (int spin = 0; spin < 1000000; ++spin) {
+            if (uint32_t(__atomic_load_n(&m[kMutexMagicSlot], __ATOMIC_ACQUIRE))
+                    == kMacApkMutexMagic) return true;
+            sched_yield();
+        }
+        return false;
     }
     if (!macapk_arm64_mutex_all_zero(m)) {
         // CONCURRENT-FIRST-LOCK RACE (v1.0.590): two threads lock a fresh
@@ -28100,6 +28217,19 @@ static inline bool macapk_arm64_mutex_ensure_valid(int32_t* m) {
         // the magic with ACQUIRE ordering before giving up: if a concurrent
         // stamper set it, the mutex IS ours and valid. (The CAS-stamp path below
         // already handles the symmetric race via its `expected` readback.)
+        // The same window exists for a static recursive/errorcheck mutex whose
+        // lazy init (above) is mid-flight: type slot already claimed, magic not
+        // yet published. Wait it out (bounded) instead of reporting EINVAL.
+        if (macapk_arm64_mutex_static_init_on()) {
+            const int32_t t = __atomic_load_n(&m[kMutexTypeSlot], __ATOMIC_RELAXED);
+            if (t == 1 || t == 2) {
+                for (int spin = 0; spin < 1000000; ++spin) {
+                    if (uint32_t(__atomic_load_n(&m[kMutexMagicSlot], __ATOMIC_ACQUIRE))
+                            == kMacApkMutexMagic) return true;
+                    sched_yield();
+                }
+            }
+        }
         return uint32_t(__atomic_load_n(&m[kMutexMagicSlot], __ATOMIC_ACQUIRE))
                    == kMacApkMutexMagic;
     }
@@ -32834,6 +32964,33 @@ static inline ssize_t macapk_rw_face(ssize_t r) {
     if (r < 0 && macapk_rw_errno_linux_on()) errno = errno_mac2lin(errno);
     return r;
 }
+
+// File/path shims (open/openat/fcntl/stat/mkdir/rename/...) used to leave the
+// DARWIN errno for the guest, which expects Bionic/Linux numbering: a failed
+// F_SETLK is Darwin EAGAIN 35 == Linux EDEADLK (SQLite then reports IOERR, not
+// BUSY); rmdir of a full dir is ENOTEMPTY 66 (Linux 39), ELOOP 62 (40),
+// ENAMETOOLONG 63 (36). Each exported face is `macapk_file_face(<name>_host())`:
+// the _host core keeps HOST errno, which is what the raw syscall router (and the
+// ARM32 pipe2 lane) expects -- they translate once themselves, so they call the
+// core, never the face (a Linux ELOOP 40 translated twice is EMSGSIZE 90; see
+// macapk_syscall_libc_errno_on). =0 restores the raw Darwin errno.
+static bool macapk_file_errno_linux_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_FILE_ERRNO_LINUX");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+extern "C++" {   // a template cannot have C linkage; this TU is inside extern "C" here
+template <class T>
+static inline T macapk_file_face(T r) {
+    bool failed;
+    if constexpr (std::is_pointer<T>::value) failed = (r == nullptr);
+    else failed = (r < 0);
+    if (failed && macapk_file_errno_linux_on()) errno = errno_mac2lin(errno);
+    return r;
+}
+}   // extern "C++"
 
 static constexpr int kBionicEfdFlagsSet =
     kBionicEfdSemaphore | kBionicFdCloexec | kBionicFdNonblock;
@@ -43043,7 +43200,11 @@ static int macapk_macos_to_bionic_fflags(int m) {
 // returned EACCES, and no native state survived a reboot. Named params place
 // mode in x2 exactly where the caller put it (same fix idiom as __macapk_arm64_
 // syscall above). mode is only honored when O_CREAT is set, matching open(2).
+static int macapk_open_host(const char* path, int flags, mode_t mode);
 extern "C" int __macapk_arm64_open(const char* path, int flags, mode_t mode) {
+    return macapk_file_face(macapk_open_host(path, flags, mode));
+}
+static int macapk_open_host(const char* path, int flags, mode_t mode) {
     if (!path) return -1;
     std::string remapped;
     {
@@ -43213,8 +43374,11 @@ static void macapk_pairip_systrace(const char* sc, const char* path) {
     if (o > 0) { ssize_t w = ::write(fd, b, (size_t)o); (void)w; }
 }
 
-extern "C" int __macapk_arm64_openat(int dirfd, const char* path, int flags,
-                                     mode_t mode) {
+static int macapk_openat_host(int dirfd, const char* path, int flags, mode_t mode);
+extern "C" int __macapk_arm64_openat(int dirfd, const char* path, int flags, mode_t mode) {
+    return macapk_file_face(macapk_openat_host(dirfd, path, flags, mode));
+}
+static int macapk_openat_host(int dirfd, const char* path, int flags, mode_t mode) {
     if (!path) { errno = EFAULT; return -1; }
     macapk_pairip_systrace("openat", path);
     const int mflags = macapk_bionic_to_macos_oflags(flags);
@@ -43349,8 +43513,11 @@ extern "C" int __macapk_arm64_renameat(int olddirfd, const char* oldp,
 // libsysoptimizer all import it as an ordinary dynamic symbol.
 static bool macapk_host_path_to_android(const char* host, std::string& out);
 static ssize_t macapk_readlink_finish(char* buf, size_t n, ssize_t rc);
-extern "C" ssize_t __macapk_arm64_readlink(const char* path, char* buf,
-                                           size_t n) {
+static ssize_t macapk_readlink_host(const char* path, char* buf, size_t n);
+extern "C" ssize_t __macapk_arm64_readlink(const char* path, char* buf, size_t n) {
+    return macapk_file_face(macapk_readlink_host(path, buf, n));
+}
+static ssize_t macapk_readlink_host(const char* path, char* buf, size_t n) {
     if (!path || !buf) { errno = EFAULT; return -1; }
     ssize_t rc = ::readlink(macapk_arm64_remap_path(path).c_str(), buf, n);
     // Same Android-path reverse map as readlinkat: a guest reading back a symlink must see
@@ -43568,7 +43735,11 @@ static short macapk_lin_to_mac_locktype(short lt) {
 static short macapk_mac_to_lin_locktype(short lt) {
     switch (lt) { case 1: return 0; case 3: return 1; case 2: return 2; default: return 2; }
 }
+static int macapk_fcntl_host(int fd, int cmd, void* arg);
 extern "C" int __macapk_arm64_fcntl(int fd, int cmd, void* arg) {
+    return macapk_file_face(macapk_fcntl_host(fd, cmd, arg));
+}
+static int macapk_fcntl_host(int fd, int cmd, void* arg) {
     switch (cmd) {
         case 0: { int r = ::fcntl(fd, F_DUPFD, (int)(intptr_t)arg);        // F_DUPFD
                   macapk_efd_dup(fd, r); return r; }
@@ -43733,7 +43904,11 @@ extern "C" ssize_t __macapk_arm64_write(int fd, const void* buf, size_t n) {
     macapk_net_trace_sock_rw("write", fd, buf, n, r);
     return macapk_rw_face(r);
 }
+static int macapk_access_host(const char* path, int mode);
 extern "C" int __macapk_arm64_access(const char* path, int mode) {
+    return macapk_file_face(macapk_access_host(path, mode));
+}
+static int macapk_access_host(const char* path, int mode) {
     if (!path) return -1;
     std::string remapped = macapk_arm64_remap_path(path);
     int rc = access(remapped.c_str(), mode);
@@ -43812,7 +43987,11 @@ static bool macapk_procfs_stat_on();
 static void macapk_datadir_stat_fixup(struct stat& st);
 static bool macapk_is_datadir_path(const char* android_path);
 
+static int macapk_stat_host(const char* path, BionicStat* st);
 extern "C" int __macapk_arm64_stat(const char* path, BionicStat* st) {
+    return macapk_file_face(macapk_stat_host(path, st));
+}
+static int macapk_stat_host(const char* path, BionicStat* st) {
     if (!path || !st) return -1;
     // Heartbeat: log every stat call so we can see whether the .png
     // lookup goes through stat (vs. some other existence check).
@@ -43833,7 +44012,11 @@ extern "C" int __macapk_arm64_stat(const char* path, BionicStat* st) {
     }
     return rc;
 }
+static int macapk_lstat_host(const char* path, BionicStat* st);
 extern "C" int __macapk_arm64_lstat(const char* path, BionicStat* st) {
+    return macapk_file_face(macapk_lstat_host(path, st));
+}
+static int macapk_lstat_host(const char* path, BionicStat* st) {
     if (!path || !st) return -1;
     std::string remapped = macapk_arm64_remap_path(path);
     struct stat host;
@@ -43960,32 +44143,56 @@ extern "C" int __macapk_arm64_fstat(int fd, BionicStat* st) {
 // lstat/access already remap; these complete the set so an engine can
 // CREATE its writable tree (il2cpp's resource extraction: mkdir scratch,
 // write+rename the *.dll-resources.dat, stamp unity.ver).
+static int macapk_mkdir_host(const char* path, mode_t mode);
 extern "C" int __macapk_arm64_mkdir(const char* path, mode_t mode) {
+    return macapk_file_face(macapk_mkdir_host(path, mode));
+}
+static int macapk_mkdir_host(const char* path, mode_t mode) {
     if (!path) { errno = EFAULT; return -1; }
     const MacapkPathWriteScope wi(true);   // mutates: the .apk fallback is read-only
     return ::mkdir(macapk_arm64_remap_path(path).c_str(), mode ? mode : 0777);
 }
+static int macapk_rmdir_host(const char* path);
 extern "C" int __macapk_arm64_rmdir(const char* path) {
+    return macapk_file_face(macapk_rmdir_host(path));
+}
+static int macapk_rmdir_host(const char* path) {
     if (!path) { errno = EFAULT; return -1; }
     const MacapkPathWriteScope wi(true);   // mutates: the .apk fallback is read-only
     return ::rmdir(macapk_arm64_remap_path(path).c_str());
 }
+static int macapk_unlink_host(const char* path);
 extern "C" int __macapk_arm64_unlink(const char* path) {
+    return macapk_file_face(macapk_unlink_host(path));
+}
+static int macapk_unlink_host(const char* path) {
     if (!path) { errno = EFAULT; return -1; }
     const MacapkPathWriteScope wi(true);   // mutates: the .apk fallback is read-only
     return ::unlink(macapk_arm64_remap_path(path).c_str());
 }
+static int macapk_remove_host(const char* path);
 extern "C" int __macapk_arm64_remove(const char* path) {
+    return macapk_file_face(macapk_remove_host(path));
+}
+static int macapk_remove_host(const char* path) {
     if (!path) { errno = EFAULT; return -1; }
     const MacapkPathWriteScope wi(true);   // mutates: the .apk fallback is read-only
     return ::remove(macapk_arm64_remap_path(path).c_str());
 }
+static int macapk_chmod_host(const char* path, mode_t mode);
 extern "C" int __macapk_arm64_chmod(const char* path, mode_t mode) {
+    return macapk_file_face(macapk_chmod_host(path, mode));
+}
+static int macapk_chmod_host(const char* path, mode_t mode) {
     if (!path) { errno = EFAULT; return -1; }
     const MacapkPathWriteScope wi(true);   // mutates: the .apk fallback is read-only
     return ::chmod(macapk_arm64_remap_path(path).c_str(), mode);
 }
+static int macapk_rename_host(const char* oldp, const char* newp);
 extern "C" int __macapk_arm64_rename(const char* oldp, const char* newp) {
+    return macapk_file_face(macapk_rename_host(oldp, newp));
+}
+static int macapk_rename_host(const char* oldp, const char* newp) {
     if (!oldp || !newp) { errno = EFAULT; return -1; }
     const MacapkPathWriteScope wi(true);   // mutates: the .apk fallback is read-only
     std::string o = macapk_arm64_remap_path(oldp);
@@ -44075,7 +44282,11 @@ struct BionicDirent {
 };
 }  // namespace
 
+static void* macapk_opendir_host(const char* path);
 extern "C" void* __macapk_arm64_opendir(const char* path) {
+    return macapk_file_face(macapk_opendir_host(path));
+}
+static void* macapk_opendir_host(const char* path) {
     if (!path) return nullptr;
     std::string remapped = macapk_arm64_remap_path(path);
     DIR* d = opendir(remapped.c_str());
@@ -45192,7 +45403,11 @@ extern "C" int __macapk_arm64_epoll_wait(int epfd, void* evp, int maxevents,
 // pipe2(fds[2], flags) -- Linux pipe + atomic O_NONBLOCK/O_CLOEXEC. macOS has
 // no pipe2, so emulate with pipe() + fcntl. flags arrive as Bionic/Linux
 // constants (O_NONBLOCK 0x800, O_CLOEXEC 0x80000); translate to macOS.
+static int macapk_pipe2_host(int fds[2], int flags);
 extern "C" int __macapk_arm64_pipe2(int fds[2], int flags) {
+    return macapk_file_face(macapk_pipe2_host(fds, flags));
+}
+static int macapk_pipe2_host(int fds[2], int flags) {
     if (::pipe(fds) != 0) return -1;
     if (flags & MACAPK_BIONIC_O_CLOEXEC) {
         ::fcntl(fds[0], F_SETFD, FD_CLOEXEC);
@@ -45499,8 +45714,11 @@ extern "C" int __macapk_arm64_fstat64(int fd, BionicStat* st) {
 // dirfd=-100 -> EBADF. Likewise the guest's AT_SYMLINK_NOFOLLOW is 0x100, a bit
 // Darwin does not define, so passing `flags` through unchanged made xnu EINVAL
 // the whole call. See the AT_* table above macapk_bionic_to_macos_atflags.
-extern "C" int __macapk_arm64_fstatat(int dirfd, const char* path,
-                                      BionicStat* st, int flags) {
+static int macapk_fstatat_host(int dirfd, const char* path, BionicStat* st, int flags);
+extern "C" int __macapk_arm64_fstatat(int dirfd, const char* path, BionicStat* st, int flags) {
+    return macapk_file_face(macapk_fstatat_host(dirfd, path, st, flags));
+}
+static int macapk_fstatat_host(int dirfd, const char* path, BionicStat* st, int flags) {
     if (!path || !st) { errno = EFAULT; return -1; }
     macapk_pairip_systrace("newfstatat", path);
     struct stat host;
@@ -47555,13 +47773,21 @@ extern "C" uint64_t __macapk_logcap_rotations(void) {
 // the carrier instead of the counter (review issue 1 of
 // docs/eventfd-counter-and-rw-errno_2026-09-28.md; dup3/F_DUPFD already did
 // this correctly, dup/dup2 were the gap).
+static int macapk_dup_host(int oldfd);
 extern "C" int __macapk_arm64_dup(int oldfd) {
+    return macapk_file_face(macapk_dup_host(oldfd));
+}
+static int macapk_dup_host(int oldfd) {
     const int r = ::dup(oldfd);
     if (r < 0) return -1;             // errno set by dup(); face translates it
     macapk_efd_dup(oldfd, r);
     return r;
 }
+static int macapk_dup2_host(int oldfd, int newfd);
 extern "C" int __macapk_arm64_dup2(int oldfd, int newfd) {
+    return macapk_file_face(macapk_dup2_host(oldfd, newfd));
+}
+static int macapk_dup2_host(int oldfd, int newfd) {
     // Linux dup2(fd, fd) is a no-op returning fd (no EINVAL, unlike dup3),
     // but still EBADF for a closed fd -- fcntl(F_GETFD) is the cheap validity
     // probe (works for the eventfd carrier the same as any other fd).
@@ -48771,7 +48997,7 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         case 20:  return (long)__macapk_arm64_epoll_create1((int)a1);  // epoll_create1
         case 21:  return (long)__macapk_arm64_epoll_ctl((int)a1, (int)a2, (int)a3, (void*)macapk_untag_ptr((void*)a4));  // epoll_ctl
         case 24:  return (long)__macapk_arm64_dup3((int)a1, (int)a2, (int)a3);  // dup3 (was ENOSYS)
-        case 25:  return (long)__macapk_arm64_fcntl((int)a1, (int)a2, (void*)macapk_untag_ptr((void*)a3));  // fcntl
+        case 25:  return (long)macapk_fcntl_host((int)a1, (int)a2, (void*)macapk_untag_ptr((void*)a3));  // fcntl
         // 26-28 and 198-209: these shims answer in LINUX errno (the inotify stubs
         // set 38; the socket shims translate at their own export for by-name
         // callers), so macapk_router_from_linux returns them to this router's host
@@ -48787,7 +49013,7 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         case 44:  return (long)__macapk_arm64_fstatfs((int)a1, (void*)macapk_untag_ptr((void*)a2));  // fstatfs
         case 48:  return (long)__macapk_arm64_faccessat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, (int)a4);  // faccessat
         case 53:  return (long)__macapk_arm64_fchmodat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (mode_t)a3, (int)a4);  // fchmodat
-        case 56:  return (long)__macapk_arm64_openat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, (mode_t)a4);  // openat
+        case 56:  return (long)macapk_openat_host((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, (mode_t)a4);  // openat
         // 36/37/45/49/54/88 added with the S0 path shims (2026-09-26), by this
         // block's own rule: the kernel's name matches a shim that now exists, the
         // semantics and argument order are the libc wrapper's (each of these libc
@@ -48847,7 +49073,7 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         case 176: return (long)getgid();                       // getgid
         case 177: return (long)getegid();                      // getegid
         case 62:  return (long)__macapk_arm64_lseek64((int)a1, (off_t)a2, (int)a3);  // lseek
-        case 59:  return (long)__macapk_arm64_pipe2((int*)a1, (int)a2);  // pipe2
+        case 59:  return (long)macapk_pipe2_host((int*)a1, (int)a2);  // pipe2
         // read/pread64/pwrite64 call the HOST-errno cores: their exported faces
         // answer in Linux errno since 2026-09-28 (MACAPK_RW_ERRNO_LINUX), and this
         // router's contract is host errno (translated once by the face above).
@@ -48869,7 +49095,7 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         case 67:  return (long)::pread((int)a1, (void*)macapk_untag_ptr((void*)a2), (size_t)a3, (off_t)a4);  // pread64
         case 68:  return (long)::pwrite((int)a1, (const void*)a2, (size_t)a3, (off_t)(int64_t)a4);  // pwrite64
         case 78:  return (long)__macapk_arm64_readlinkat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (char*)macapk_untag_ptr((void*)a3), (size_t)a4);  // readlinkat
-        case 79:  return (long)__macapk_arm64_fstatat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (BionicStat*)macapk_untag_ptr((void*)a3), (int)a4);  // fstatat
+        case 79:  return (long)macapk_fstatat_host((int)a1, (const char*)macapk_untag_ptr((void*)a2), (BionicStat*)macapk_untag_ptr((void*)a3), (int)a4);  // fstatat
         case 80:  return (long)__macapk_arm64_fstat((int)a1, (BionicStat*)macapk_untag_ptr((void*)a2));  // fstat
         case 115:  return (long)__macapk_arm64_clock_nanosleep((int)a1, (int)a2, (const struct timespec*)a3, (struct timespec*)macapk_untag_ptr((void*)a4));  // clock_nanosleep
         case 118:  return (long)__macapk_arm64_sched_setparam((pid_t)a1, (const void*)a2);  // sched_setparam
@@ -50694,7 +50920,7 @@ uint32_t __macapk_shim_pipe2(uint32_t fds_addr, uint32_t flags,
     if (!fds_addr) return static_cast<uint32_t>(-1);
     int* fds = reinterpret_cast<int*>(gptr(fds_addr));
     return static_cast<uint32_t>(
-        __macapk_arm64_pipe2(fds, static_cast<int>(flags)));
+        macapk_pipe2_host(fds, static_cast<int>(flags)));
 }
 
 // dladdr(addr, info) -- 2026-07-28, another instance of the wrong-ABI
@@ -55180,6 +55406,61 @@ extern "C" int __macapk_arm64___android_log_vprint(int /*prio*/, const char* tag
     }
     return n;
 }
+
+// ---------------------------------------------------------------------------
+// Small Bionic-only symbols with no Darwin export. A guest import that finds
+// neither a shim nor a libSystem symbol resolves to the unresolved-symbol trap
+// (abort on first call), so each of these is a deliberately minimal stand-in.
+// Declarations from bionic: libc/include/sched.h, android/fdsan.h,
+// android/log.h (__android_log_is_loggable lives in liblog's private header
+// but is exported), malloc.h, unistd.h.
+// ---------------------------------------------------------------------------
+// int sched_getcpu(void): macOS exposes no CPU number to userland. 0 is a valid
+// answer for per-CPU sharding callers (they only use it as a hash/index).
+extern "C" int __macapk_arm64_sched_getcpu(void) { return 0; }
+
+// int __android_log_is_loggable(int prio, const char* tag, int default_prio):
+// no per-tag log.tag.<tag> properties here, so the default level decides, as
+// liblog does when the property is unset (loggable iff prio >= default_prio).
+extern "C" int __macapk_arm64___android_log_is_loggable(int prio, const char* /*tag*/,
+                                                         int default_prio) {
+    return prio >= default_prio ? 1 : 0;
+}
+
+// fdsan (android/fdsan.h): fd-ownership checking is a debugging aid that aborts
+// on misuse; we do not track owners. Level 0 is ANDROID_FDSAN_ERROR_LEVEL_DISABLED
+// (the old level is returned by set_error_level, hence 0 too); tags are opaque
+// 64-bit values to the guest, so 0 ("unowned") is a consistent answer.
+extern "C" int __macapk_arm64_android_fdsan_get_error_level(void) { return 0; }
+extern "C" int __macapk_arm64_android_fdsan_set_error_level(int /*new_level*/) { return 0; }
+extern "C" uint64_t __macapk_arm64_android_fdsan_get_owner_tag(int /*fd*/) { return 0; }
+extern "C" uint64_t __macapk_arm64_android_fdsan_create_owner_tag(int type, uint64_t value) {
+    // android/fdsan.h: (type << 56) | (value & ((1<<56)-1)) -- cheap to keep faithful.
+    return (static_cast<uint64_t>(type) << 56) | (value & ((1ULL << 56) - 1));
+}
+extern "C" void __macapk_arm64_android_fdsan_exchange_owner_tag(int /*fd*/, uint64_t /*expected*/,
+                                                                  uint64_t /*new_tag*/) {}
+extern "C" int __macapk_arm64_android_fdsan_close_with_tag(int fd, uint64_t /*tag*/) {
+    return ::close(fd);   // no ownership check; errno is the host's, as plain close() is unshimmed
+}
+
+// int getresuid/getresgid(id_t* r, id_t* e, id_t* s): macOS has neither. This
+// process has no saved-set ids distinct from real/effective, so report the
+// effective id (what getuid()/getgid() answer here) for all three.
+extern "C" int __macapk_arm64_getresuid(uid_t* r, uid_t* e, uid_t* s) {
+    if (!r || !e || !s) { errno = EFAULT; return -1; }
+    *r = *e = *s = getuid();
+    return 0;
+}
+extern "C" int __macapk_arm64_getresgid(gid_t* r, gid_t* e, gid_t* s) {
+    if (!r || !e || !s) { errno = EFAULT; return -1; }
+    *r = *e = *s = getgid();
+    return 0;
+}
+
+// int mallopt(int param, int value): M_DECAY_TIME, M_PURGE etc. tune Bionic's
+// allocator, which we do not use. Bionic returns 1 on success, 0 on failure.
+extern "C" int __macapk_arm64_mallopt(int /*param*/, int /*value*/) { return 1; }
 
 extern "C" {
 __attribute__((naked))

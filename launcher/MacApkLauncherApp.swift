@@ -3397,7 +3397,10 @@ struct LauncherView: View {
                     \(peek.detailLine)
 
                     This is newer than the installed version (\(old) -> \(new)). \
-                    Your saved data is carried forward.
+                    \(BundleGenerator.identityMode() == .package
+                        && RegistryStore.shared.setting(InstallPipeline.storeUpdatesInPlaceSettingKey) != "0"
+                        ? "Your saved data is carried forward."
+                        : "It installs alongside the current version as a separate app. The current version and its data stay untouched.")
                     """
                 case let (old?, new?) where new < old:
                     alert.alertStyle = .warning

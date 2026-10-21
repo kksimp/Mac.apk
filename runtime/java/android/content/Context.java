@@ -374,7 +374,9 @@ public abstract class Context {
     public Resources getResourcesDirect() { return getResources(); }
     public Context createPackageContextAsUser(String packageName, int flags,
                                                 android.os.UserHandle user)
-            throws android.content.pm.PackageManager.NameNotFoundException { return this; }
+            throws android.content.pm.PackageManager.NameNotFoundException {
+        return createPackageContext(packageName, flags);
+    }
     public Context createContextForSplit(String splitName)
             throws android.content.pm.PackageManager.NameNotFoundException { return this; }
     public Context createAttributionContext(String attributionTag) { return this; }
@@ -3166,7 +3168,27 @@ public abstract class Context {
         }
     }
 
-    public Context createPackageContext(String packageName, int flags) { return this; }
+    /** AOSP ContextImpl.createPackageContextAsUser throws NameNotFoundException
+     *  for a package that is not installed ("Application package X not found").
+     *  This used to answer `this` for ANY name, so an app probing "is package X
+     *  installed?" through it always heard yes, and a caller that went on to
+     *  load X's resources or classes got its own instead. Now a name the
+     *  PackageManager does not know throws, exactly as getPackageInfo already
+     *  does here; the app's own package and "android" (the framework, whose
+     *  resources this Context already serves) still answer `this`.
+     *  MACAPK_PKGCTX_STRICT=0 restores the old always-`this` answer. */
+    private static final boolean PKGCTX_STRICT =
+        !"0".equals(System.getenv("MACAPK_PKGCTX_STRICT"));
+
+    public Context createPackageContext(String packageName, int flags)
+            throws android.content.pm.PackageManager.NameNotFoundException {
+        if (PKGCTX_STRICT && packageName != null
+                && !packageName.equals(getPackageName()) && !"android".equals(packageName)) {
+            android.content.pm.PackageManager pm = getPackageManager();
+            if (pm != null) pm.getPackageInfo(packageName, 0);   // throws when not installed
+        }
+        return this;
+    }
 
     // ---- Wallpaper (all @Deprecated upstream; the replacement is
     // WallpaperManager, which these delegate to exactly as AOSP's ContextImpl

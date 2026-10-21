@@ -23,7 +23,68 @@ public class LocaleManager {
 
     // The app's currently-selected locales. Empty == "follow the system",
     // which is what AOSP returns when the app has set no override.
-    private volatile LocaleList applicationLocales = LocaleList.getEmptyLocaleList();
+    //
+    // PROCESS-WIDE AND PERSISTED. AOSP keeps the selection in the system's
+    // LocaleManagerService and it survives restarts -- that is the point of a
+    // per-app language: AppCompat 1.6+ on API 33+ hands its storage to the
+    // platform (AppLocalesStorageHelper) and reads it back at every launch.
+    // Here it was an instance field, and Context caches one LocaleManager per
+    // Context, so an Activity's choice was invisible through the Application
+    // and every choice was gone on the next start. It is now one value per
+    // process, saved to <dataDir>/macapk_app_locales and read back on first use.
+    private static volatile LocaleList applicationLocales;
+    private static final String STORE_NAME = "macapk_app_locales";
+
+    private static java.io.File storeFile() {
+        try {
+            Application app = Application.getInstance();
+            java.io.File dir = app != null ? app.getDataDir() : null;
+            return dir != null ? new java.io.File(dir, STORE_NAME) : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static LocaleList loaded() {
+        LocaleList l = applicationLocales;
+        if (l != null) return l;
+        synchronized (LocaleManager.class) {
+            if (applicationLocales != null) return applicationLocales;
+            l = LocaleList.getEmptyLocaleList();
+            java.io.File f = storeFile();
+            if (f != null && f.isFile()) {
+                try {
+                    String tags = new String(java.nio.file.Files.readAllBytes(f.toPath()),
+                        java.nio.charset.StandardCharsets.UTF_8).trim();
+                    if (!tags.isEmpty()) {
+                        l = LocaleList.forLanguageTags(tags);
+                        if (l.size() > 0 && l.get(0) != null) Locale.setDefault(l.get(0));
+                    }
+                } catch (Throwable ignored) {}
+            }
+            applicationLocales = l;
+            return l;
+        }
+    }
+
+    private static void save(LocaleList l) {
+        java.io.File f = storeFile();
+        if (f == null) return;
+        try {
+            if (l.size() == 0) {
+                f.delete();
+                return;
+            }
+            java.io.File tmp = new java.io.File(f.getPath() + ".tmp");
+            java.nio.file.Files.write(tmp.toPath(),
+                l.toLanguageTags().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            java.nio.file.Files.move(tmp.toPath(), f.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        } catch (Throwable t) {
+            android.util.Log.w("LocaleManager", "could not save app locales: " + t);
+        }
+    }
 
     // Captured once at class-load, before any app has ever called
     // setApplicationLocales -- the true boot-time system locale, so a caller
@@ -58,7 +119,10 @@ public class LocaleManager {
      *  scope this to. */
     public void setApplicationLocales(LocaleList locales) {
         if (locales == null) locales = LocaleList.getEmptyLocaleList();
-        this.applicationLocales = locales;
+        synchronized (LocaleManager.class) {
+            applicationLocales = locales;
+            save(locales);
+        }
         Locale primary = locales.size() > 0 ? locales.get(0) : SYSTEM_LOCALE;
         try {
             if (primary != null) Locale.setDefault(primary);
@@ -78,8 +142,7 @@ public class LocaleManager {
     /** AOSP: returns the app's selected locales, or the empty list if it
      *  follows the system. */
     public LocaleList getApplicationLocales() {
-        LocaleList l = applicationLocales;
-        return l != null ? l : LocaleList.getEmptyLocaleList();
+        return loaded();
     }
 
     /** AOSP getApplicationLocales(String packageName): system-app overload.

@@ -2,10 +2,10 @@ package android.speech.tts;
 
 // android.speech.tts.UtteranceProgressListener -- callbacks for the progress of
 // an utterance through the synthesis queue (API 15+). AOSP frameworks/base
-// core/java/android/speech/tts/UtteranceProgressListener.java. Mac.apk never
-// synthesizes audio, so these callbacks are never invoked; the type exists so
-// TextToSpeech.setOnUtteranceProgressListener(...) resolves and apps can
-// subclass it. The abstract methods and the non-abstract convenience overloads
+// core/java/android/speech/tts/UtteranceProgressListener.java. TextToSpeech's
+// queue worker reports each utterance through onStart / onDone / onError /
+// onStop; the synthesis-level callbacks (onBeginSynthesis, onAudioAvailable,
+// onRangeStart) are not driven, since the macOS engine plays its own audio. The abstract methods and the non-abstract convenience overloads
 // mirror AOSP so an app's subclass compiles unchanged.
 public abstract class UtteranceProgressListener {
 

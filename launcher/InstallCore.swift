@@ -4549,6 +4549,31 @@ public final class InstallPipeline {
         }
         if rows.isEmpty { return .failed(stage: "uninstall", message: "\(package) is not installed") }
 
+        // Refuse while a guest is running: removing its bundle and data dir out
+        // from under a live process loses its unsaved state and leaves it
+        // writing into a deleted tree. Same two signals the install path uses
+        // (runningGuests, then the stub's pidfile flock, which is authoritative
+        // where the former can be stale). MACAPK_UNINSTALL_RUNNING_CHECK=0 skips.
+        if ProcessInfo.processInfo.environment["MACAPK_UNINSTALL_RUNNING_CHECK"] != "0" {
+            let live = RuntimeInstall.runningGuests()
+            for r in rows {
+                var running = live.contains(r.dirName) || live.contains(r.package)
+                if !running {
+                    for name in Set([r.dirName, r.package]) where !name.isEmpty {
+                        let fd = open(Paths.runDir.appendingPathComponent("\(name).pid").path, O_RDONLY)
+                        guard fd >= 0 else { continue }
+                        if flock(fd, LOCK_EX | LOCK_NB) != 0 { running = true } else { flock(fd, LOCK_UN) }
+                        close(fd)
+                        if running { break }
+                    }
+                }
+                if running {
+                    return .failed(stage: "app-running",
+                                   message: "\(r.label) is running. Quit it, then try uninstalling again.")
+                }
+            }
+        }
+
         for r in rows {
             if let bp = r.bundlePath {
                 let url = URL(fileURLWithPath: bp)

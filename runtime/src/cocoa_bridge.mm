@@ -9881,6 +9881,13 @@ static void install_menu_bar(NSString* appTitle) {
     NSMenu* appMenu = [[NSMenu alloc] init];
     [appMenu addItemWithTitle:[NSString stringWithFormat:@"Hide %@", appTitle]
                        action:@selector(hide:) keyEquivalent:@"h"];
+    // Standard Hide Others (Option+Command+H) / Show All, right under Hide.
+    NSMenuItem* hideOthers =
+        [appMenu addItemWithTitle:@"Hide Others"
+                           action:@selector(hideOtherApplications:) keyEquivalent:@"h"];
+    [hideOthers setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
+    [appMenu addItemWithTitle:@"Show All"
+                       action:@selector(unhideAllApplications:) keyEquivalent:@""];
     [appMenu addItem:[NSMenuItem separatorItem]];
     // v1.0.1047: target our own quit rather than AppKit's terminate:, which
     // would reach exit(0) and re-open the __cxa_finalize deadlock. See
@@ -9907,6 +9914,29 @@ static void install_menu_bar(NSString* appTitle) {
 
     // Controls menu: pick the keyboard-binding profile.
     install_controls_menu(mainMenu);
+
+    // Window menu: Minimize (Cmd+M) / Zoom / Bring All to Front. Without it a
+    // borderless-looking guest window had no Cmd+M at all. A Command chord is
+    // offered to the window's performKeyEquivalent: and then the main menu
+    // BEFORE keyDown: runs (NSApplication sendEvent:), so Cmd+M is consumed
+    // here and never reaches the guest as Ctrl+M. Deliberately no Edit menu:
+    // Cmd+C/V/X/A already reach the guest as Ctrl chords (host_keymap.h) and an
+    // Edit menu's key equivalents would steal them. MACAPK_WINDOW_MENU=0 omits it.
+    const char* wm = std::getenv("MACAPK_WINDOW_MENU");
+    if (!(wm && wm[0] == '0')) {
+        NSMenuItem* windowItem = [[NSMenuItem alloc] init];
+        [mainMenu addItem:windowItem];
+        NSMenu* windowMenu = [[NSMenu alloc] initWithTitle:@"Window"];
+        [windowMenu addItemWithTitle:@"Minimize"
+                              action:@selector(performMiniaturize:) keyEquivalent:@"m"];
+        [windowMenu addItemWithTitle:@"Zoom"
+                              action:@selector(performZoom:) keyEquivalent:@""];
+        [windowMenu addItem:[NSMenuItem separatorItem]];
+        [windowMenu addItemWithTitle:@"Bring All to Front"
+                              action:@selector(arrangeInFront:) keyEquivalent:@""];
+        [windowItem setSubmenu:windowMenu];
+        [g_app setWindowsMenu:windowMenu];
+    }
 
     [g_app setMainMenu:mainMenu];
 }

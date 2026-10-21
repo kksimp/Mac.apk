@@ -51,8 +51,16 @@ public class AndroidKeyStoreProvider extends Provider {
             "android.security.keystore.AndroidKeyStoreSpi");
         put("KeyGenerator.AES",
             "android.security.keystore.AndroidKeyStoreKeyGeneratorSpi$AES");
+        put("KeyGenerator.HmacSHA1",
+            "android.security.keystore.AndroidKeyStoreKeyGeneratorSpi$HmacSHA1");
+        put("KeyGenerator.HmacSHA224",
+            "android.security.keystore.AndroidKeyStoreKeyGeneratorSpi$HmacSHA224");
         put("KeyGenerator.HmacSHA256",
             "android.security.keystore.AndroidKeyStoreKeyGeneratorSpi$HmacSHA256");
+        put("KeyGenerator.HmacSHA384",
+            "android.security.keystore.AndroidKeyStoreKeyGeneratorSpi$HmacSHA384");
+        put("KeyGenerator.HmacSHA512",
+            "android.security.keystore.AndroidKeyStoreKeyGeneratorSpi$HmacSHA512");
         // v1.0.1597: the ASYMMETRIC side. Without these,
         // KeyPairGenerator.getInstance("EC", "AndroidKeyStore") -- the standard
         // way an app mints a device-bound key, and what token binding, request

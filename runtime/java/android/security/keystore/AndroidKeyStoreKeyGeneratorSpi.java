@@ -19,8 +19,8 @@ import javax.crypto.spec.SecretKeySpec;
 //   - engineInit(AlgorithmParameterSpec, SecureRandom) requires a
 //     KeyGenParameterSpec (InvalidAlgorithmParameterException otherwise),
 //     requires a non-null alias, defaults the key size per algorithm when
-//     the spec leaves it -1 (AES: 128; HmacSHA256: 256 = the digest output
-//     size), and validates it (AES: 128/192/256);
+//     the spec leaves it -1 (AES: 128; HmacSHA*: the digest output
+//     size, e.g. 256 for SHA256), and validates it (AES: 128/192/256);
 //   - engineGenerateKey() generates the key, BINDS it to the spec's alias
 //     in the keystore (that is the whole point of the AndroidKeyStore
 //     generator -- a later KeyStore.getKey(alias, null) must return it),
@@ -43,18 +43,58 @@ public abstract class AndroidKeyStoreKeyGeneratorSpi extends KeyGeneratorSpi {
         }
     }
 
+    // AOSP registers an HMAC generator per digest (HmacSHA1/224/256/384/512),
+    // each defaulting to the digest output size. HmacSHA1 is what TOTP/HOTP
+    // (RFC 6238) authenticator apps ask for.
+    private static void validateHmacKeySize(int bits)
+        throws InvalidAlgorithmParameterException {
+        // AOSP bounds HMAC keystore keys to 64..512 bits inclusive,
+        // byte-aligned.
+        if (bits < 64 || bits > 512 || (bits % 8) != 0) {
+            throw new InvalidAlgorithmParameterException(
+                "Unsupported key size: " + bits
+                + ". Supported: multiple of 8 within 64-512 bits,"
+                + " inclusive.");
+        }
+    }
+
+    public static final class HmacSHA1 extends AndroidKeyStoreKeyGeneratorSpi {
+        public HmacSHA1() { super("HmacSHA1", 160); }
+        @Override
+        void validateKeySize(int bits) throws InvalidAlgorithmParameterException {
+            validateHmacKeySize(bits);
+        }
+    }
+
+    public static final class HmacSHA224 extends AndroidKeyStoreKeyGeneratorSpi {
+        public HmacSHA224() { super("HmacSHA224", 224); }
+        @Override
+        void validateKeySize(int bits) throws InvalidAlgorithmParameterException {
+            validateHmacKeySize(bits);
+        }
+    }
+
     public static final class HmacSHA256 extends AndroidKeyStoreKeyGeneratorSpi {
         public HmacSHA256() { super("HmacSHA256", 256); }
         @Override
         void validateKeySize(int bits) throws InvalidAlgorithmParameterException {
-            // AOSP bounds HMAC keystore keys to 64..512 bits inclusive,
-            // byte-aligned.
-            if (bits < 64 || bits > 512 || (bits % 8) != 0) {
-                throw new InvalidAlgorithmParameterException(
-                    "Unsupported key size: " + bits
-                    + ". Supported: multiple of 8 within 64-512 bits,"
-                    + " inclusive.");
-            }
+            validateHmacKeySize(bits);
+        }
+    }
+
+    public static final class HmacSHA384 extends AndroidKeyStoreKeyGeneratorSpi {
+        public HmacSHA384() { super("HmacSHA384", 384); }
+        @Override
+        void validateKeySize(int bits) throws InvalidAlgorithmParameterException {
+            validateHmacKeySize(bits);
+        }
+    }
+
+    public static final class HmacSHA512 extends AndroidKeyStoreKeyGeneratorSpi {
+        public HmacSHA512() { super("HmacSHA512", 512); }
+        @Override
+        void validateKeySize(int bits) throws InvalidAlgorithmParameterException {
+            validateHmacKeySize(bits);
         }
     }
 

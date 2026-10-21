@@ -37,11 +37,27 @@ public class NotificationManager {
     public void cancel(String tag, int id) {}
     public void cancelAll() {}
 
+    /** AOSP PreferencesHelper.createNotificationChannel (android14 :896-1000):
+     *  creating a channel whose id already exists does not add a second one --
+     *  it updates the existing channel's name and description, sets its group
+     *  only if it had none, and lowers (never raises) its importance. Apps call
+     *  this on every launch, so appending made getNotificationChannels() grow a
+     *  duplicate per start. */
     public void createNotificationChannel(NotificationChannel channel) {
-        if (channel != null) channels.add(channel);
+        if (channel == null) return;
+        NotificationChannel existing = getNotificationChannel(channel.getId());
+        if (existing == null || existing == channel) {
+            if (existing == null) channels.add(channel);
+            return;
+        }
+        existing.setName(channel.getName());
+        existing.setDescription(channel.getDescription());
+        if (existing.getGroup() == null) existing.setGroup(channel.getGroup());
+        if (channel.getImportance() < existing.getImportance())
+            existing.setImportance(channel.getImportance());
     }
     public void createNotificationChannels(List<NotificationChannel> channels) {
-        if (channels != null) this.channels.addAll(channels);
+        if (channels != null) for (NotificationChannel c : channels) createNotificationChannel(c);
     }
     public void deleteNotificationChannel(String channelId) {
         channels.removeIf(c -> c != null && c.getId() != null && c.getId().equals(channelId));

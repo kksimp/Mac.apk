@@ -135,7 +135,10 @@ final class UpdateChecker: ObservableObject {
                 } else if let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                           let tag = obj["tag_name"] as? String,
                           ReleaseVersion.components(tag) != nil {
+                    // Only ever open a github.com page: the URL comes from a
+                    // network response and is handed to NSWorkspace.
                     let page = (obj["html_url"] as? String).flatMap(URL.init(string:))
+                        .flatMap { $0.scheme == "https" && $0.host?.lowercased() == "github.com" ? $0 : nil }
                         ?? Self.releasesPage
                     if let baked, ReleaseVersion.isNewer(tag, than: baked) {
                         result = .available(latestTag: tag, page: page)

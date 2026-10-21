@@ -771,6 +771,22 @@ enum BundleGenerator {
         var candidates = [base, apkSafeDirName("\(base) (\(lastSeg))")]
         for n in 2...99 { candidates.append(apkSafeDirName("\(base) \(n)")) }
         for cand in candidates {
+            // A name already used by a built-in app ("Calendar", "Notes") or by
+            // a foreign bundle in the OTHER applications folder would give two
+            // same-named apps in Launchpad/Spotlight. Our own bundle elsewhere
+            // is not a collision here (the folder choice above already follows
+            // it). MACAPK_NAME_COLLISION_EXTRA=0 restores the bundlesDir-only check.
+            if ProcessInfo.processInfo.environment["MACAPK_NAME_COLLISION_EXTRA"] != "0" {
+                let fm = FileManager.default
+                if fm.fileExists(atPath: "/System/Applications/\(cand).app") { continue }
+                let foreign = Paths.bundleDirs.contains { d in
+                    guard d.standardizedFileURL.path != bundlesDir.standardizedFileURL.path else { return false }
+                    let other = d.appendingPathComponent("\(cand).app")
+                    return fm.fileExists(atPath: other.path)
+                        && !bundleMatches(other, package: spec.package, dirName: wantDir)
+                }
+                if foreign { continue }
+            }
             let url = bundlesDir.appendingPathComponent("\(cand).app")
             guard FileManager.default.fileExists(atPath: url.path) else { return cand }
             if bundleMatches(url, package: spec.package, dirName: wantDir) {

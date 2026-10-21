@@ -411,6 +411,42 @@ public enum Paths {
     public static var bundlesDirIsWritable: Bool { isWritableDir(bundlesDir) }
 }
 
+// MARK: - Free-space preflight
+
+/// An install unpacks the APK (dex -> jar, apktool decode, translated dylibs,
+/// the retained APK copy): in practice about 3x the APK, plus working room. A
+/// full disk otherwise surfaces as a cryptic extractor failure half-way through
+/// and leaves a partial bundle behind. Fail up front with a readable message.
+/// MACAPK_SPACE_CHECK=0 skips it.
+public enum FreeSpaceCheck {
+    public static let overheadBytes: Int64 = 200 * 1024 * 1024
+
+    /// nil when there is enough room (or it cannot be determined); otherwise
+    /// the message to show.
+    public static func shortfallMessage(apkSizes: [Int64], destination: URL) -> String? {
+        if ProcessInfo.processInfo.environment["MACAPK_SPACE_CHECK"] == "0" { return nil }
+        let needed = apkSizes.reduce(0, +) * 3 + overheadBytes
+        // The bundle folder may not exist yet; ask the nearest existing parent.
+        var probe = destination
+        while !FileManager.default.fileExists(atPath: probe.path), probe.path != "/" {
+            probe = probe.deletingLastPathComponent()
+        }
+        guard let avail = try? probe.resourceValues(
+                forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+                .volumeAvailableCapacityForImportantUsage,
+              avail < needed else { return nil }
+        let gb = String(format: "%.1f", Double(needed) / 1_073_741_824)
+        let freeGb = String(format: "%.1f", Double(avail) / 1_073_741_824)
+        return "Not enough disk space: installing needs about \(gb) GB free, "
+             + "but only \(freeGb) GB is available. Free some space and try again."
+    }
+
+    public static func size(of url: URL) -> Int64 {
+        let n = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        return Int64(n)
+    }
+}
+
 // MARK: - App data location (outside the bundle)
 
 /// Where an installed app's Android tree lives, and the move that puts it there.
@@ -3574,6 +3610,11 @@ public final class InstallPipeline {
         // updatesInPlace). Refused while that app is running: AOSP kills the
         // replaced package's processes first, and we cannot move a live app's
         // data directory out from under it.
+        if let msg = FreeSpaceCheck.shortfallMessage(
+                apkSizes: [FreeSpaceCheck.size(of: req.sourceFile)],
+                destination: Paths.bundlesDir) {
+            return .failed("no-space", msg)
+        }
         var inPlace = updatesInPlace(kind: kind, source: req.source, existing: existing)
         if inPlace, let old = existing {
             let live = RuntimeInstall.runningGuests()
@@ -4548,6 +4589,31 @@ public final class InstallPipeline {
             }
         }
         if rows.isEmpty { return .failed(stage: "uninstall", message: "\(package) is not installed") }
+
+        // Refuse while a guest is running: removing its bundle and data dir out
+        // from under a live process loses its unsaved state and leaves it
+        // writing into a deleted tree. Same two signals the install path uses
+        // (runningGuests, then the stub's pidfile flock, which is authoritative
+        // where the former can be stale). MACAPK_UNINSTALL_RUNNING_CHECK=0 skips.
+        if ProcessInfo.processInfo.environment["MACAPK_UNINSTALL_RUNNING_CHECK"] != "0" {
+            let live = RuntimeInstall.runningGuests()
+            for r in rows {
+                var running = live.contains(r.dirName) || live.contains(r.package)
+                if !running {
+                    for name in Set([r.dirName, r.package]) where !name.isEmpty {
+                        let fd = open(Paths.runDir.appendingPathComponent("\(name).pid").path, O_RDONLY)
+                        guard fd >= 0 else { continue }
+                        if flock(fd, LOCK_EX | LOCK_NB) != 0 { running = true } else { flock(fd, LOCK_UN) }
+                        close(fd)
+                        if running { break }
+                    }
+                }
+                if running {
+                    return .failed(stage: "app-running",
+                                   message: "\(r.label) is running. Quit it, then try uninstalling again.")
+                }
+            }
+        }
 
         for r in rows {
             if let bp = r.bundlePath {

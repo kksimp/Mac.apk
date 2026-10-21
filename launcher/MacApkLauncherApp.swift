@@ -3397,7 +3397,10 @@ struct LauncherView: View {
                     \(peek.detailLine)
 
                     This is newer than the installed version (\(old) -> \(new)). \
-                    Your saved data is carried forward.
+                    \(BundleGenerator.identityMode() == .package
+                        && RegistryStore.shared.setting(InstallPipeline.storeUpdatesInPlaceSettingKey) != "0"
+                        ? "Your saved data is carried forward."
+                        : "It installs alongside the current version as a separate app. The current version and its data stay untouched.")
                     """
                 case let (old?, new?) where new < old:
                     alert.alertStyle = .warning
@@ -5564,7 +5567,15 @@ final class InstalledLibrary: ObservableObject {
                     var appCache = cacheDir
                     var madeBundle: URL?
                     var bundleError: String? = nil
-                    if let pkg = peek.package, !pkg.isEmpty {
+                    // Before the bundle is created or anything is unpacked: a
+                    // full disk should be a clear message, not a half install.
+                    let spaceError = FreeSpaceCheck.shortfallMessage(
+                        apkSizes: [FreeSpaceCheck.size(of: apk)],
+                        destination: Paths.bundlesDir)
+                    if let se = spaceError {
+                        installLog("\(apkName): \(se)")
+                        bundleError = se
+                    } else if let pkg = peek.package, !pkg.isEmpty {
                         let ver = peek.versionName ?? ""
                         let dirName = ver.isEmpty ? pkg : "\(pkg)_\(ver)"
                         do {
@@ -5615,7 +5626,7 @@ final class InstalledLibrary: ObservableObject {
                     // then need cleaning up.
                     if let be = bundleError {
                         let outcome = ExtractOutcome(apk: apk, entry: nil, exitStatus: -1,
-                                                     output: "bundle generation failed: \(be)",
+                                                     output: spaceError ?? "bundle generation failed: \(be)",
                                                      launchError: be)
                         outcomes.add(outcome)
                         Task { @MainActor in

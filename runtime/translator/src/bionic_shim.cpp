@@ -28082,10 +28082,59 @@ static int macapk_oal_mutex_unlock(int32_t* m) {
 // memory at most a single +1 increment on the recipient's offset 0,
 // which is far below the threshold (lens[i] >= 16) that triggers the
 // inflate_table crash.
+// Static RECURSIVE / ERRORCHECK initialisers. Bionic (libc/include/pthread.h):
+//   PTHREAD_MUTEX_INITIALIZER               { { ((0 & 3) << 14) } }  == 0      (all-zero)
+//   PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP  { { ((1 & 3) << 14) } }  == 0x4000
+//   PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP { { ((2 & 3) << 14) } }  == 0x8000
+// i.e. the type rides in bits 14-15 of the first int and every other byte is
+// zero. Those two are neither magic-stamped nor all-zero, so ensure_valid used
+// to answer EINVAL for them (the ARM32 lane honours the same pattern, see
+// arm32_mutex_type_enabled). Returns the Bionic type (1 recursive, 2
+// errorcheck) for an UNSTAMPED mutex of exactly that shape, else 0. Our own
+// futex word m[0] is 0/1/2 (or an odd mach port name when owner-aware), so a
+// live mutex can never read 0x4000/0x8000. MACAPK_ARM64_MUTEX_STATIC_INIT=0
+// restores the old EINVAL.
+static bool macapk_arm64_mutex_static_init_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_ARM64_MUTEX_STATIC_INIT");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+static inline int32_t macapk_arm64_mutex_static_type(const int32_t* m) {
+    if (!macapk_arm64_mutex_static_init_on()) return 0;
+    const int32_t w = __atomic_load_n(&m[0], __ATOMIC_RELAXED);
+    if (w != 0x4000 && w != 0x8000) return 0;
+    for (int i = 1; i < 10; ++i) {
+        if (__atomic_load_n(&m[i], __ATOMIC_RELAXED) != 0) return 0;
+    }
+    return w == 0x4000 ? 1 : 2;
+}
 static inline bool macapk_arm64_mutex_ensure_valid(int32_t* m) {
     if (uint32_t(__atomic_load_n(&m[kMutexMagicSlot], __ATOMIC_RELAXED))
             == kMacApkMutexMagic) {
         return true;
+    }
+    if (const int32_t st = macapk_arm64_mutex_static_type(m)) {
+        // First use of a static recursive/errorcheck mutex. Claim the lazy init by
+        // CAS-ing the type slot (0 -> st); only the winner rewrites the futex word
+        // and stamps the magic (release), so a concurrent first locker either wins
+        // or waits for the stamp. The type slot is written BEFORE the magic, and
+        // the magic is what every other path keys on.
+        int32_t expected = 0;
+        if (__atomic_compare_exchange_n(&m[kMutexTypeSlot], &expected, st, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            __atomic_store_n(&m[0], 0, __ATOMIC_RELAXED);
+            __atomic_store_n(&m[kMutexMagicSlot], int32_t(kMacApkMutexMagic),
+                             __ATOMIC_RELEASE);
+            return true;
+        }
+        for (int spin = 0; spin < 1000000; ++spin) {
+            if (uint32_t(__atomic_load_n(&m[kMutexMagicSlot], __ATOMIC_ACQUIRE))
+                    == kMacApkMutexMagic) return true;
+            sched_yield();
+        }
+        return false;
     }
     if (!macapk_arm64_mutex_all_zero(m)) {
         // CONCURRENT-FIRST-LOCK RACE (v1.0.590): two threads lock a fresh
@@ -28101,6 +28150,19 @@ static inline bool macapk_arm64_mutex_ensure_valid(int32_t* m) {
         // the magic with ACQUIRE ordering before giving up: if a concurrent
         // stamper set it, the mutex IS ours and valid. (The CAS-stamp path below
         // already handles the symmetric race via its `expected` readback.)
+        // The same window exists for a static recursive/errorcheck mutex whose
+        // lazy init (above) is mid-flight: type slot already claimed, magic not
+        // yet published. Wait it out (bounded) instead of reporting EINVAL.
+        if (macapk_arm64_mutex_static_init_on()) {
+            const int32_t t = __atomic_load_n(&m[kMutexTypeSlot], __ATOMIC_RELAXED);
+            if (t == 1 || t == 2) {
+                for (int spin = 0; spin < 1000000; ++spin) {
+                    if (uint32_t(__atomic_load_n(&m[kMutexMagicSlot], __ATOMIC_ACQUIRE))
+                            == kMacApkMutexMagic) return true;
+                    sched_yield();
+                }
+            }
+        }
         return uint32_t(__atomic_load_n(&m[kMutexMagicSlot], __ATOMIC_ACQUIRE))
                    == kMacApkMutexMagic;
     }

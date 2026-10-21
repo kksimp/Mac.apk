@@ -137,7 +137,14 @@ const NSTimeInterval kSignInTimeout = 600.0;
 
 - (void)webView:(WKWebView*)wv didFinishNavigation:(WKNavigation*)nav {
     (void)nav;
-    fprintf(stderr, "[gms-signin] loaded %s\n", wv.URL.absoluteString.UTF8String ?: "(none)");
+    // Scheme + host + path only: the query/fragment of the sign-in redirects
+    // carry account identifiers and one-time tokens, and stderr ends up in the
+    // user's log file.
+    NSURL* u = wv.URL;
+    NSString* shown = u ? [NSString stringWithFormat:@"%@://%@%@", u.scheme ?: @"",
+                                                     u.host ?: @"", u.path ?: @""]
+                        : @"(none)";
+    fprintf(stderr, "[gms-signin] loaded %s\n", shown.UTF8String ?: "(none)");
     [self checkCookies];
 }
 

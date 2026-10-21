@@ -26814,10 +26814,47 @@ extern "C" ssize_t __macapk_arm64_recvfrom(int fd, void* buf, size_t n, int flag
     return rc;
 }
 
+// IPPROTO_TCP option names. Linux (include/uapi/linux/tcp.h) and Darwin
+// (<netinet/tcp.h>) agree only on the first two; the rest used to pass through
+// raw, so Linux TCP_KEEPIDLE 4 landed on Darwin TCP_NOPUSH 4 and KEEPINTVL 5 /
+// KEEPCNT 6 hit nothing sensible:
+//   option              Linux   Darwin
+//   TCP_NODELAY           1       0x01
+//   TCP_MAXSEG            2       0x02
+//   TCP_CORK              3       TCP_NOPUSH 0x04  (closest analogue; FreeBSD folds them too)
+//   TCP_KEEPIDLE          4       TCP_KEEPALIVE 0x10
+//   TCP_KEEPINTVL         5       0x101
+//   TCP_KEEPCNT           6       0x102
+//   TCP_USER_TIMEOUT     18       TCP_RXT_CONNDROPTIME 0x80 (Linux ms, Darwin seconds)
+// Anything else (TCP_INFO 11, TCP_QUICKACK 12, TCP_CONGESTION 13, ...) has no
+// Darwin counterpart and is refused with ENOPROTOOPT rather than aliasing an
+// unrelated Darwin option. MACAPK_TCP_OPTMAP=0 restores the raw pass-through.
+static bool macapk_tcp_optmap_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_TCP_OPTMAP");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+static constexpr int kLinuxTcpUserTimeout = 18;
+// Darwin optname for a Linux IPPROTO_TCP optname, or -1 when unmapped.
+static int tcp_optname_lin2mac(int lin) {
+    switch (lin) {
+        case 1:  return 0x01;    // TCP_NODELAY
+        case 2:  return 0x02;    // TCP_MAXSEG
+        case 3:  return 0x04;    // TCP_CORK -> TCP_NOPUSH
+        case 4:  return 0x10;    // TCP_KEEPIDLE -> TCP_KEEPALIVE
+        case 5:  return 0x101;   // TCP_KEEPINTVL
+        case 6:  return 0x102;   // TCP_KEEPCNT
+        case kLinuxTcpUserTimeout: return 0x80;   // TCP_RXT_CONNDROPTIME
+        default: return -1;
+    }
+}
+
 // setsockopt/getsockopt: translate the SOL_SOCKET level + SO_* optname. Other
 // levels (IPPROTO_TCP=6, IPPROTO_IP=0, IPPROTO_IPV6=41 -- identical numbers on
-// both) and their optnames pass through; the common ones Mono uses there
-// (TCP_NODELAY=1) match macOS, and net-trace flags any that don't.
+// both) keep their level; IPPROTO_TCP optnames go through tcp_optname_lin2mac
+// above, and net-trace flags any that don't map.
 extern "C" int __macapk_arm64_setsockopt(int fd, int level, int optname,
                                            const void* val, socklen_t len) {
     int mlevel = optname_level_to_mac(level);
@@ -26829,7 +26866,20 @@ extern "C" int __macapk_arm64_setsockopt(int fd, int level, int optname,
         int t = ip_optname_lin2mac(level, optname);
         if (t >= 0) mopt = t;
     }
-    int rc = ::setsockopt(fd, mlevel, mopt, val, len);
+    int rc;
+    if (level == 6 /*IPPROTO_TCP*/ && macapk_tcp_optmap_on()) {
+        mopt = tcp_optname_lin2mac(optname);
+        if (mopt < 0) { errno = errno_mac2lin(ENOPROTOOPT); return -1; }
+        if (optname == kLinuxTcpUserTimeout && val && len >= sizeof(int)) {
+            int ms = *static_cast<const int*>(val);
+            int sec = ms <= 0 ? 0 : (ms + 999) / 1000;   // Linux ms -> Darwin seconds, round up
+            rc = ::setsockopt(fd, mlevel, mopt, &sec, sizeof(sec));
+        } else {
+            rc = ::setsockopt(fd, mlevel, mopt, val, len);
+        }
+    } else {
+        rc = ::setsockopt(fd, mlevel, mopt, val, len);
+    }
     int e = errno;
     if (net_trace_on() && g_net_trace_n.fetch_add(1) < net_trace_cap()) {
         std::fprintf(stderr,
@@ -26852,7 +26902,24 @@ extern "C" int __macapk_arm64_getsockopt(int fd, int level, int optname,
         int t = ip_optname_lin2mac(level, optname);
         if (t >= 0) mopt = t;
     }
-    int rc = ::getsockopt(fd, mlevel, mopt, val, len);
+    int rc;
+    if (level == 6 /*IPPROTO_TCP*/ && macapk_tcp_optmap_on()) {
+        mopt = tcp_optname_lin2mac(optname);
+        if (mopt < 0) { errno = errno_mac2lin(ENOPROTOOPT); return -1; }
+        if (optname == kLinuxTcpUserTimeout && val && len && *len >= sizeof(int)) {
+            int sec = 0;
+            socklen_t sl = sizeof(sec);
+            rc = ::getsockopt(fd, mlevel, mopt, &sec, &sl);
+            if (rc == 0) {
+                *static_cast<int*>(val) = sec * 1000;   // Darwin seconds -> Linux ms
+                *len = sizeof(int);
+            }
+        } else {
+            rc = ::getsockopt(fd, mlevel, mopt, val, len);
+        }
+    } else {
+        rc = ::getsockopt(fd, mlevel, mopt, val, len);
+    }
     int e = errno;
     // SO_ERROR (Linux SOL_SOCKET/4) returns the pending socket error as a raw
     // OS errno in *val -- a macOS number that the guest will compare against

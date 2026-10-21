@@ -5567,7 +5567,15 @@ final class InstalledLibrary: ObservableObject {
                     var appCache = cacheDir
                     var madeBundle: URL?
                     var bundleError: String? = nil
-                    if let pkg = peek.package, !pkg.isEmpty {
+                    // Before the bundle is created or anything is unpacked: a
+                    // full disk should be a clear message, not a half install.
+                    let spaceError = FreeSpaceCheck.shortfallMessage(
+                        apkSizes: [FreeSpaceCheck.size(of: apk)],
+                        destination: Paths.bundlesDir)
+                    if let se = spaceError {
+                        installLog("\(apkName): \(se)")
+                        bundleError = se
+                    } else if let pkg = peek.package, !pkg.isEmpty {
                         let ver = peek.versionName ?? ""
                         let dirName = ver.isEmpty ? pkg : "\(pkg)_\(ver)"
                         do {
@@ -5618,7 +5626,7 @@ final class InstalledLibrary: ObservableObject {
                     // then need cleaning up.
                     if let be = bundleError {
                         let outcome = ExtractOutcome(apk: apk, entry: nil, exitStatus: -1,
-                                                     output: "bundle generation failed: \(be)",
+                                                     output: spaceError ?? "bundle generation failed: \(be)",
                                                      launchError: be)
                         outcomes.add(outcome)
                         Task { @MainActor in

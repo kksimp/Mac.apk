@@ -208,6 +208,10 @@ public abstract class Window {
         }
         // FLAG_SECURE, only when the caller addressed the bit (as above).
         if ((mask & WindowManager.LayoutParams.FLAG_SECURE) != 0) macapkNoteSecure();
+        // FLAG_KEEP_SCREEN_ON: this window now holds / stops holding the display on.
+        if ((mask & WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) != 0)
+            android.os.MacApkKeepAwake.screen(this,
+                (attrs.flags & WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) != 0);
         dispatchWindowAttributesChanged(attrs);
     }
     /** AOSP Window.addFlags: setFlags(flags, flags). */

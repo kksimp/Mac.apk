@@ -4383,6 +4383,9 @@ namespace location { void RegisterLocationBridgeMethods(JNIEnv* env); }
 // android.media.session.MacApkNowPlaying (the active MediaSession <-> macOS
 // Now Playing and its remote commands). Soft-fails on a jar that lacks it.
 namespace nowplaying { void RegisterNowPlayingBridgeMethods(JNIEnv* env); }
+// Forward-declared from power_assertion_bridge.mm; registers
+// android.os.MacApkKeepAwake (keep-screen-on / wake locks -> IOKit assertions).
+namespace power { void RegisterPowerAssertionMethods(JNIEnv* env); }
 // Forward-declared from webview_bridge.mm; registers
 // android.webkit.MacApkWebViewBridge's JNI methods (system WKWebView engine
 // behind android.webkit.WebView). Soft-fails: a registration miss disables
@@ -4509,6 +4512,7 @@ void RegisterAllNativeMethods(JNIEnv* env) {
     gamepad::RegisterGamepadBridgeMethods(env);
     location::RegisterLocationBridgeMethods(env);
     nowplaying::RegisterNowPlayingBridgeMethods(env);
+    power::RegisterPowerAssertionMethods(env);
     webview::RegisterWebViewBridgeMethods(env);
     clipboard::RegisterClipboardBridgeMethods(env);
     icuhost::RegisterIcuHostMethods(env);

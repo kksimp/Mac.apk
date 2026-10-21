@@ -43012,6 +43012,18 @@ std::atomic<int> g_du3d_fd{-1};
 // -- so "open for append" was TRUNCATING, and O_CREAT|O_EXCL exclusivity was lost.
 // Bits with no macOS analogue (O_DSYNC, __O_SYNC, O_DIRECT, O_LARGEFILE, O_NOATIME,
 // O_PATH, O_TMPFILE) are dropped (macOS expresses those via fcntl(F_NOCACHE)/fsync).
+//
+// arm64 AND arm override four of the asm-generic bits (arch/arm64/include/uapi/
+// asm/fcntl.h, arch/arm/include/uapi/asm/fcntl.h; Bionic's uapi copies match):
+//            asm-generic (x86)   arm/arm64
+//   O_DIRECTORY   0x10000          0x4000
+//   O_NOFOLLOW    0x20000          0x8000
+//   O_DIRECT      0x4000           0x10000
+//   O_LARGEFILE   0x8000           0x20000
+// Mac.apk only runs arm/arm64 guests, so the table uses the arm column. With
+// the asm-generic column, an O_DIRECT open became macOS O_DIRECTORY (ENOTDIR on
+// a regular file), O_LARGEFILE (32-bit LFS code) became O_NOFOLLOW
+// (ELOOP through a symlink), and real O_DIRECTORY/O_NOFOLLOW were dropped.
 static int macapk_bionic_to_macos_oflags(int b) {
     int m = b & 0x3;                              // O_RDONLY/WRONLY/RDWR (identical)
     if (b & 0x40)    m |= 0x200;       // O_CREAT     (lin 0x40   -> mac 0x200)
@@ -43020,8 +43032,8 @@ static int macapk_bionic_to_macos_oflags(int b) {
     if (b & 0x200)   m |= 0x400;       // O_TRUNC     (lin 0x200  -> mac 0x400)
     if (b & 0x400)   m |= 0x8;         // O_APPEND    (lin 0x400  -> mac 0x8)
     if (b & 0x800)   m |= 0x4;         // O_NONBLOCK  (lin 0x800  -> mac 0x4)
-    if (b & 0x10000) m |= 0x100000;    // O_DIRECTORY (lin 0x10000-> mac 0x100000)
-    if (b & 0x20000) m |= 0x100;       // O_NOFOLLOW  (lin 0x20000-> mac 0x100)
+    if (b & 0x4000)  m |= 0x100000;    // O_DIRECTORY (arm 0x4000 -> mac 0x100000)
+    if (b & 0x8000)  m |= 0x100;       // O_NOFOLLOW  (arm 0x8000 -> mac 0x100)
     if (b & 0x80000) m |= 0x1000000;   // O_CLOEXEC   (lin 0x80000-> mac 0x1000000)
     return m;
 }
@@ -43031,7 +43043,7 @@ static int macapk_macos_to_bionic_fflags(int m) {
     int b = m & 0x3;                              // access mode (identical)
     if (m & 0x8)       b |= 0x400;     // O_APPEND
     if (m & 0x4)       b |= 0x800;     // O_NONBLOCK
-    if (m & 0x100)     b |= 0x20000;   // O_NOFOLLOW
+    if (m & 0x100)     b |= 0x8000;    // O_NOFOLLOW (arm value, see above)
     if (m & 0x1000000) b |= 0x80000;   // O_CLOEXEC
     return b;
 }

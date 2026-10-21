@@ -32,12 +32,21 @@ public final class Proxy {
     /** AOSP getDefaultHost(): the global HTTP proxy host, or null if none. */
     @Deprecated public static String getDefaultHost() {
         String h = System.getProperty("http.proxyHost");
-        return (h == null || h.isEmpty()) ? null : h;
+        if (h == null || h.isEmpty()) {
+            // useSystemProxies=true leaves the property unset (see ProxyInfo).
+            ProxyInfo sys = ProxyInfo.macapkSystemProxyOrNull();
+            return sys != null ? sys.getHost() : null;
+        }
+        return h;
     }
 
     /** AOSP getDefaultPort(): the global HTTP proxy port, or -1 if no host. */
     @Deprecated public static int getDefaultPort() {
         if (getDefaultHost() == null) return -1;
+        if (System.getProperty("http.proxyHost") == null || System.getProperty("http.proxyHost").isEmpty()) {
+            ProxyInfo sys = ProxyInfo.macapkSystemProxyOrNull();
+            return sys != null ? sys.getPort() : -1;
+        }
         String p = System.getProperty("http.proxyPort");
         if (p == null || p.isEmpty()) return 80;
         try { return Integer.parseInt(p); } catch (NumberFormatException e) { return 80; }

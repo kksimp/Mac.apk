@@ -180,7 +180,7 @@ public class ProxyInfo implements Parcelable {
         String h = System.getProperty("http.proxyHost");
         if (h == null || h.isEmpty()) {
             h = System.getProperty("https.proxyHost");
-            if (h == null || h.isEmpty()) return null;
+            if (h == null || h.isEmpty()) return macapkSelectorProxyOrNull();
         }
         String portProp = System.getProperty("http.proxyPort");
         if (portProp == null || portProp.isEmpty()) portProp = System.getProperty("https.proxyPort");
@@ -191,5 +191,23 @@ public class ProxyInfo implements Parcelable {
         String excl = System.getProperty("http.nonProxyHosts"); // '|'-separated on the JVM
         if (excl != null) excl = excl.replace('|', ',');
         return new ProxyInfo(h, port, excl);
+    }
+
+    // With -Djava.net.useSystemProxies=true (jvm_loader.cpp) the macOS proxy/PAC
+    // settings are exposed through the default ProxySelector, not through
+    // http.proxyHost, so ask it what an HTTPS request would use.
+    private static ProxyInfo macapkSelectorProxyOrNull() {
+        try {
+            java.net.ProxySelector ps = java.net.ProxySelector.getDefault();
+            if (ps == null) return null;
+            for (java.net.Proxy p : ps.select(java.net.URI.create("https://www.google.com"))) {
+                if (p.type() == java.net.Proxy.Type.HTTP
+                        && p.address() instanceof java.net.InetSocketAddress) {
+                    java.net.InetSocketAddress a = (java.net.InetSocketAddress) p.address();
+                    return new ProxyInfo(a.getHostString(), a.getPort(), null);
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
     }
 }

@@ -497,6 +497,14 @@ void StartJvm(const JvmConfig& cfg, JavaVM** out_vm, JNIEnv** out_env) {
             owned_options.push_back("-Djdk.net.hosts.file=/var/empty/macapk_hosts_does_not_exist");
         }
     }
+    // Honour the macOS system proxy / PAC settings (System Settings > Network >
+    // Proxies). Without this the JDK ignores them, so guests on corporate-proxy
+    // networks cannot reach anything. Android apps get the device proxy from
+    // the platform the same way. MACAPK_SYSTEM_PROXIES=0 restores the old
+    // direct-connect behaviour.
+    if (const char* sp = std::getenv("MACAPK_SYSTEM_PROXIES"); !(sp && sp[0] == '0')) {
+        owned_options.push_back("-Djava.net.useSystemProxies=true");
+    }
     // We used to also force -Djava.net.preferIPv4Stack=true here. It landed in
     // the same commit as the hosts-file redirect above (same "make networking
     // stop crashing" era) and was never revisited when that redirect was

@@ -30,12 +30,134 @@ public class NotificationManager {
 
     private final List<NotificationChannel> channels = new ArrayList<>();
 
-    public void notify(int id, Notification notification) {}
-    public void notify(String tag, int id, Notification notification) {}
-    public void notifyAsPackage(String targetPackage, String tag, int id, Notification notification) {}
-    public void cancel(int id) {}
-    public void cancel(String tag, int id) {}
-    public void cancelAll() {}
+    // ---- Mac.apk bridge to macOS Notification Center (notification_bridge.mm) ----
+    // Gate MACAPK_NOTIFICATIONS (default on; =0 restores the old no-op behaviour).
+    // State is static: Context.getSystemService builds one manager per Context, but
+    // the notification shade is per-package, and a tap must find the Notification
+    // whichever instance posted it.
+    private static final boolean ENABLED = !"0".equals(System.getenv("MACAPK_NOTIFICATIONS"));
+    private static volatile boolean sLinked = true;
+    private static final java.util.Map<String, android.service.notification.StatusBarNotification> sActive =
+            new java.util.LinkedHashMap<>();
+    private static final java.util.Map<String, Long> sLastPost = new java.util.HashMap<>();
+    /** Minimum gap between re-posts of one ongoing/progress key. */
+    private static final long THROTTLE_MS = 2000;
+
+    private static native void nativePost(String key, String title, String text, String subtitle,
+                                          byte[] iconPng, boolean silent);
+    private static native void nativeCancel(String key);
+    private static native void nativeCancelAll();
+    private static native boolean nativeIsDenied();
+
+    private final String mPkg;
+
+    public NotificationManager() { this(null); }
+    public NotificationManager(android.content.Context ctx) {
+        String p = null;
+        try { if (ctx != null) p = ctx.getPackageName(); } catch (Throwable ignored) {}
+        mPkg = p != null ? p : "unknown";
+    }
+
+    private static String key(String tag, int id) { return tag + "#" + id; }
+
+    public void notify(int id, Notification notification) { notify(null, id, notification); }
+    public void notifyAsPackage(String targetPackage, String tag, int id, Notification notification) {
+        notify(tag, id, notification);
+    }
+
+    /** AOSP NotificationManagerService.enqueueNotificationInternal keys a posted
+     *  notification by (pkg, tag, id); re-posting the same key updates in place.
+     *  A channel at IMPORTANCE_NONE is blocked (PreferencesHelper / NMS
+     *  checkDisqualifyingFeatures, android14 NotificationManagerService.java
+     *  ~:6830), and LOW/MIN make no sound or heads-up, hence a silent banner. */
+    public void notify(String tag, int id, Notification n) {
+        if (n == null) return;
+        String key = key(tag, id);
+        int importance = IMPORTANCE_DEFAULT;
+        NotificationChannel ch = n.getChannelId() != null ? getNotificationChannel(n.getChannelId()) : null;
+        if (ch != null) importance = ch.getImportance();
+        if (importance == IMPORTANCE_NONE) return;
+        long now = System.currentTimeMillis();
+        boolean ongoing = (n.flags & Notification.FLAG_ONGOING_EVENT) != 0
+                || (n.extras != null && n.extras.containsKey(Notification.EXTRA_PROGRESS_MAX)
+                    && n.extras.getInt(Notification.EXTRA_PROGRESS_MAX, 0) > 0);
+        boolean post, reposted;
+        synchronized (sActive) {
+            sActive.put(key, new android.service.notification.StatusBarNotification(
+                    mPkg, mPkg, id, tag, android.os.Process.myUid(), android.os.Process.myPid(), n,
+                    android.os.Process.myUserHandle(), null, now));
+            Long last = sLastPost.get(key);
+            reposted = last != null;
+            post = !(ongoing && last != null && now - last < THROTTLE_MS);
+            if (post) sLastPost.put(key, now);
+        }
+        if (!ENABLED || !sLinked || !post) return;
+        String title = text(n, Notification.EXTRA_TITLE);
+        String body = text(n, Notification.EXTRA_TEXT);
+        if (body == null) body = text(n, Notification.EXTRA_BIG_TEXT);
+        if (body == null && n.tickerText != null && n.tickerText.length() > 0) body = n.tickerText.toString();
+        if (title == null && body == null) return;
+        String sub = text(n, Notification.EXTRA_SUB_TEXT);
+        try {
+            nativePost(key, title, body, sub, iconPng(n),
+                       importance == IMPORTANCE_LOW || importance == IMPORTANCE_MIN
+                       || (reposted && (n.flags & Notification.FLAG_ONLY_ALERT_ONCE) != 0));
+        } catch (UnsatisfiedLinkError e) {
+            sLinked = false;
+        }
+    }
+
+    private static String text(Notification n, String k) {
+        if (n.extras == null) return null;
+        CharSequence cs = n.extras.getCharSequence(k);
+        return cs != null && cs.length() > 0 ? cs.toString() : null;
+    }
+
+    /** Large icon as PNG, or null (macOS shows the app icon anyway). */
+    private static byte[] iconPng(Notification n) {
+        try {
+            android.graphics.drawable.Icon ic = n.getLargeIcon();
+            android.graphics.Bitmap bm = ic != null ? ic.getBitmap() : null;
+            if (bm == null) return null;
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            return bm.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out) ? out.toByteArray() : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    public void cancel(int id) { cancel(null, id); }
+    public void cancel(String tag, int id) { cancelKey(key(tag, id)); }
+    public void cancelAll() {
+        synchronized (sActive) { sActive.clear(); sLastPost.clear(); }
+        if (!ENABLED || !sLinked) return;
+        try { nativeCancelAll(); } catch (UnsatisfiedLinkError e) { sLinked = false; }
+    }
+
+    private static void cancelKey(String key) {
+        synchronized (sActive) { sActive.remove(key); sLastPost.remove(key); }
+        if (!ENABLED || !sLinked) return;
+        try { nativeCancel(key); } catch (UnsatisfiedLinkError e) { sLinked = false; }
+    }
+
+    /** Called from notification_bridge.mm on the main queue when the user clicks
+     *  the banner. AOSP NotificationContentView click -> StatusBarNotificationPresenter
+     *  fires contentIntent and, with FLAG_AUTO_CANCEL, cancels the notification. */
+    static void macapkOnNotificationClicked(String key) {
+        final android.service.notification.StatusBarNotification sbn;
+        synchronized (sActive) { sbn = sActive.get(key); }
+        if (sbn == null) return;
+        new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+            Notification n = sbn.getNotification();
+            try {
+                if (n.contentIntent != null) n.contentIntent.send();
+            } catch (PendingIntent.CanceledException ignored) {
+            } catch (Throwable t) {
+                System.err.println("[W] notification: contentIntent failed: " + t);
+            }
+            if ((n.flags & Notification.FLAG_AUTO_CANCEL) != 0) cancelKey(key);
+        });
+    }
 
     public void createNotificationChannel(NotificationChannel channel) {
         if (channel != null) channels.add(channel);
@@ -86,7 +208,10 @@ public class NotificationManager {
         return new ArrayList<>(channelGroups);
     }
 
-    public boolean areNotificationsEnabled() { return true; }
+    public boolean areNotificationsEnabled() {
+        if (!ENABLED || !sLinked) return true;
+        try { return !nativeIsDenied(); } catch (UnsatisfiedLinkError e) { sLinked = false; return true; }
+    }
     public int getCurrentInterruptionFilter() { return INTERRUPTION_FILTER_ALL; }
     public void setInterruptionFilter(int filter) {}
     public int getImportance() { return IMPORTANCE_DEFAULT; }
@@ -280,7 +405,9 @@ public class NotificationManager {
     /** AOSP getActiveNotifications (API 23): this app's currently-posted
      *  notifications. Mac.apk has no notification shade, so none are "active". */
     public android.service.notification.StatusBarNotification[] getActiveNotifications() {
-        return new android.service.notification.StatusBarNotification[0];
+        synchronized (sActive) {
+            return sActive.values().toArray(new android.service.notification.StatusBarNotification[0]);
+        }
     }
 
 

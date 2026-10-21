@@ -148,6 +148,7 @@ set(MACAPK_RUNTIME_SOURCES
     # (MediaPlayer.framework, rung 1: the Mac's own system media controls and
     # media keys; gate MACAPK_NOW_PLAYING).
     src/nowplaying_bridge.mm
+    src/notification_bridge.mm
     src/webview_bridge.mm
     # Android App Links: the sign-in window that hands a verified link back (AppLinks.java).
     src/applink_window.mm
@@ -416,6 +417,7 @@ target_link_libraries(macapk-runtime PRIVATE
     "-framework GameController"
     "-framework CoreLocation"
     "-framework MediaPlayer"
+    "-framework UserNotifications"
     "-framework IOKit"
 )
 

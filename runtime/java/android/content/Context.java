@@ -1346,7 +1346,7 @@ public abstract class Context {
                 result = new android.app.AlarmManager();
                 break;
             case NOTIFICATION_SERVICE:
-                result = new android.app.NotificationManager();
+                result = new android.app.NotificationManager(this);
                 break;
             case SEARCH_SERVICE:
                 result = new android.app.SearchManager(this);

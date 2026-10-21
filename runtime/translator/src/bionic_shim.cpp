@@ -55407,6 +55407,61 @@ extern "C" int __macapk_arm64___android_log_vprint(int /*prio*/, const char* tag
     return n;
 }
 
+// ---------------------------------------------------------------------------
+// Small Bionic-only symbols with no Darwin export. A guest import that finds
+// neither a shim nor a libSystem symbol resolves to the unresolved-symbol trap
+// (abort on first call), so each of these is a deliberately minimal stand-in.
+// Declarations from bionic: libc/include/sched.h, android/fdsan.h,
+// android/log.h (__android_log_is_loggable lives in liblog's private header
+// but is exported), malloc.h, unistd.h.
+// ---------------------------------------------------------------------------
+// int sched_getcpu(void): macOS exposes no CPU number to userland. 0 is a valid
+// answer for per-CPU sharding callers (they only use it as a hash/index).
+extern "C" int __macapk_arm64_sched_getcpu(void) { return 0; }
+
+// int __android_log_is_loggable(int prio, const char* tag, int default_prio):
+// no per-tag log.tag.<tag> properties here, so the default level decides, as
+// liblog does when the property is unset (loggable iff prio >= default_prio).
+extern "C" int __macapk_arm64___android_log_is_loggable(int prio, const char* /*tag*/,
+                                                         int default_prio) {
+    return prio >= default_prio ? 1 : 0;
+}
+
+// fdsan (android/fdsan.h): fd-ownership checking is a debugging aid that aborts
+// on misuse; we do not track owners. Level 0 is ANDROID_FDSAN_ERROR_LEVEL_DISABLED
+// (the old level is returned by set_error_level, hence 0 too); tags are opaque
+// 64-bit values to the guest, so 0 ("unowned") is a consistent answer.
+extern "C" int __macapk_arm64_android_fdsan_get_error_level(void) { return 0; }
+extern "C" int __macapk_arm64_android_fdsan_set_error_level(int /*new_level*/) { return 0; }
+extern "C" uint64_t __macapk_arm64_android_fdsan_get_owner_tag(int /*fd*/) { return 0; }
+extern "C" uint64_t __macapk_arm64_android_fdsan_create_owner_tag(int type, uint64_t value) {
+    // android/fdsan.h: (type << 56) | (value & ((1<<56)-1)) -- cheap to keep faithful.
+    return (static_cast<uint64_t>(type) << 56) | (value & ((1ULL << 56) - 1));
+}
+extern "C" void __macapk_arm64_android_fdsan_exchange_owner_tag(int /*fd*/, uint64_t /*expected*/,
+                                                                  uint64_t /*new_tag*/) {}
+extern "C" int __macapk_arm64_android_fdsan_close_with_tag(int fd, uint64_t /*tag*/) {
+    return ::close(fd);   // no ownership check; errno is the host's, as plain close() is unshimmed
+}
+
+// int getresuid/getresgid(id_t* r, id_t* e, id_t* s): macOS has neither. This
+// process has no saved-set ids distinct from real/effective, so report the
+// effective id (what getuid()/getgid() answer here) for all three.
+extern "C" int __macapk_arm64_getresuid(uid_t* r, uid_t* e, uid_t* s) {
+    if (!r || !e || !s) { errno = EFAULT; return -1; }
+    *r = *e = *s = getuid();
+    return 0;
+}
+extern "C" int __macapk_arm64_getresgid(gid_t* r, gid_t* e, gid_t* s) {
+    if (!r || !e || !s) { errno = EFAULT; return -1; }
+    *r = *e = *s = getgid();
+    return 0;
+}
+
+// int mallopt(int param, int value): M_DECAY_TIME, M_PURGE etc. tune Bionic's
+// allocator, which we do not use. Bionic returns 1 on success, 0 on failure.
+extern "C" int __macapk_arm64_mallopt(int /*param*/, int /*value*/) { return 1; }
+
 extern "C" {
 __attribute__((naked))
 int __macapk_arm64___android_log_print(int /*prio*/, const char* /*tag*/,

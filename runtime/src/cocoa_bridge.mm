@@ -320,6 +320,76 @@ static void apply_window_locks_main(double box_w, double box_h, double cur_w, do
 static void install_window_delegate(NSWindow* w);
 static NSRect render_frame_in_container(NSSize cs, bool* bars);
 
+// ---- Remember the window POSITION per app (MACAPK_WINDOW_RESTORE=0 disables) ----
+// Every launch used to centre on the main screen, so an app the user parked on a
+// second display (or in a corner) came back centred each time. We persist the
+// window CENTRE in NSUserDefaults under macapk.frame.<id> whenever the USER drags
+// or resizes it, and use it in place of the screen centre at the three places
+// that centre the window (CocoaInit, recenter_placeholder_next_cycle, the
+// kCenterOnScreen reshape). Position only: the window SIZE is derived from the
+// app's requested size, the orientation class and the aspect lock (window
+// policy), so restoring a saved size would fight all three; a saved centre is
+// instead applied to whatever size those produce, then clamped onto the screen
+// that overlaps it most (a display that is gone falls back to the screen centre).
+// AppKit's own restoration stays OFF (see CocoaInit): this is our key, not its.
+// <id> is MACAPK_PACKAGE when the launcher exports it, else MACAPK_APP_LABEL (the
+// app's display name, which the launcher always passes); neither -> no restore.
+// The saved centre is only consulted until the user first moves the window in this
+// run (g_restore_pending), so a later rotate/reshape behaves exactly as before.
+static bool window_restore_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_WINDOW_RESTORE");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+static NSString* window_restore_key() {
+    const char* id = std::getenv("MACAPK_PACKAGE");
+    if (!id || !id[0]) id = std::getenv("MACAPK_APP_LABEL");
+    if (!id || !id[0]) return nil;
+    return [@"macapk.frame." stringByAppendingString:[NSString stringWithUTF8String:id]];
+}
+static bool    g_restore_loaded  = false;
+static bool    g_restore_pending = false;   // a saved centre exists and the user has not moved the window yet
+static NSPoint g_restore_center  = NSZeroPoint;
+static void window_restore_load_once() {
+    if (g_restore_loaded) return;
+    g_restore_loaded = true;
+    if (!window_restore_on()) return;
+    NSString* key = window_restore_key();
+    NSString* v = key ? [[NSUserDefaults standardUserDefaults] stringForKey:key] : nil;
+    if (!v) return;
+    const NSPoint p = NSPointFromString(v);
+    if (!std::isfinite(p.x) || !std::isfinite(p.y)) return;
+    g_restore_center = p;
+    g_restore_pending = true;
+}
+// Origin for a window of `size`: the saved centre (clamped onto a visible screen)
+// while a restore is pending, else centred in `vis` (the previous behaviour).
+static NSPoint placeholder_origin_for(NSSize size, NSRect vis) {
+    NSPoint centred = NSMakePoint(vis.origin.x + (vis.size.width  - size.width)  / 2.0,
+                                  vis.origin.y + (vis.size.height - size.height) / 2.0);
+    window_restore_load_once();
+    if (!g_restore_pending) return centred;
+    NSRect want = NSMakeRect(g_restore_center.x - size.width / 2.0,
+                             g_restore_center.y - size.height / 2.0,
+                             size.width, size.height);
+    NSRect best = NSZeroRect;
+    CGFloat bestArea = 0;
+    for (NSScreen* sc in [NSScreen screens]) {
+        const NSRect v = [sc visibleFrame];
+        const NSRect i = NSIntersectionRect(v, want);
+        const CGFloat a = i.size.width * i.size.height;
+        if (a > bestArea) { bestArea = a; best = v; }
+    }
+    if (bestArea <= 0) return centred;   // the display it was on is gone
+    if (NSMaxX(want) > NSMaxX(best)) want.origin.x = NSMaxX(best) - size.width;
+    if (want.origin.x < best.origin.x) want.origin.x = best.origin.x;
+    if (NSMaxY(want) > NSMaxY(best)) want.origin.y = NSMaxY(best) - size.height;
+    if (want.origin.y < best.origin.y) want.origin.y = best.origin.y;
+    return want.origin;
+}
+
 // Install the runtime window's menu bar (app menu + a View menu whose Rotate item
 // shows its Cmd+R shortcut). Forward-declared here for CocoaInit; defined below.
 static void install_menu_bar(NSString* appTitle);
@@ -4161,9 +4231,7 @@ bool CocoaInit() {
         {
             NSRect fr0 = [g_placeholder_window frame];
             ++g_own_frame_change;
-            [g_placeholder_window setFrameOrigin:NSMakePoint(
-                screenVis.origin.x + (screenVis.size.width  - fr0.size.width)  / 2.0,
-                screenVis.origin.y + (screenVis.size.height - fr0.size.height) / 2.0)];
+            [g_placeholder_window setFrameOrigin:placeholder_origin_for(fr0.size, screenVis)];
             --g_own_frame_change;
         }
         if (MacApkHarnessNoActivate()) [g_placeholder_window orderBack:nil];
@@ -5709,8 +5777,25 @@ static void apply_user_resize_main(NSWindow* w, const char* how) {
                      : "");
 }
 
+// A drag (title bar) or resize-corner drag by the USER: remember where the window
+// is for the next launch and stop applying the launch-time saved centre. Our own
+// frame changes, fullscreen, and moves with no button down (AppKit's aspect
+// shrink settling, Stage Manager) are not the user's choice and are ignored.
+static void window_user_moved_main(NSWindow* w) {
+    if (!window_restore_on() || !w) return;
+    if (g_own_frame_change > 0 || g_fs_transition || window_is_fullscreen()) return;
+    if (!([NSEvent pressedMouseButtons] & 1)) return;
+    g_restore_pending = false;
+    NSString* key = window_restore_key();
+    if (!key) return;
+    const NSRect fr = [w frame];
+    [[NSUserDefaults standardUserDefaults]
+        setObject:NSStringFromPoint(NSMakePoint(NSMidX(fr), NSMidY(fr))) forKey:key];
+}
+
 static void window_did_end_live_resize_main(NSWindow* w) {
     if (g_fs_transition) return;
+    window_user_moved_main(w);
     if (window_is_fullscreen()) { fullscreen_content_changed_main(w, "split-view divider"); return; }
     apply_user_resize_main(w, "drag");
 }
@@ -9953,9 +10038,7 @@ static void recenter_placeholder_next_cycle() {
         NSRect vis = [screen visibleFrame];
         NSRect fr  = [g_placeholder_window frame];
         ++g_own_frame_change;
-        [g_placeholder_window setFrameOrigin:NSMakePoint(
-            vis.origin.x + (vis.size.width  - fr.size.width)  / 2.0,
-            vis.origin.y + (vis.size.height - fr.size.height) / 2.0)];
+        [g_placeholder_window setFrameOrigin:placeholder_origin_for(fr.size, vis)];
         --g_own_frame_change;
     });
 }
@@ -10036,8 +10119,7 @@ static void reshape_placeholder_to_globals_main(ReshapeAnchor anchor) {
         if (NSMaxY(newFrame) > NSMaxY(vis)) newFrame.origin.y = NSMaxY(vis) - newFrame.size.height;
         if (newFrame.origin.y < vis.origin.y) newFrame.origin.y = vis.origin.y;
     } else {
-        newFrame.origin.x = vis.origin.x + (vis.size.width  - newFrame.size.width)  / 2.0;
-        newFrame.origin.y = vis.origin.y + (vis.size.height - newFrame.size.height) / 2.0;
+        newFrame.origin = placeholder_origin_for(newFrame.size, vis);
     }
     ++g_own_frame_change;   // ours, not a user resize (windowDidResize)
     [g_placeholder_window setFrame:newFrame display:YES animate:NO];
@@ -10691,6 +10773,9 @@ void CocoaHideTranslationOverlay() {
 }
 - (NSSize)windowWillResize:(NSWindow*)sender toSize:(NSSize)frameSize {
     return macapk::window_will_resize_main(sender, frameSize);
+}
+- (void)windowDidMove:(NSNotification*)note {
+    macapk::window_user_moved_main((NSWindow*)[note object]);
 }
 - (void)windowDidEndLiveResize:(NSNotification*)note {
     macapk::window_did_end_live_resize_main((NSWindow*)[note object]);

@@ -149,6 +149,11 @@ public abstract class AsyncTask<Params, Progress, Result> {
     private volatile Status status = Status.PENDING;
     private volatile boolean cancelled;
     private FutureTask<Result> future;
+    /** AOSP mTaskInvoked: doInBackground started, so the worker itself posts
+     *  the result; the future's done() posts only for a task cancelled before
+     *  it ever ran (AsyncTask.java android14 :311-330, postResultIfNotInvoked). */
+    private final java.util.concurrent.atomic.AtomicBoolean taskInvoked =
+        new java.util.concurrent.atomic.AtomicBoolean();
 
     public final Status getStatus() { return status; }
     public final boolean isCancelled() { return cancelled; }
@@ -178,6 +183,7 @@ public abstract class AsyncTask<Params, Progress, Result> {
         status = Status.RUNNING;
         onPreExecute();
         Callable<Result> work = () -> {
+            taskInvoked.set(true);
             try {
                 Result r = doInBackground(params);
                 postResultOnMainThread(r);
@@ -200,7 +206,14 @@ public abstract class AsyncTask<Params, Progress, Result> {
                 return null;
             }
         };
-        future = new FutureTask<>(work);
+        future = new FutureTask<Result>(work) {
+            @Override protected void done() {
+                // Cancelled while still queued: call() never runs, and before
+                // this neither onCancelled nor onPostExecute ever fired, so a
+                // spinner dismissed in onCancelled stayed up for good.
+                if (!taskInvoked.get()) postResultOnMainThread(null);
+            }
+        };
         exec.execute(future);
         return this;
     }
@@ -215,8 +228,9 @@ public abstract class AsyncTask<Params, Progress, Result> {
 
     public final boolean cancel(boolean mayInterruptIfRunning) {
         cancelled = true;
-        if (future != null) future.cancel(mayInterruptIfRunning);
-        return true;
+        // AOSP returns mFuture.cancel(...): false once the task has completed
+        // (or was already cancelled), true otherwise.
+        return future == null || future.cancel(mayInterruptIfRunning);
     }
 
     public final Result get() throws InterruptedException, java.util.concurrent.ExecutionException {
@@ -231,6 +245,7 @@ public abstract class AsyncTask<Params, Progress, Result> {
 
     @SafeVarargs
     protected final void publishProgress(Progress... values) {
+        if (cancelled) return;   // AOSP: `if (!isCancelled())`
         new Handler(Looper.getMainLooper()).post(() -> onProgressUpdate(values));
     }
 

@@ -10718,6 +10718,17 @@ using macapk::hostkey::MacKeyEventToAndroid;
 // Main thread only. Indexed by the Carbon virtual key code.
 static bool g_cmd_chord_down[128];
 
+// Keys whose ACTION_DOWN reached the guest and whose ACTION_UP has not, with
+// the key code and character that DOWN carried. AppKit sends no keyUp: for a
+// key still held when the window stops being key (Cmd+Tab, a click on another
+// app, a system dialog), so without this a held W kept the character walking
+// and a held key binding kept its finger down until that key was pressed
+// again. macapkReleaseHeldKeys delivers the missing UPs, the way Android's
+// InputDispatcher synthesizes the UP (FLAG_CANCELED) for keys held when a
+// window loses focus. Main thread only. Indexed by the Carbon virtual key code.
+struct MacApkHeldKey { bool down; int keycode; int unicode; };
+static MacApkHeldKey g_held_keys[128];
+
 // MACAPK_DEBUG_HOSTKEY_FILE=<path> (debug harness, default off): each line the
 // harness appends -- "cmd+v", "cmd+shift+v", "ctrl+a", "v", "cmd+[" -- becomes
 // a synthetic NSEvent keyDown/keyUp pair routed the way NSApplication routes a
@@ -11301,24 +11312,27 @@ static int g_tpNextId = 0;
 // AppKit ever sending touchesEnded / touchesCancelled to this view. An EMPTY frame
 // tells the mapper every contact is gone (it CANCELs a live hold and forgets them),
 // so no ghost pointer outlives the view that owned it.
+// The same goes for keys: losing key status (or the window) ends every held key
+// without a keyUp: (macapkReleaseHeldKeys), so the observer is registered
+// whether or not the multitouch trackpad path is on.
 - (void)viewWillMoveToWindow:(NSWindow*)newWindow {
-    if (MacapkTrackpadMultitouchOn()) {
-        NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
-        if (self.window) {
-            [self macapkTrackpadReset];
-            [nc removeObserver:self name:NSWindowDidResignKeyNotification object:self.window];
-        }
-        if (newWindow) {
-            [nc addObserver:self selector:@selector(macapkWindowResignedKey:)
-                       name:NSWindowDidResignKeyNotification object:newWindow];
-        }
+    NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
+    if (self.window) {
+        if (MacapkTrackpadMultitouchOn()) [self macapkTrackpadReset];
+        [self macapkReleaseHeldKeys];
+        [nc removeObserver:self name:NSWindowDidResignKeyNotification object:self.window];
+    }
+    if (newWindow) {
+        [nc addObserver:self selector:@selector(macapkWindowResignedKey:)
+                   name:NSWindowDidResignKeyNotification object:newWindow];
     }
     [super viewWillMoveToWindow:newWindow];
 }
 
 - (void)macapkWindowResignedKey:(NSNotification*)note {
     (void)note;
-    [self macapkTrackpadReset];
+    if (MacapkTrackpadMultitouchOn()) [self macapkTrackpadReset];
+    [self macapkReleaseHeldKeys];
 }
 
 - (void)macapkTrackpadReset {
@@ -11834,7 +11848,23 @@ static JNIEnv* MacapkTouchJniEnv() {
     // downTime) only on this word, never by inferring it from "the same DOWN twice", because
     // a key's UP can be lost on this layer (TouchDispatcher.hostKeyEvent).
     const BOOL rep = (event.type == NSEventTypeKeyDown) ? [event isARepeat] : NO;
+    const unsigned short vk = [event keyCode];
+    if (vk < 128) {
+        if (action == 0) g_held_keys[vk] = {true, keycode, uni};
+        else if (action == 1) g_held_keys[vk].down = false;
+    }
     [self dispatchKeyRawAction:action keyCode:keycode unicode:uni meta:meta repeat:rep];
+}
+
+// The window stopped being key: deliver the ACTION_UP AppKit will never send
+// for each key still held (g_held_keys).
+- (void)macapkReleaseHeldKeys {
+    for (int vk = 0; vk < 128; vk++) {
+        if (!g_held_keys[vk].down) continue;
+        g_held_keys[vk].down = false;
+        [self dispatchKeyRawAction:1 keyCode:g_held_keys[vk].keycode
+                           unicode:g_held_keys[vk].unicode meta:0 repeat:NO];
+    }
 }
 
 // The single JNI door for key delivery. Shared by the hardware-key path

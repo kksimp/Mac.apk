@@ -98,13 +98,51 @@ inline bool IsCmdShortcutChord(NSEvent* event) {
     return b > 0x20 && b != 0x7f && b < 0xF700;
 }
 
+// The Android KEYCODE_* for a key on the ANSI block, by its PHYSICAL position
+// (Carbon kVK_ANSI_*), or 0. The fallback for a printable key whose base
+// character is not one MacKeyEventToAndroid names by character:
+//   * a non-Latin layout (Russian, Greek, Hebrew, Arabic, ...): the key at A
+//     produces 'ф', which used to leave KEYCODE_UNKNOWN, so WASD game keys,
+//     key bindings and the Command-as-Ctrl shortcuts (Cmd+C/V/X/A/Z arrived as
+//     Ctrl + keycode 0) did nothing on that layout;
+//   * a shifted digit on a Latin layout: charactersIgnoringModifiers keeps
+//     Shift, so Shift+1 is '!' -- Android's hardware keyboard reports
+//     KEYCODE_1 with META_SHIFT_ON there (Generic.kl maps scan codes, not
+//     characters, and KeyCharacterMap turns the pair into '!').
+// The character still travels in the unicode slot, so text fields keep
+// typing what the layout produced ('ф', '!'); only the key code changes.
+inline int PhysicalKeyToAndroid(unsigned short vk) {
+    switch (vk) {
+        case 0:  return 29;  case 11: return 30;  case 8:  return 31;   // A B C
+        case 2:  return 32;  case 14: return 33;  case 3:  return 34;   // D E F
+        case 5:  return 35;  case 4:  return 36;  case 34: return 37;   // G H I
+        case 38: return 38;  case 40: return 39;  case 37: return 40;   // J K L
+        case 46: return 41;  case 45: return 42;  case 31: return 43;   // M N O
+        case 35: return 44;  case 12: return 45;  case 15: return 46;   // P Q R
+        case 1:  return 47;  case 17: return 48;  case 32: return 49;   // S T U
+        case 9:  return 50;  case 13: return 51;  case 7:  return 52;   // V W X
+        case 16: return 53;  case 6:  return 54;                        // Y Z
+        case 29: return 7;   case 18: return 8;   case 19: return 9;    // 0 1 2
+        case 20: return 10;  case 21: return 11;  case 23: return 12;   // 3 4 5
+        case 22: return 13;  case 26: return 14;  case 28: return 15;   // 6 7 8
+        case 25: return 16;                                             // 9
+        case 50: return 68;  case 27: return 69;  case 24: return 70;   // ` - =
+        case 33: return 71;  case 30: return 72;  case 42: return 73;   // [ ] '\'
+        case 41: return 74;  case 39: return 75;  case 44: return 76;   // ; ' /
+        case 43: return 55;  case 47: return 56;                        // , .
+        default: return 0;
+    }
+}
+
 // Translate a macOS NSEvent key into an Android KEYCODE_* (return value)
 // plus the literal Unicode character (*outUnicode, 0 for non-printing keys)
 // and an Android meta-state bitmask (*outMeta). Printable keys are mapped by
 // their base character so the result is independent of keyboard layout;
 // editing / navigation keys are mapped by the macOS virtual key code
-// (Carbon kVK_*). A return of 0 (KEYCODE_UNKNOWN) still carries the Unicode
-// char, so typed text reaches the guest even for keys we don't name.
+// (Carbon kVK_*). A character with no name of its own falls back to the
+// key's physical position (PhysicalKeyToAndroid). A return of 0
+// (KEYCODE_UNKNOWN) still carries the Unicode char, so typed text reaches
+// the guest even for keys we don't name.
 inline int MacKeyEventToAndroid(NSEvent* event, int* outUnicode, int* outMeta) {
     NSString* chars = [event characters];
     NSString* base  = [event charactersIgnoringModifiers];
@@ -158,6 +196,22 @@ inline int MacKeyEventToAndroid(NSEvent* event, int* outUnicode, int* outMeta) {
         case 124: return 22;   // RightArrow    -> DPAD_RIGHT
         case 125: return 20;   // DownArrow     -> DPAD_DOWN
         case 126: return 19;   // UpArrow       -> DPAD_UP
+        case 115: return 122;  // Home          -> MOVE_HOME
+        case 119: return 123;  // End           -> MOVE_END
+        case 116: return 92;   // PageUp        -> PAGE_UP
+        case 121: return 93;   // PageDown      -> PAGE_DOWN
+        case 122: return 131;  // F1            -> F1
+        case 120: return 132;  // F2
+        case 99:  return 133;  // F3
+        case 118: return 134;  // F4
+        case 96:  return 135;  // F5
+        case 97:  return 136;  // F6
+        case 98:  return 137;  // F7
+        case 100: return 138;  // F8
+        case 101: return 139;  // F9
+        case 109: return 140;  // F10
+        case 103: return 141;  // F11
+        case 111: return 142;  // F12
         default:  break;
     }
     switch (b) {                     // common punctuation by character
@@ -167,6 +221,7 @@ inline int MacKeyEventToAndroid(NSEvent* event, int* outUnicode, int* outMeta) {
         case '\\': return 73;  case '[':  return 71;  case ']': return 72;
         case '`':  return 68;  default: break;
     }
+    if (int k = PhysicalKeyToAndroid([event keyCode])) return k;
     return 0;  // KEYCODE_UNKNOWN (unicode char still delivered)
 }
 

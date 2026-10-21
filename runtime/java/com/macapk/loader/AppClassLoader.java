@@ -2339,11 +2339,19 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
                 // unresolved externals.
                 File cached = new File(appDir,
                     "lib_native/lib" + depName + ".dylib");
+                // Recurse so depName's own DT_NEEDED is loaded before
+                // depName itself. This must run on the CACHE-HIT path too.
+                // Install-time pre-translation populates lib_native/ for
+                // every lib, so at launch `cached` almost always exists.
+                // While the recursion sat inside the translate branch below,
+                // that cache hit skipped it: a dependent whose DT_NEEDED
+                // lists it before the library that exports its symbols was
+                // then dlopen'd first and bound those imports to the
+                // unresolved trap. Bionic has no such window -- dlopen loads
+                // the whole DT_NEEDED closure before relocating.
+                preloadDependencies(depName);
                 if (!cached.exists()) {
                     cached.getParentFile().mkdirs();
-                    // Recurse so depName's own DT_NEEDED is preloaded
-                    // before depName itself.
-                    preloadDependencies(depName);
                     if (translatorBin == null
                         || !translatorBin.canExecute()
                         || !translate(depSo, cached)) {

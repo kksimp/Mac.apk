@@ -758,12 +758,85 @@ static void attach_source_node(Stream* s) {
 // ---------------------------------------------------------------------------
 // Lazy engine bring-up. Caller holds g_mtx.
 // ---------------------------------------------------------------------------
+// AVAudioEngine stops ITSELF when the output device or its format changes
+// (AirPods connect, headphones unplugged, sample-rate switch) and posts
+// AVAudioEngineConfigurationChangeNotification; AVAudioEngine.h: "the engine
+// will have stopped ... the nodes remain attached; the client must restart".
+// Nothing restarted it, so all app audio went silent until relaunch. The attached
+// AVAudioSourceNodes feed the mixer with their own formats and the mixer->output
+// link re-forms at the new hardware format, so a plain prepare+start on the
+// existing graph is enough (source nodes pull; there is no player to re-play).
+// MACAPK_AUDIO_ENGINE_RESTART=0 restores the old behaviour (no observer, no retry).
+static bool engine_restart_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_AUDIO_ENGINE_RESTART");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+static bool g_engine_test_no_output() {
+    const char* e = std::getenv("MACAPK_AUDIO_TEST_NO_OUTPUT");
+    return e && e[0] == '1';
+}
+// Caller holds g_mtx.
+static void engine_restart_locked(const char* why) {
+    if (!g_engine || g_engine.isRunning) {
+        if (g_engine && g_engine.isRunning) g_engine_started = true;
+        return;
+    }
+    @autoreleasepool {
+        NSError* err = nil;
+        BOOL ok = NO;
+        @try {
+            [g_engine prepare];
+            ok = [g_engine startAndReturnError:&err];
+        } @catch (NSException* ex) {
+            std::fprintf(stderr, "[audio] engine restart (%s) raised: %s\n", why,
+                         ex.reason ? ex.reason.UTF8String : "(no reason)");
+        }
+        g_engine_started = ok;
+        AVAudioFormat* of = ok ? [g_engine.outputNode outputFormatForBus:0] : nil;
+        std::fprintf(stderr, "[audio] engine restart (%s): %s%s%.0f Hz %u ch\n", why,
+                     ok ? "running, output " : "FAILED: ",
+                     ok ? "" : (err ? err.localizedDescription.UTF8String : "(unknown)"),
+                     ok ? of.sampleRate : 0.0, ok ? (unsigned)of.channelCount : 0u);
+    }
+}
+static void install_engine_config_observer() {
+    if (!engine_restart_enabled()) return;
+    // Hop to a global queue: the notification can be posted from inside a call
+    // that already holds g_mtx (startAndReturnError: in ensure_engine_locked), and
+    // taking g_mtx on the posting thread would self-deadlock.
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:AVAudioEngineConfigurationChangeNotification
+                    object:g_engine
+                     queue:nil
+                usingBlock:^(NSNotification* note) {
+        (void)note;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            std::lock_guard<std::mutex> lk(g_mtx);
+            engine_restart_locked("config change");
+        });
+    }];
+}
+
 static void ensure_engine_locked() {
-    if (g_engine_tried) return;
+    if (g_engine_tried) {
+        // No output device at boot (or a failed restart): retry the start, at most
+        // once a second, instead of staying silent for the life of the process.
+        if (g_engine && !g_engine_started && engine_restart_enabled()
+            && !g_engine_test_no_output()) {
+            static double last = 0;
+            const double now = (double)clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1e9;
+            if (now - last >= 1.0) { last = now; engine_restart_locked("retry"); }
+        }
+        return;
+    }
     g_engine_tried = true;
 
     @autoreleasepool {
         g_engine = [[AVAudioEngine alloc] init];     // +1, kept for process life
+        install_engine_config_observer();
         // Accessing mainMixerNode instantiates it and connects it to the
         // output node at the hardware format. With no source attached the
         // graph is valid and silent.

@@ -28,7 +28,17 @@ public class UiModeManager {
 
     public UiModeManager() {}
 
-    public int getCurrentModeType()    { return MODE_TYPE_NORMAL; }
+    public static boolean isTvMode() {
+        return "1".equals(System.getenv("MACAPK_TV_MODE"))
+            || "true".equalsIgnoreCase(System.getenv("MACAPK_TV_MODE"));
+    }
+
+    public int getCurrentModeType() {
+        if (isTvMode()) {
+            return MODE_TYPE_TELEVISION;
+        }
+        return MODE_TYPE_NORMAL;
+    }
 
     // Night mode round-trips: AppCompat's AppCompatDelegate.setDefaultNightMode
     // and any in-app dark-mode toggle set this then re-read it to drive their

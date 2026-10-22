@@ -1755,10 +1755,37 @@ public final class Boot {
         // version, not the app version. That split the app's assets
         // (..._7.11.1) from its runtime data + shader cache (..._15), so a
         // Unity title (Crossy Road) loaded its engine but rendered only the
-        // camera clear -- a flat blue window.)
         String dataSubdir = new File(appDir).getName();
-        File persistentDataDir = new File(androidRoot,
+        File realDataDir = new File(androidRoot,
                 "data/data/" + dataSubdir);
+        realDataDir.mkdirs();
+        File chosenDataDir = realDataDir;
+        String cleanPkg = manifest.packageName;
+        if (cleanPkg != null && !cleanPkg.isEmpty() && !cleanPkg.equals(dataSubdir)) {
+            // AOSP Context.getDataDir() and getFilesDir() always report the clean
+            // package name (/data/user/0/<pkg> or /data/data/<pkg>), NEVER version
+            // suffixes like "<pkg>_<ver>". App-tamper and anti-clone detectors
+            // count dots in getFilesDir().getPath() to detect cloned package names
+            // (e.g. "com.foo.bar.clone"); version dots in the data directory trip
+            // these checks.
+            // Establish a clean <pkg> symlink pointing to the versioned data dir so
+            // guest code sees standard AOSP path format while preserving per-version
+            // data isolation on the host filesystem.
+            File cleanDataDir = new File(androidRoot, "data/data/" + cleanPkg);
+            try {
+                java.nio.file.Path link = cleanDataDir.toPath();
+                if (java.nio.file.Files.isSymbolicLink(link)) {
+                    java.nio.file.Files.delete(link);
+                }
+                if (!cleanDataDir.exists()) {
+                    java.nio.file.Files.createSymbolicLink(link, java.nio.file.Paths.get(dataSubdir));
+                    chosenDataDir = cleanDataDir;
+                }
+            } catch (Throwable t) {
+                NativeLog.w(TAG, "could not establish clean data dir link: " + t);
+            }
+        }
+        final File persistentDataDir = chosenDataDir;
         File filesDir = new File(persistentDataDir, "files"); filesDir.mkdirs();
         File cacheDir = new File(persistentDataDir, "cache"); cacheDir.mkdirs();
         NativeLog.i(TAG, "data dir: " + persistentDataDir.getAbsolutePath());

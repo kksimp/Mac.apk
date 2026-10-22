@@ -7,7 +7,6 @@ Icon?
 
 # Editors
 .idea/
-.vscode/
 *.iml
 *.swp
 *.swo
@@ -35,9 +34,9 @@ thirdparty/framework-res/
 
 # Signing and notarization settings. Never commit these.
 scripts/.release.env
-.env
-.env.*
 *.p8
 *.p12
 *.keystore
 *.jks
+config.bat
+node_modules

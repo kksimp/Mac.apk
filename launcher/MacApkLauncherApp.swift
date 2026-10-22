@@ -5954,6 +5954,7 @@ struct AppDetailSheet: View {
                 identitySection
                 storageSection
                 macAppSection
+                optionsSection
                 Section("Environment overrides") {
                     EnvEditor(env: Binding(
                         get: { library.current(app).env },
@@ -6063,6 +6064,24 @@ struct AppDetailSheet: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
+        }
+    }
+
+    private var optionsSection: some View {
+        Section("App options") {
+            Toggle("Run in Android TV mode", isOn: Binding(
+                get: { library.current(app).env["MACAPK_TV_MODE"] == "1" },
+                set: { enabled in
+                    var env = library.current(app).env
+                    if enabled {
+                        env["MACAPK_TV_MODE"] = "1"
+                    } else {
+                        env.removeValue(forKey: "MACAPK_TV_MODE")
+                    }
+                    library.setEnv(env, for: library.current(app))
+                }
+            ))
+            .help("Forces Android TV Leanback UI mode (UiModeManager MODE_TYPE_TELEVISION), bypassing mobile ads and enabling TV landscape controls.")
         }
     }
 

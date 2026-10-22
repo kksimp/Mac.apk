@@ -1540,7 +1540,10 @@ public final class Boot {
         // Cocoa layer observes AppleInterfaceStyle change, the way a device
         // delivers a uiMode Configuration change instead of demanding a relaunch.
         boolean nightYes = macapkSystemIsDark();
-        cfg.uiMode = Configuration.UI_MODE_TYPE_NORMAL
+        int modeType = android.app.UiModeManager.isTvMode()
+            ? Configuration.UI_MODE_TYPE_TELEVISION
+            : Configuration.UI_MODE_TYPE_NORMAL;
+        cfg.uiMode = modeType
             | (nightYes ? Configuration.UI_MODE_NIGHT_YES : Configuration.UI_MODE_NIGHT_NO);
         System.setProperty("macapk.nightMode", nightYes ? "yes" : "no");
         sNightApplied = nightYes;

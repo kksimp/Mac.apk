@@ -4504,6 +4504,13 @@ public final class MacApkPackageManager extends PackageManager {
             if ("android.hardware.vulkan.version".equals(name)) has = version <= 0x402000;
             else if ("android.hardware.vulkan.level".equals(name)) has = version <= 0;
         }
+        if (!has && android.app.UiModeManager.isTvMode() && version <= 0) {
+            if ("android.software.leanback".equals(name)
+                    || "android.software.leanback_only".equals(name)
+                    || "android.hardware.type.television".equals(name)) {
+                has = true;
+            }
+        }
         // v1.0.983: MACAPK_TRACE_DEVICEINFO -- the device-profile counterpart
         // of MACAPK_TRACE_ATTR/MACAPK_TRACE_DEFSTYLE. Added while auditing
         // what Aurora Store's device-properties builder (com.aurora.gplayapi
@@ -4527,11 +4534,18 @@ public final class MacApkPackageManager extends PackageManager {
      *  so it is not optional. */
     @Override public android.content.pm.FeatureInfo[] getSystemAvailableFeatures() {
         java.util.ArrayList<android.content.pm.FeatureInfo> res =
-                new java.util.ArrayList<>(SYSTEM_FEATURES.size() + 1);
+                new java.util.ArrayList<>(SYSTEM_FEATURES.size() + 3);
         for (String name : SYSTEM_FEATURES) {
             android.content.pm.FeatureInfo fi = new android.content.pm.FeatureInfo();
             fi.name = name;
             res.add(fi);
+        }
+        if (android.app.UiModeManager.isTvMode()) {
+            for (String tvFeat : new String[]{"android.software.leanback", "android.hardware.type.television"}) {
+                android.content.pm.FeatureInfo fi = new android.content.pm.FeatureInfo();
+                fi.name = tvFeat;
+                res.add(fi);
+            }
         }
         android.content.pm.FeatureInfo gl = new android.content.pm.FeatureInfo();
         // Read the level off the SAME source ActivityManager reports through

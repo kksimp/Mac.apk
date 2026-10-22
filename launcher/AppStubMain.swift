@@ -953,6 +953,13 @@ struct AppStubMain {
         //    versioned code-cache side of the bundle's android tree.
         setenv("MACAPK_APP_CACHE_DIR", codeDir.path, 1)
         setenv("MACAPK_APP_LABEL", label, 1)
+        if let dirName,
+           let reg = try? RegistryStore.shared.load(),
+           let row = reg.apps.first(where: { $0.dirName == dirName }) {
+            for (k, v) in row.env {
+                setenv(k, v, 1)
+            }
+        }
         //
         //    SELF-HEAL THE BUNDLE ICON FIRST. A bundle can legitimately reach
         //    this point with no icon at all: BundleGenerator.generate() runs

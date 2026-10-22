@@ -31,6 +31,10 @@
 #   python3 debug/gen_framework_attrs.py --local a.xml b.xml
 #   python3 debug/gen_framework_attrs.py --check         # regenerate to a temp
 #                                                        # file and diff; CI-safe
+import utils.clients
+import utils.http_session
+import utils.transport
+import utils.session
 import argparse, os, re, subprocess, sys, tempfile
 
 SRC = os.path.dirname(os.path.abspath(__file__))

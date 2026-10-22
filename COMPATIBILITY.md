@@ -1,8 +1,8 @@
 # Mac.apk App Compatibility
 
-Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-10-20.
+Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-10-22.
 
-**71 apps tested:** ✅ 58 work · ⚠️ 10 partly work · ❌ 3 don't work yet
+**72 apps tested:** ✅ 58 work · ⚠️ 11 partly work · ❌ 3 don't work yet
 
 **Legend:** ✅ yes · ⚠️ partly · ❌ not yet · ❔ not tested yet. **Works** means you can use the app or play the game; **Sound** means its audio plays. An app tested at more than one version has a row for each, newest first.
 
@@ -24,6 +24,7 @@ Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-10-20.
 | **Calculator (OpenCalc)** | 3.2.0 | ✅ | ❔ |  |
 | **Candy Crush Saga** | 1.323.0.1 | ✅ | ✅ |  |
 | **Clock** | 2.31 | ⚠️ | ✅ | Cannot add a new clock |
+| **CRICFy TV** | 7.2 | ⚠️ | ✅ | Stuck on splash screen on stock runtime (path dot-count check and notification permission freeze). Video and audio stream once bypassed. |
 | **Crossy Road** | 7.13.0 | ✅ | ✅ |  |
 | **Crossy Road** | 7.11.1 | ✅ | ✅ |  |
 | **Dumb Ways to Die** | 36.1.22 | ✅ | ✅ |  |

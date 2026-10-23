@@ -2437,9 +2437,12 @@ public class LayoutInflater {
             // then makes the SAME static call (see its doc comment), so it can
             // only answer where the static path answered nothing or answered for
             // a theme the view is not actually using.
-            Integer c = MACAPK_INFLATE_TA_ATTR ? macapkResolveColorValue(col, viewTheme)
-                                               : macapkResolveColorValue(col);
-            if (c != null) tv.setTextColor(c);
+            android.content.res.ColorStateList csl = macapkResolveTextColorList(view, col, viewTheme);
+            Integer c = csl != null ? null
+                    : (MACAPK_INFLATE_TA_ATTR ? macapkResolveColorValue(col, viewTheme)
+                                              : macapkResolveColorValue(col));
+            if (csl != null) tv.setTextColor(csl);
+            else if (c != null) tv.setTextColor(c);
         }
         // v1.0.935: fontFamily travels with the appearance. Material 3's
         // typescale styles (TextAppearance.Material3.LabelLarge and friends)
@@ -2581,6 +2584,23 @@ public class LayoutInflater {
                 break;
         }
         if (minH > 0) {
+            // The table above is in PIXELS AT 2x (56dp = 112px), the Retina
+            // density it was written for. At any other density it is wrong by
+            // that ratio: at 1x (a non-Retina monitor, density 160) every real
+            // ActionBarContainer and wrap_content Toolbar was floored at 112dp,
+            // twice the bar, so each AppCompat screen showed an empty band as
+            // tall as the toolbar under it (NoNonsense Notes, every screen), and
+            // a real TabLayout / ProgressBar got twice its floor. Scaled by the
+            // view's own density, so 2x keeps exactly the old numbers.
+            float density = android.util.DisplayMetrics.macapkDeviceDensity();
+            try {
+                android.util.DisplayMetrics dm = placeholder.getResources() != null
+                    ? placeholder.getResources().getDisplayMetrics() : null;
+                if (dm != null && dm.density > 0f) density = dm.density;
+            } catch (Throwable ignored) {}
+            if (density > 0f && Math.abs(density - 2f) > 0.001f) {
+                minH = Math.max(1, Math.round(minH * density / 2f));
+            }
             // lane layout, 2026-08-01: NEVER LOWER an existing minimum. This
             // hint runs AFTER instantiation (inflateElement line ~513), and a
             // REAL widget's constructor may have just set the correct minimum
@@ -4733,6 +4753,8 @@ public class LayoutInflater {
                         // android:textColor="@android:color/darker_gray"
                         // (F-Droid's text_last_update) fell through to the
                         // default black instead of grey.
+                        android.content.res.ColorStateList csl = macapkResolveTextColorList(view, value, null);
+                        if (csl != null) { tv.setTextColor(csl); return; }
                         Integer c = macapkResolveColorValue(value);
                         if (c != null) tv.setTextColor(c);
                     }
@@ -5483,6 +5505,43 @@ public class LayoutInflater {
             } catch (Throwable ignored) {}
             return s.substring("@string/".length());  // best-effort literal
         }
+        // A PLATFORM string (`android:text="@android:string/cancel"`, compiled as
+        // @0x01040000): AOSP's TypedArray.getText resolves it from framework-res
+        // like any other. This returned the reference itself, so NoNonsense
+        // Notes' list dialog buttons read "@ANDROID:STRING/CANCEL" and
+        // "@ANDROID:STRING/OK" (textAllCaps). Resources.getString already
+        // serves 0x0104xxxx (ResourceIndex.stringForId); this only has to
+        // turn the name back into its id.
+        if (s.startsWith("@android:string/")) {
+            final String fwName = s.substring("@android:string/".length());
+            final String platform = macapkPlatformString(fwName);
+            if (platform != null) return platform;
+            // public-final.xml ids of the strings ResourceIndex's frozen table
+            // serves when the platform table is gated off (getIdentifier
+            // cannot name them then).
+            int id = 0;
+            switch (fwName) {
+                case "cancel": id = 0x01040000; break;
+                case "copy": id = 0x01040001; break;
+                case "cut": id = 0x01040003; break;
+                case "no": id = 0x01040009; break;
+                case "ok": id = 0x0104000a; break;
+                case "paste": id = 0x0104000b; break;
+                case "search_go": id = 0x0104000c; break;
+                case "selectAll": id = 0x0104000d; break;
+                case "untitled": id = 0x0104000f; break;
+                case "yes": id = 0x01040013; break;
+                case "dialog_alert_title": id = 0x01040014; break;
+                default: break;
+            }
+            if (id != 0 && context != null) {
+                try {
+                    android.content.res.Resources r = context.getResources();
+                    CharSequence resolved = r != null ? r.getText(id) : null;
+                    if (resolved != null && resolved.length() > 0) return resolved.toString();
+                } catch (Throwable ignored) {}
+            }
+        }
         return s;
     }
 
@@ -6051,6 +6110,58 @@ public class LayoutInflater {
             return rc == 1 ? null : rc;
         }
         return null;
+    }
+
+    /** A TextView colour attribute as AOSP reads it: TypedArray.getColorStateList,
+     *  so a @color/ SELECTOR (directly, or reached through ?attr hops in the
+     *  view's theme) keeps its states. Both of our textColor paths (the direct
+     *  attribute and the textAppearance's) resolved to ONE int, which froze every
+     *  selector text colour on its default row: a disabled preference
+     *  (androidx's setEnabledStateOnViews -> setEnabled(false)) kept full-ink
+     *  text under Material 3's m3_default_color_primary_text, whose
+     *  state_enabled="false" row carries the 38% disabled alpha (Privacy
+     *  Friendly Notes' Settings: "Autodelete timespan" while its dependency is
+     *  off). Returns null for anything that is not a STATEFUL list, so plain
+     *  colours keep the int path exactly. MACAPK_TEXTCOLOR_CSL=0 restores the
+     *  int-only path. */
+    static final boolean MACAPK_TEXTCOLOR_CSL =
+        !"0".equals(System.getenv("MACAPK_TEXTCOLOR_CSL"));
+    private android.content.res.ColorStateList macapkResolveTextColorList(View view, String value,
+            android.content.res.Resources.Theme th) {
+        if (!MACAPK_TEXTCOLOR_CSL || value == null) return null;
+        String cur = value.trim();
+        if (cur.isEmpty() || cur.startsWith("#")) return null;
+        android.content.res.Resources r = view.getResources();
+        if (r == null) return null;
+        if (th == null) {
+            try { if (view.getContext() != null) th = view.getContext().getTheme(); }
+            catch (Throwable ignored) {}
+        }
+        if (cur.startsWith("?")) {
+            if (th == null) return null;
+            for (int hop = 0; hop < 4 && cur.startsWith("?"); hop++) {
+                String attr = cur.substring(1);
+                if (attr.startsWith("android:attr/")) attr = "android:" + attr.substring(13);
+                else if (attr.startsWith("attr/")) attr = attr.substring(5);
+                String raw;
+                try { raw = th.resolveAttrRaw(attr); } catch (Throwable t) { raw = null; }
+                if (raw == null) return null;
+                raw = raw.trim();
+                if (raw.isEmpty() || raw.equals(cur)) return null;
+                cur = raw;
+            }
+        }
+        if (!cur.startsWith("@") || cur.startsWith("@android:")) return null;
+        try {
+            int id;
+            if (cur.startsWith("@0x") || cur.startsWith("@0X")) id = (int) Long.parseLong(cur.substring(3), 16);
+            else id = parseResourceId(cur);
+            if (id == 0 || (id >>> 24) == 0x01) return null;
+            android.content.res.ColorStateList csl = r.getColorStateList(id, th);
+            return (csl != null && csl.isStateful()) ? csl : null;
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     private void applyImageSrc(android.widget.ImageView iv, String value) {

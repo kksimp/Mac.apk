@@ -895,7 +895,10 @@ public final class ResourceIndex {
     // bypasses it; MACAPK_FWVIEW_DISK_CACHE_VERIFY=1 builds AND replays and
     // logs any field mismatch (the positive control).
     private static final int MACAPK_FWVIEW_CACHE_MAGIC = 0x4657_5631;   // "FWV1"
-    private static final int MACAPK_FWVIEW_CACHE_FORMAT_VER = 1;
+    // 2: macapkStyleItemKey / macapkFwItemText keep ^attr-private items and hops.
+    private static final int MACAPK_FWVIEW_CACHE_FORMAT_VER = 2;
+    /** ArscReader's type/name spelling of a private platform attribute. */
+    static final String ATTR_PRIVATE_PREFIX = "^attr-private/";
 
     /** The framework's own -w/-h/-sw dp thresholds, set by the last live build
      *  (macapkBuildFwViewUncached) so the wrapper can canonicalize the config
@@ -1690,6 +1693,11 @@ public final class ResourceIndex {
                 String tn = v.publicMap.get(data);
                 if (tn != null && tn.startsWith("attr/")) {
                     return "?android:" + tn.substring(5);
+                }
+                // A private platform attr hop (see macapkStyleItemKey).
+                if (tn != null && tn.startsWith(ATTR_PRIVATE_PREFIX)
+                        && tn.length() > ATTR_PRIVATE_PREFIX.length()) {
+                    return "?android:" + tn.substring(ATTR_PRIVATE_PREFIX.length());
                 }
                 return String.format("?0x%08x", data);
             }
@@ -2859,6 +2867,19 @@ public final class ResourceIndex {
      *  keyed cannot be looked up either way). */
     private static String macapkStyleItemKey(String bagItemName) {
         if (bagItemName == null || bagItemName.isEmpty()) return null;
+        // A PRIVATE platform attr (table type ^attr-private, ids 0x0112....) is
+        // still an attribute, and the platform themes bind them: Theme binds
+        // `colorPopupBackground` (to ?attr/colorBackgroundFloating), which
+        // @android:drawable/popup_background_material paints as its <solid>.
+        // Dropping these items left every such ?attr unresolved -- the solid
+        // came out transparent and every AppCompat overflow / popup menu drew
+        // its items straight over the screen behind it. Keyed by NAME like the
+        // public attrs (a name is unique across attr and ^attr-private in one
+        // package; LayoutInflater's dimension walk relies on the same).
+        if (bagItemName.startsWith(ATTR_PRIVATE_PREFIX)) {
+            String n = bagItemName.substring(ATTR_PRIVATE_PREFIX.length());
+            return n.isEmpty() ? null : n;
+        }
         if (bagItemName.charAt(0) == '^') return null;
         int a = bagItemName.indexOf("attr/");
         if (a == 0) return bagItemName.substring(5);

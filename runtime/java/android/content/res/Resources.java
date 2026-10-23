@@ -1860,7 +1860,13 @@ public class Resources {
         catch (NumberFormatException nfe) { return null; }
         if (id == 0) return null;
         String[] tn = macapkTypeNameOf(id);
-        if (tn == null || tn.length < 2 || !"attr".equals(tn[0])
+        // "^attr-private" is a PRIVATE platform attribute (0x0112....): the
+        // platform themes bind it by name like any public one (ResourceIndex
+        // .macapkStyleItemKey), e.g. popup_background_material's
+        // ?attr/colorPopupBackground.
+        if (tn == null || tn.length < 2
+                || !("attr".equals(tn[0])
+                     || ((id >>> 24) == 0x01 && "^attr-private".equals(tn[0])))
                 || tn[1] == null || tn[1].isEmpty()) return null;
         return ((id >>> 24) == 0x01 ? "?android:" : "?") + tn[1];
     }
@@ -6532,10 +6538,13 @@ public class Resources {
                     .getMethod("resolveAttrInTheme", String.class, String.class);
                 for (int hop = 0; hop < 4 && sr.startsWith("?"); hop++) {
                     String refAttr = sr.substring(1);
+                    // App attribute: whole-cascade identity first (see
+                    // macapkResolveAppAttrExact / resolveDefStyleName).
+                    final boolean appHop = !refAttr.startsWith("android:");
                     if (refAttr.startsWith("attr/")) refAttr = refAttr.substring(5);
                     else if (refAttr.startsWith("android:attr/")) refAttr = refAttr.substring(13);
-                    String next = null;
-                    for (String style : appliedStyles) {
+                    String next = appHop ? macapkResolveAppAttrExact(refAttr) : null;
+                    if (next == null) for (String style : appliedStyles) {
                         Object r = mResolve.invoke(macapkResourceIndex, style, refAttr);
                         if (r instanceof String) { next = (String) r; break; }
                     }
@@ -6552,6 +6561,31 @@ public class Resources {
                 }
             } catch (Throwable ignored) { return ref; }
             return sr;
+        }
+
+        /** Pass 1 of macapkResolveAppAttrRawHonest alone: the highest-priority
+         *  applied style whose chain declares the APP attribute `attrName` under
+         *  that exact key, or null (also for a one-style cascade, where the
+         *  per-style walk already asks that style first). */
+        private String macapkResolveAppAttrExact(String attrName) {
+            if (!MACAPK_THEME_APP_ATTR_CASCADE || attrName == null
+                    || attrName.startsWith("android:") || appliedStyles.size() <= 1
+                    || macapkResourceIndex == null) {
+                return null;
+            }
+            try {
+                java.lang.reflect.Method mExact = macapkThemeExactMethod;
+                if (mExact == null) {
+                    mExact = macapkResourceIndex.getClass()
+                        .getMethod("resolveAttrInThemeExact", String.class, String.class);
+                    macapkThemeExactMethod = mExact;
+                }
+                for (String style : appliedStyles) {
+                    Object r = mExact.invoke(macapkResourceIndex, style, attrName);
+                    if (r instanceof String s && !s.isEmpty()) return s;
+                }
+            } catch (Throwable ignored) {}
+            return null;
         }
 
         /** Resolve a defStyleAttr (a theme attr id like actionOverflowButtonStyle)
@@ -6587,9 +6621,28 @@ public class Resources {
                     if (attrName != null) {
                         java.lang.reflect.Method mResolve = macapkResourceIndex.getClass()
                             .getMethod("resolveAttrInTheme", String.class, String.class);
-                        for (String style : appliedStyles) {
-                            Object r = mResolve.invoke(macapkResourceIndex, style, attrName);
-                            if (r instanceof String) { styleRef = (String) r; break; }
+                        // An APP attribute (not 0x01) is answered by its own
+                        // identity across the WHOLE cascade first, the rule
+                        // resolveAttribute already follows
+                        // (macapkResolveAppAttrRawHonest). The per-style walk
+                        // below runs each style's `android:` alias and platform
+                        // fallback before the next style is asked, so a dialog
+                        // theme whose parent is a PLATFORM theme answered
+                        // AppCompat's alertDialogStyle with the platform's
+                        // android:alertDialogStyle before the activity theme's own
+                        // AlertDialog.AppCompat was reached. AlertController then
+                        // read listLayout 0 and every list dialog (ListPreference,
+                        // single/multi choice) threw ClassCastException in
+                        // AlertDialog.Builder.create (NoNonsense Notes'
+                        // ThemeNnnDialogLight extends Theme.DeviceDefault.Light.Dialog).
+                        if ((defStyleAttr >>> 24) != 0x01) {
+                            styleRef = macapkResolveAppAttrExact(attrName);
+                        }
+                        if (styleRef == null) {
+                            for (String style : appliedStyles) {
+                                Object r = mResolve.invoke(macapkResourceIndex, style, attrName);
+                                if (r instanceof String) { styleRef = (String) r; break; }
+                            }
                         }
                         if (styleRef == null) {
                             Object appName = macapkResourceIndex.getClass()
@@ -6621,12 +6674,15 @@ public class Resources {
                     // hang the inflater, so cap the hops and drop out.
                     for (int hop = 0; hop < 4 && sr.startsWith("?"); hop++) {
                         String refAttr = sr.substring(1);
+                        // `?X` / `?attr/X` names an APP attribute; the same
+                        // whole-cascade identity rule applies to the hop.
+                        final boolean appHop = !refAttr.startsWith("android:");
                         if (refAttr.startsWith("attr/")) refAttr = refAttr.substring(5);
                         else if (refAttr.startsWith("android:attr/")) refAttr = refAttr.substring(13);
-                        String next = null;
+                        String next = appHop ? macapkResolveAppAttrExact(refAttr) : null;
                         java.lang.reflect.Method mResolve2 = macapkResourceIndex.getClass()
                             .getMethod("resolveAttrInTheme", String.class, String.class);
-                        for (String style : appliedStyles) {
+                        if (next == null) for (String style : appliedStyles) {
                             Object r = mResolve2.invoke(macapkResourceIndex, style, refAttr);
                             if (r instanceof String) { next = (String) r; break; }
                         }

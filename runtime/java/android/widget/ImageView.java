@@ -456,6 +456,13 @@ public class ImageView extends View {
     @Override
     protected void onDraw(android.graphics.Canvas canvas) {
         if (canvas == null) return;
+        // AOSP hands the drawable the view's resolved direction (updateDrawable,
+        // onRtlPropertiesChanged), which is what flips an autoMirrored icon
+        // under RTL. Done per draw here, so a direction that resolves after the
+        // drawable was set reaches it too.
+        if (drawable != null) {
+            try { drawable.setLayoutDirection(getLayoutDirection()); } catch (Throwable ignored) {}
+        }
         // v1.0.100 diagnostic: skip drawing of named ImageView subclasses.
         if ("1".equals(ENV_MACAPK_SKIP_ALL_IMAGE_DRAW)) return;
         String skip = ENV_MACAPK_SKIP_IMAGEVIEW_DRAW;

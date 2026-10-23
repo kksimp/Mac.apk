@@ -91,16 +91,22 @@ public class Gravity {
      *  LEFT/RIGHT before computing pixel positions. layoutDirection is
      *  View.LAYOUT_DIRECTION_LTR (0) or LAYOUT_DIRECTION_RTL (1). */
     public static int getAbsoluteGravity(int gravity, int layoutDirection) {
-        if ((gravity & RELATIVE_LAYOUT_DIRECTION) == 0) return gravity;
-        int horiz = gravity & HORIZONTAL_GRAVITY_MASK;
-        // STAR T(=LEFT bits) and END(=RIGHT bits) -- in RTL, flip.
-        if (layoutDirection == 1 /* RTL */) {
-            int flipped = 0;
-            if ((horiz & LEFT)  != 0) flipped |= RIGHT;
-            if ((horiz & RIGHT) != 0) flipped |= LEFT;
-            horiz = flipped;
+        // AOSP Gravity.getAbsoluteGravity, verbatim in effect. LEFT (0x03) and
+        // RIGHT (0x05) share the AXIS_SPECIFIED bit, so they must be matched as
+        // whole START/END masks: the old per-bit flip mapped START under RTL to
+        // LEFT|RIGHT, i.e. FILL_HORIZONTAL, instead of RIGHT.
+        int result = gravity;
+        if ((result & RELATIVE_LAYOUT_DIRECTION) != 0) {
+            if ((result & START) == START) {
+                result &= ~START;
+                result |= (layoutDirection == 1 /* RTL */) ? RIGHT : LEFT;
+            } else if ((result & END) == END) {
+                result &= ~END;
+                result |= (layoutDirection == 1 /* RTL */) ? LEFT : RIGHT;
+            }
+            result &= ~RELATIVE_LAYOUT_DIRECTION;
         }
-        return (gravity & ~HORIZONTAL_GRAVITY_MASK & ~RELATIVE_LAYOUT_DIRECTION) | horiz;
+        return result;
     }
 
     public static void apply(int gravity, int w, int h,

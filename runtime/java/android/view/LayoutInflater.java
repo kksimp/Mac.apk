@@ -1821,6 +1821,13 @@ public class LayoutInflater {
             // DEFAULT_MARGIN_RESOLVED (0), even over marginRight/Horizontal.
             mlp.leftMargin = (st != null) ? st : 0;
             mlp.rightMargin = (en != null) ? en : 0;
+            // Keep them RELATIVE too, as AOSP's MarginLayoutParams does, so
+            // resolveLayoutDirection can mirror them once the view resolves RTL.
+            // Resolving to left/right here alone baked in LTR: an RTL toolbar
+            // button with marginEnd kept its gap on the right, slid to the left
+            // edge, and covered the overflow menu.
+            mlp.startMargin = (st != null) ? st : 0;
+            mlp.endMargin = (en != null) ? en : 0;
         }
     }
 
@@ -3300,21 +3307,26 @@ public class LayoutInflater {
         String st = dp.get("paddingStart"), en = dp.get("paddingEnd");
         boolean stDef = st != null && parseDimensionPxIntSafe(st) != null;
         boolean enDef = en != null && parseDimensionPxIntSafe(en) != null;
-        if (macapkRtlCompatibilityMode()) {
+        final boolean compat = macapkRtlCompatibilityMode();
+        if (compat) {
             // View ctor :6272-6287: start/end only where left/right was not
             // defined (padding, paddingHorizontal and paddingLeft/Right all
             // count as defined).
             if (stDef && l == null) l = st;
             if (enDef && r == null) r = en;
-        } else {
-            // resolvePadding (:21705), LTR: a defined start/end overrides.
-            if (stDef) l = st;
-            if (enDef) r = en;
         }
         if (l != null) applyAttribute(view, "paddingLeft", l);
         if (t != null) applyAttribute(view, "paddingTop", t);
         if (r != null) applyAttribute(view, "paddingRight", r);
         if (b != null) applyAttribute(view, "paddingBottom", b);
+        if (!compat && (stDef || enDef)) {
+            // resolvePadding (:21705): a defined start/end overrides the
+            // absolute edge it maps to FOR THE RESOLVED DIRECTION, so it stays
+            // relative on the view rather than being baked in as left/right.
+            view.macapkSetXmlRelativePadding(
+                stDef ? parseDimensionPxIntSafe(st) : Integer.MIN_VALUE,
+                enDef ? parseDimensionPxIntSafe(en) : Integer.MIN_VALUE);
+        }
     }
 
     private boolean nonNegPx(String v) {
@@ -5076,6 +5088,24 @@ public class LayoutInflater {
                     }
                     return;
                 }
+                case "layoutDirection": {
+                    // android:layoutDirection (ltr=0 rtl=1 inherit=2 locale=3) was
+                    // dropped, so a subtree an app pins LTR inside an RTL UI got
+                    // mirrored anyway -- WhatsApp's bottom bar (layoutDirection="ltr",
+                    // items already ordered for RTL by the app) came out reversed.
+                    int ld;
+                    switch (value) {
+                        case "ltr":     ld = View.LAYOUT_DIRECTION_LTR;     break;
+                        case "rtl":     ld = View.LAYOUT_DIRECTION_RTL;     break;
+                        case "inherit": ld = View.LAYOUT_DIRECTION_INHERIT; break;
+                        case "locale":  ld = View.LAYOUT_DIRECTION_LOCALE;  break;
+                        default:
+                            try { ld = Integer.decode(value.trim()); }
+                            catch (NumberFormatException e) { return; }
+                    }
+                    if (ld >= 0 && ld <= 3) view.setLayoutDirection(ld);
+                    return;
+                }
                 case "textAlignment": {
                     // android:textAlignment -- an aapt2 ENUM attr; apktool
                     // hands us the token string. AOSP token -> constant table:
@@ -5146,18 +5176,25 @@ public class LayoutInflater {
                     return;
                 }
                 case "paddingStart": {
-                    // LTR-only mapping (RTL not yet supported here).
+                    // Relative, resolved against the layout direction
+                    // (View.macapkSetXmlRelativePadding). Was LTR-only.
                     Integer px = parseDimensionPxInt(value);
-                    if (px != null) view.setPadding(px,
-                        view.getPaddingTop(), view.getPaddingRight(),
-                        view.getPaddingBottom());
+                    if (px != null) {
+                        if (macapkRtlCompatibilityMode()) view.setPadding(px,
+                            view.getPaddingTop(), view.getPaddingRight(),
+                            view.getPaddingBottom());
+                        else view.macapkSetXmlRelativePadding(px, Integer.MIN_VALUE);
+                    }
                     return;
                 }
                 case "paddingEnd": {
                     Integer px = parseDimensionPxInt(value);
-                    if (px != null) view.setPadding(view.getPaddingLeft(),
-                        view.getPaddingTop(), px,
-                        view.getPaddingBottom());
+                    if (px != null) {
+                        if (macapkRtlCompatibilityMode()) view.setPadding(view.getPaddingLeft(),
+                            view.getPaddingTop(), px,
+                            view.getPaddingBottom());
+                        else view.macapkSetXmlRelativePadding(Integer.MIN_VALUE, px);
+                    }
                     return;
                 }
                 default:

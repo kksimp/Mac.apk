@@ -3999,7 +3999,8 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
                     int dm = dp(c, 16);   // Material FAB Behavior default margin
                     mL = mR = mT = mB = dm;
                 }
-                int abs = android.view.Gravity.getAbsoluteGravity(g, 0);  // LTR
+                // The PARENT's resolved direction, as FrameLayout.layoutChildren uses.
+                int abs = android.view.Gravity.getAbsoluteGravity(g, vg.getLayoutDirection());
                 android.graphics.Rect container = new android.graphics.Rect(
                     mL, mT, parentW - mR, parentH - mB);
                 android.graphics.Rect out = new android.graphics.Rect();
@@ -4225,9 +4226,12 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
                 int defaultMargin = dp(c, 16);
                 marginL = marginR = marginT = marginB = defaultMargin;
             }
-            // Resolve START/END -> LEFT/RIGHT for LTR (we don't track
-            // layoutDirection per-view yet; assume LTR).
-            int abs = android.view.Gravity.getAbsoluteGravity(g, 0);
+            // Resolve START/END against the PARENT's resolved direction, as
+            // FrameLayout.layoutChildren does. This assumed LTR, so under an RTL
+            // locale it dragged every bottom|end FAB (WhatsApp's new-chat and
+            // Meta AI buttons) back to the right edge after the real layout pass
+            // had put it on the left.
+            int abs = android.view.Gravity.getAbsoluteGravity(g, vg.getLayoutDirection());
             android.graphics.Rect container = new android.graphics.Rect(
                 marginL, marginT, parentW - marginR, parentH - marginB);
             android.graphics.Rect out = new android.graphics.Rect();

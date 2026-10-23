@@ -4515,6 +4515,23 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     }
     /** AOSP `View.isPaddingResolved()` (View.java:20208-20210). */
     boolean isPaddingResolved() { return mPaddingResolved; }
+    /** LayoutInflater: android:paddingStart / paddingEnd from the XML or its
+     *  style, kept RELATIVE as AOSP's constructor keeps them (mUserPaddingStart/
+     *  End, :6272-6287) and resolved against the layout direction by
+     *  resolvePadding -- now and again whenever the direction resolves. Pass
+     *  Integer.MIN_VALUE for an edge the XML does not set. The inflater used to
+     *  write start into paddingLeft and end into paddingRight, so under RTL
+     *  every relative padding sat on the wrong side (AppCompat's popup menu
+     *  items: paddingEnd on the right, the title pushed against the left edge). */
+    void macapkSetXmlRelativePadding(int start, int end) {
+        if (start != UNDEFINED_PADDING) mUserPaddingStart = start;
+        if (end != UNDEFINED_PADDING) mUserPaddingEnd = end;
+        mUserPaddingLeftInitial = paddingLeft;
+        mUserPaddingRightInitial = paddingRight;
+        mPaddingResolved = false;
+        resolvePadding();
+    }
+
     /** AOSP `View.setPaddingRelative` (android-11.0.0_r48 View.java:24378-24398).
      *  Material's RelativePadding.applyToView calls this to push
      *  WindowInsets-derived padding back onto the view; without it,

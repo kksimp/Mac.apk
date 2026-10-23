@@ -257,6 +257,7 @@ public class VectorDrawable extends Drawable {
         intrinsicWidthDp  = parseDpToPx(root.getAttributeNS(NS, "width"),  intrinsicWidthDp);
         intrinsicHeightDp = parseDpToPx(root.getAttributeNS(NS, "height"), intrinsicHeightDp);
         tint = parseColor(root.getAttributeNS(NS, "tint"), 0);
+        if ("true".equalsIgnoreCase(root.getAttributeNS(NS, "autoMirrored"))) setAutoMirrored(true);
 
         // Walk children: <path>, <group>
         walkChildren(root, new ArrayList<GroupXform>());
@@ -638,6 +639,20 @@ public class VectorDrawable extends Drawable {
 
     @Override
     public void draw(Canvas canvas) {
+        // AOSP VectorDrawable.draw: needMirroring() (android:autoMirrored and an
+        // RTL layout direction) flips the canvas about the bounds before the
+        // tree is drawn, so a back arrow points the RTL way.
+        if (canvas != null && isAutoMirrored() && getLayoutDirection() == 1 /* RTL */) {
+            final android.graphics.Rect b = getBounds();
+            final int save = canvas.save();
+            canvas.scale(-1f, 1f, (b.left + b.right) / 2f, (b.top + b.bottom) / 2f);
+            try { macapkDrawUnmirrored(canvas); } finally { canvas.restoreToCount(save); }
+            return;
+        }
+        macapkDrawUnmirrored(canvas);
+    }
+
+    private void macapkDrawUnmirrored(Canvas canvas) {
         if (canvas == null || paths.isEmpty()) return;
         // Honor a PROGRAMMATIC tint (Compose Icon(tint=), AppCompat
         // DrawableCompat.setTintList / ?attr/colorControlNormal) over the XML

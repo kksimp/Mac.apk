@@ -580,6 +580,8 @@ public class ContentResolver {
     // callbacks never fired. v1.0.423.
     private static final java.util.List<Object[]> sObservers =
         new java.util.concurrent.CopyOnWriteArrayList<>();
+    static final boolean MACAPK_NOTIFY_SUBTREE =
+        !"0".equals(System.getenv("MACAPK_NOTIFY_SUBTREE"));
     private static void macapkNotify(Uri uri, ContentObserver self) {
         String u = uri != null ? uri.toString() : "";
         for (Object[] e : sObservers) {
@@ -587,7 +589,19 @@ public class ContentResolver {
             if (obs == self) continue;
             String base = (String) e[1];
             boolean desc = (Boolean) e[2];
-            if (base.isEmpty() || u.equals(base) || (desc && u.startsWith(base))) {
+            // AOSP ObserverNode.collectObserversLocked (ContentService.java):
+            // once the walk reaches the LEAF of the notified uri it collects
+            // every observer in that node's whole SUBTREE, whatever their
+            // notifyForDescendants -- a change to content://a/lists also tells
+            // an observer of content://a/lists/withcount. We only matched the
+            // other direction, so NoNonsense Notes' drawer (a CursorLoader on
+            // TaskList.URI_WITH_COUNT, notified via TaskList.URI) never showed a
+            // newly created list until the app restarted.
+            // MACAPK_NOTIFY_SUBTREE=0 restores the old match.
+            final boolean subtree = MACAPK_NOTIFY_SUBTREE && !u.isEmpty()
+                    && base.length() > u.length() && base.startsWith(u)
+                    && (u.endsWith("/") || base.charAt(u.length()) == '/');
+            if (base.isEmpty() || u.equals(base) || (desc && u.startsWith(base)) || subtree) {
                 // Deliberately still broad, and NOT covered by the
                 // exception-narrowing above. On a device each observer lives
                 // behind its own binder callback, so one observer's failure

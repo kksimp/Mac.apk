@@ -4840,7 +4840,7 @@ public final class MacApkPackageManager extends PackageManager {
         // toActivityInfo already did this; these two were simply missed.
         info.applicationInfo = makeAppInfo(flags);
         info.name        = entry.name;
-        info.authority   = entry.authorities;
+        info.authority   = entry.resolvedAuthorities(null);
         info.packageName = this.packageName;
         // The MANIFEST value, never the runtime-resolved one. AOSP puts the
         // manifest value in the info object (PackageInfoUtils.java:829) and applies
@@ -4874,9 +4874,10 @@ public final class MacApkPackageManager extends PackageManager {
     @Override public ProviderInfo resolveContentProvider(String authority, int flags) {
         if (authority == null) return null;
         for (Manifest.ProviderEntry entry : providers.values()) {
-            if (entry.authorities == null) continue;
+            final String authorities = entry.resolvedAuthorities(null);
+            if (authorities == null) continue;
             boolean match = false;
-            for (String a : entry.authorities.split(";")) {
+            for (String a : authorities.split(";")) {
                 if (authority.equals(a.trim())) { match = true; break; }
             }
             if (!match) continue;
@@ -4896,7 +4897,7 @@ public final class MacApkPackageManager extends PackageManager {
             // toActivityInfo already did this; these two were simply missed.
             info.applicationInfo = makeAppInfo(flags);
             info.name        = entry.name;
-            info.authority   = entry.authorities;
+            info.authority   = authorities;
             info.packageName = this.packageName;
             // The MANIFEST value, never the runtime-resolved one. AOSP puts the
             // manifest value in the info object (PackageInfoUtils.java:829) and applies

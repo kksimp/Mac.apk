@@ -68,35 +68,70 @@ public class Toast {
     }
 
     private View buildDefaultView(CharSequence text) {
-        TextView tv = new TextView(mContext);
+        // The application context: a toast outlives the activity that raised
+        // it (AOSP's is a system window), and the overlay stack closes every
+        // window owned by an activity when that activity is destroyed.
+        Context vc = mContext;
+        try { if (mContext.getApplicationContext() != null) vc = mContext.getApplicationContext(); } catch (Throwable ignored) {}
+        TextView tv = new TextView(vc);
         tv.setText(text);
         tv.setTextColor(0xFFFFFFFF);
         try { tv.setTextSize(14f); } catch (Throwable ignored) {}
         tv.setGravity(Gravity.CENTER);
-        try { tv.setBackgroundColor(0xCC333333); } catch (Throwable ignored) {}
-        tv.setPadding(48, 24, 48, 24);
+        // AOSP's text toast is a rounded frame (toast_frame / SystemUI
+        // text_toast), not a square band; padding in dp, not raw px.
+        try {
+            android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+            bg.setColor(0xE6333333);
+            bg.setCornerRadius(macapkDp(20));
+            tv.setBackground(bg);
+        } catch (Throwable ignored) {
+            try { tv.setBackgroundColor(0xCC333333); } catch (Throwable ignored2) {}
+        }
+        tv.setPadding(macapkDp(16), macapkDp(10), macapkDp(16), macapkDp(10));
         return tv;
     }
+
+    /** A toast is its OWN window on AOSP (TN.handleShow, android14
+     *  Toast.java:~690: mWM.addView(mView, mParams) with TYPE_TOAST and
+     *  FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCHABLE), drawn over every activity and
+     *  surviving the one that raised it. Ours was added as a child of the
+     *  current activity's decor FrameLayout, which is not what the canvas
+     *  driver paints (it paints the content root the activity installed, e.g.
+     *  AppCompat's sub-decor), so most toasts never reached the screen
+     *  (Privacy Friendly Notes "Note saved"/"Note not saved"), and the few that did sat at
+     *  the decor's TOP|START. It now goes through the overlay window stack
+     *  that already composites Dialogs and PopupWindows.
+     *  MACAPK_TOAST_WINDOW=0 restores the decor child. */
+    static final boolean MACAPK_TOAST_WINDOW =
+        !"0".equals(System.getenv("MACAPK_TOAST_WINDOW"));
+    private boolean mShownInOverlay;
 
     public void show() {
         // Mirror to the log either way (useful for headless verification).
         NativeLog.i("Mac.apk.Toast", String.valueOf(mText));
 
-        final ViewGroup decor = currentDecor();
-        if (decor == null || mView == null) return;
+        final ViewGroup decor = MACAPK_TOAST_WINDOW ? null : currentDecor();
+        if (mView == null || (!MACAPK_TOAST_WINDOW && decor == null)) return;
 
         ensureHandler();
         Runnable showR = new Runnable() {
             @Override public void run() {
                 try {
-                    if (mShownView != null) removeFrom(decor, mShownView);
+                    if (mShownView != null) macapkRemoveShown(mShownView);
                     mShownView = mView;
-                    ViewGroup.LayoutParams lp = new ViewGroup.LayoutParams(
-                            ViewGroup.LayoutParams.WRAP_CONTENT,
-                            ViewGroup.LayoutParams.WRAP_CONTENT);
-                    decor.addView(mShownView, lp);
-                    decor.requestLayout();
-                    decor.invalidate();
+                    if (MACAPK_TOAST_WINDOW) {
+                        if (mShownView.getParent() instanceof ViewGroup) {
+                            ((ViewGroup) mShownView.getParent()).removeView(mShownView);
+                        }
+                        com.macapk.loader.WindowOverlayStack.add(mShownView, macapkWindowParams());
+                        mShownInOverlay = true;
+                    } else {
+                        decor.addView(mShownView, macapkOverlayParams());
+                        decor.requestLayout();
+                        decor.invalidate();
+                        mShownInOverlay = false;
+                    }
                 } catch (Throwable t) {
                     NativeLog.i("Mac.apk.Toast", "overlay add failed: " + t);
                 }
@@ -114,14 +149,83 @@ public class Toast {
         final View v = mShownView;
         mShownView = null;
         Runnable r = new Runnable() {
-            @Override public void run() {
-                ViewGroup parent = (v.getParent() instanceof ViewGroup)
-                        ? (ViewGroup) v.getParent() : null;
-                if (parent != null) removeFrom(parent, v);
-            }
+            @Override public void run() { macapkRemoveShown(v); }
         };
         if (Looper.myLooper() == Looper.getMainLooper()) r.run();
         else { ensureHandler(); mHandler.post(r); }
+    }
+
+    private void macapkRemoveShown(View v) {
+        if (v == null) return;
+        if (mShownInOverlay) {
+            try { com.macapk.loader.WindowOverlayStack.remove(v); } catch (Throwable ignored) {}
+            mShownInOverlay = false;
+            return;
+        }
+        ViewGroup parent = (v.getParent() instanceof ViewGroup) ? (ViewGroup) v.getParent() : null;
+        if (parent != null) removeFrom(parent, v);
+    }
+
+    /** AOSP Toast.TN params (android14 Toast.java TN(...) and handleShow):
+     *  WRAP_CONTENT, TRANSLUCENT, TYPE_TOAST, KEEP_SCREEN_ON | NOT_FOCUSABLE |
+     *  NOT_TOUCHABLE, gravity = getAbsoluteGravity(mGravity, layoutDirection),
+     *  x = mX, y = mY (default R.dimen.toast_y_offset, 24dp). */
+    private android.view.WindowManager.LayoutParams macapkWindowParams() {
+        android.view.WindowManager.LayoutParams p = new android.view.WindowManager.LayoutParams();
+        p.width = ViewGroup.LayoutParams.WRAP_CONTENT;
+        p.height = ViewGroup.LayoutParams.WRAP_CONTENT;
+        p.format = -3; // PixelFormat.TRANSLUCENT
+        p.type = 2005; // TYPE_TOAST = FIRST_SYSTEM_WINDOW + 5
+        p.flags = android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                | android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+        int dir = View.LAYOUT_DIRECTION_LTR;
+        try {
+            dir = mContext.getResources().getConfiguration().getLayoutDirection();
+        } catch (Throwable ignored) {}
+        int g = mGravity;
+        if ((g & Gravity.HORIZONTAL_GRAVITY_MASK) == 0) g |= Gravity.CENTER_HORIZONTAL;
+        if ((g & Gravity.VERTICAL_GRAVITY_MASK) == 0) g |= Gravity.BOTTOM;
+        p.gravity = Gravity.getAbsoluteGravity(g, dir);
+        p.x = mX;
+        p.y = mYSet ? mY : macapkDp(24);
+        p.horizontalMargin = mHorizontalMargin;
+        p.verticalMargin = mVerticalMargin;
+        return p;
+    }
+
+    /** The toast's place in the decor. AOSP positions a toast window by
+     *  mGravity (default BOTTOM | CENTER_HORIZONTAL) with mX / mY as the
+     *  offsets from that edge, and mY defaults to
+     *  com.android.internal.R.dimen.toast_y_offset (24dp):
+     *      mTN.mY = context.getResources().getDimensionPixelSize(
+     *              com.android.internal.R.dimen.toast_y_offset);
+     *      mTN.mGravity = context.getResources().getInteger(
+     *              com.android.internal.R.integer.config_toastDefaultGravity);
+     *  (android14 Toast.java:191-194). Ours added the view with plain
+     *  WRAP_CONTENT params, so the decor FrameLayout put it at TOP|START: a
+     *  dark band over the toolbar title (Privacy Friendly Notes "Note updated"), at the
+     *  top-right under an RTL locale. setGravity() was stored and ignored. */
+    private android.widget.FrameLayout.LayoutParams macapkOverlayParams() {
+        int g = mGravity;
+        if ((g & Gravity.HORIZONTAL_GRAVITY_MASK) == 0) g |= Gravity.CENTER_HORIZONTAL;
+        if ((g & Gravity.VERTICAL_GRAVITY_MASK) == 0) g |= Gravity.BOTTOM;
+        android.widget.FrameLayout.LayoutParams lp = new android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, g);
+        int y = mYSet ? mY : macapkDp(24);
+        int v = g & Gravity.VERTICAL_GRAVITY_MASK;
+        if (v == Gravity.BOTTOM) lp.bottomMargin = y;
+        else lp.topMargin = y;
+        int h = Gravity.getAbsoluteGravity(g, View.LAYOUT_DIRECTION_LTR) & Gravity.HORIZONTAL_GRAVITY_MASK;
+        if (h == Gravity.RIGHT) lp.rightMargin = mX;
+        else lp.leftMargin = mX;
+        return lp;
+    }
+    private boolean mYSet;
+    private int macapkDp(int dp) {
+        float d = 1f;
+        try { d = mContext.getResources().getDisplayMetrics().density; } catch (Throwable ignored) {}
+        return Math.round(dp * (d > 0 ? d : 1f));
     }
 
     private void removeFrom(ViewGroup parent, View v) {
@@ -161,7 +265,7 @@ public class Toast {
     public void setDuration(int d) { mDuration = d; }
     public void setView(View v) { mView = v; }
     public View getView() { return mView; }
-    public void setGravity(int g, int xOff, int yOff) { mGravity = g; mX = xOff; mY = yOff; }
+    public void setGravity(int g, int xOff, int yOff) { mGravity = g; mX = xOff; mY = yOff; mYSet = true; }
     public int  getGravity() { return mGravity; }
     public int  getXOffset() { return mX; }
     public int  getYOffset() { return mY; }

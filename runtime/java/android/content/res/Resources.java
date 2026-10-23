@@ -3184,10 +3184,29 @@ public class Resources {
         private final android.graphics.Paint paint = new android.graphics.Paint();
         private int alpha = 255;
 
+        /** The theme the indicator was requested for (the VIEW's, e.g. a
+         *  dialog's overlay), or null for the application theme. AOSP tints
+         *  control_checkable_material with the view theme's ?colorControlNormal /
+         *  ?colorControlActivated; reading the APPLICATION theme instead drew the
+         *  unchecked ring in Privacy Friendly Notes' ListPreference dialog white on white
+         *  (AppTheme sets colorControlNormal=@color/white for its dark toolbar,
+         *  the dialog overlay sets it to the brand blue). */
+        private final Theme theme;
+
         MacapkCompoundButtonDrawable(float density, boolean radio) {
+            this(density, radio, null);
+        }
+        MacapkCompoundButtonDrawable(float density, boolean radio, Theme theme) {
             this.d = density;
             this.radio = radio;
+            this.theme = theme;
             paint.setAntiAlias(true);
+        }
+        private int macapkColor(String attr, int fallback) {
+            if (theme != null) {
+                try { return theme.resolveAttrColor(attr, fallback); } catch (Throwable ignored) {}
+            }
+            return Resources.macapkThemeColor(attr, fallback);
         }
 
         /** `state_enabled` ABSENT means disabled -- View.onCreateDrawableState
@@ -3225,8 +3244,8 @@ public class Resources {
          *  MacapkEditTextBar records). */
         private int tint() {
             final int c = checked()
-                ? Resources.macapkThemeColor("colorControlActivated", 0xFF6200EE)
-                : Resources.macapkThemeColor("colorControlNormal", 0x8A000000);
+                ? macapkColor("colorControlActivated", 0xFF6200EE)
+                : macapkColor("colorControlNormal", 0x8A000000);
             if (enabled()) return c;
             // ?attr/disabledAlpha; AOSP's material default is 0.5 (themes_material
             // .xml). Scale the alpha channel rather than blending toward a
@@ -3271,7 +3290,7 @@ public class Resources {
             // The tick, knocked out in the window background colour. APPROXIMATE
             // (see the class comment): AOSP carves it out of the filled square
             // with a vector path.
-            paint.setColor(Resources.macapkThemeColor("colorBackground", 0xFFFFFFFF));
+            paint.setColor(macapkColor("colorBackground", 0xFFFFFFFF));
             paint.setAlpha(alpha);
             paint.setStyle(android.graphics.Paint.Style.STROKE);
             paint.setStrokeWidth(2f * d);
@@ -3380,9 +3399,9 @@ public class Resources {
             // LayoutInflater's id==0 fallback, so an AppCompat app that bundles
             // the real abc_* asset is unaffected.
             case "btn_check_material":
-                return new MacapkCompoundButtonDrawable(d, false);
+                return new MacapkCompoundButtonDrawable(d, false, theme);
             case "btn_radio_material":
-                return new MacapkCompoundButtonDrawable(d, true);
+                return new MacapkCompoundButtonDrawable(d, true, theme);
             case "btn_default_material": {
                 android.graphics.drawable.GradientDrawable s =
                     new android.graphics.drawable.GradientDrawable();

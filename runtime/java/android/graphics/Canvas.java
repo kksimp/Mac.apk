@@ -2610,10 +2610,89 @@ public class Canvas {
         // re-derived, because a disagreement here is a whole gap per cluster.
         int[] bounds = android.graphics.Paint.macapkClusterBounds(text);
         float penX = x + gap * 0.5f;
+        if (mMacapkRunDir < 0 || android.text.MacApkBidi.hasRtl(text, 0, text.length())) {
+            // Same cells, visual order: bidi runs left to right, and the clusters
+            // of a right-to-left run from its logical end. One cluster at a time
+            // in logical order mirrored every Hebrew word.
+            final int saved = mMacapkRunDir;
+            try {
+                java.text.Bidi b = new java.text.Bidi(text, mMacapkRunDir < 0
+                        ? java.text.Bidi.DIRECTION_RIGHT_TO_LEFT
+                        : mMacapkRunDir > 0 ? java.text.Bidi.DIRECTION_LEFT_TO_RIGHT
+                                            : java.text.Bidi.DIRECTION_DEFAULT_LEFT_TO_RIGHT);
+                final int rc = b.getRunCount();
+                byte[] levels = new byte[rc];
+                Integer[] order = new Integer[rc];
+                for (int r = 0; r < rc; r++) { levels[r] = (byte) b.getRunLevel(r); order[r] = r; }
+                java.text.Bidi.reorderVisually(levels, 0, order, 0, rc);
+                for (Integer r : order) {
+                    final int rs = b.getRunStart(r), re = b.getRunLimit(r);
+                    final boolean rtl = (b.getRunLevel(r) & 1) != 0;
+                    java.util.ArrayList<String> cells = new java.util.ArrayList<>();
+                    for (int k = 0; k + 1 < bounds.length; k++) {
+                        if (bounds[k] >= rs && bounds[k] < re) cells.add(text.substring(bounds[k], bounds[k + 1]));
+                    }
+                    if (rtl) java.util.Collections.reverse(cells);
+                    mMacapkRunDir = rtl ? -1 : 1;
+                    for (String cluster : cells) {
+                        macapkDrawStringRuns(cluster, penX, y, primary);
+                        penX += android.graphics.Paint.macapkAdvanceIn(cluster, primary) + gap;
+                    }
+                }
+            } finally {
+                mMacapkRunDir = saved;
+            }
+            return;
+        }
         for (int k = 0; k + 1 < bounds.length; k++) {
             String cluster = text.substring(bounds[k], bounds[k + 1]);
             macapkDrawStringRuns(cluster, penX, y, primary);
             penX += android.graphics.Paint.macapkAdvanceIn(cluster, primary) + gap;
+        }
+    }
+
+    /** The direction a drawTextRun caller asked for: 0 = from the text
+     *  (first strong character), 1 = left-to-right, -1 = right-to-left. */
+    private int mMacapkRunDir = 0;
+
+    /** Right-to-left or bidi-mixed text through java.awt.font.TextLayout, which
+     *  implements UAX #9 (reordering, mirroring) and Arabic shaping; the
+     *  per-codepoint font fallback below rides along as FONT attributes. False
+     *  when the layout cannot be built, so the caller falls back. */
+    private boolean macapkDrawBidi(String text, float x, float y, Font primary) {
+        final int n = text.length();
+        if (n == 0) return true;
+        try {
+            final Font base = (primary != null) ? primary : g.getFont();
+            java.text.AttributedString as = new java.text.AttributedString(text);
+            as.addAttribute(java.awt.font.TextAttribute.FONT, base);
+            int i = 0;
+            while (i < n) {
+                int cp = text.codePointAt(i);
+                Font fb = (cp < 0x20) ? null : MacApkFont.fallbackBaseFor(cp, base);
+                int runStart = i;
+                i += Character.charCount(cp);
+                while (i < n) {
+                    int cp2 = text.codePointAt(i);
+                    Font f2 = (cp2 < 0x20) ? null : MacApkFont.fallbackBaseFor(cp2, base);
+                    if (f2 != fb) break;
+                    i += Character.charCount(cp2);
+                }
+                if (fb != null) {
+                    as.addAttribute(java.awt.font.TextAttribute.FONT, MacApkFont.atSizeOf(fb, base), runStart, i);
+                }
+            }
+            if (mMacapkRunDir != 0) {
+                as.addAttribute(java.awt.font.TextAttribute.RUN_DIRECTION, mMacapkRunDir < 0
+                        ? java.awt.font.TextAttribute.RUN_DIRECTION_RTL
+                        : java.awt.font.TextAttribute.RUN_DIRECTION_LTR);
+            }
+            java.awt.font.TextLayout tl =
+                    new java.awt.font.TextLayout(as.getIterator(), g.getFontRenderContext());
+            tl.draw(g, x, y);
+            return true;
+        } catch (Throwable t) {
+            return false;
         }
     }
 
@@ -2636,6 +2715,10 @@ public class Canvas {
      *  The font is restored on exit because the shadow pass re-enters with the
      *  same Graphics2D state. */
     private void macapkDrawStringRuns(String text, float x, float y, Font primary) {
+        if ((mMacapkRunDir < 0 || android.text.MacApkBidi.hasRtl(text, 0, text.length()))
+                && macapkDrawBidi(text, x, y, primary)) {
+            return;
+        }
         if (MacApkFont.firstSpecial(text, primary) < 0) {
             // ⚠ v1.0.937: draw the SAME GlyphVector Paint measured, with its
             // per-glyph positions already snapped to integer advances. Calling
@@ -3792,14 +3875,26 @@ public class Canvas {
                             float x, float y, boolean isRtl, Paint p) {
         if (text == null) return;
         com.macapk.loader.GfxTrace.real("Canvas.drawTextRun(char[])");
-        drawText(new String(text, index, count), x, y, p);
+        final int saved = mMacapkRunDir;
+        mMacapkRunDir = isRtl ? -1 : 1;
+        try {
+            drawText(new String(text, index, count), x, y, p);
+        } finally {
+            mMacapkRunDir = saved;
+        }
     }
     public void drawTextRun(CharSequence text, int start, int end,
                             int contextStart, int contextEnd,
                             float x, float y, boolean isRtl, Paint p) {
         if (text == null) return;
         com.macapk.loader.GfxTrace.real("Canvas.drawTextRun(CharSequence)");
-        drawText(text.subSequence(start, end).toString(), x, y, p);
+        final int saved = mMacapkRunDir;
+        mMacapkRunDir = isRtl ? -1 : 1;
+        try {
+            drawText(text.subSequence(start, end).toString(), x, y, p);
+        } finally {
+            mMacapkRunDir = saved;
+        }
     }
 
     // drawDoubleRoundRect -- Material3 outlined borders (OutlinedCard /

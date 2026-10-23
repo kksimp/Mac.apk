@@ -442,8 +442,21 @@ public final class Configuration implements Comparable<Configuration>, android.o
         int seed = SCREENLAYOUT_LONG_YES | SCREENLAYOUT_SIZE_XLARGE;
         screenLayout = macapkReduceScreenLayout(seed, longDp, shortDp) | dir;
     }
+
+    /** The layout-direction bits that go with the default locale. These defaults
+     *  pair `locale = Locale.getDefault()` with a hardcoded LAYOUTDIR_LTR, so a
+     *  Hebrew or Arabic host gave every app an RTL locale in an LTR layout and
+     *  nothing mirrored; a device sets the two together. */
+    private static int macapkDefaultLayoutDir() {
+        try {
+            return java.awt.ComponentOrientation.getOrientation(Locale.getDefault()).isLeftToRight()
+                ? SCREENLAYOUT_LAYOUTDIR_LTR : SCREENLAYOUT_LAYOUTDIR_RTL;
+        } catch (Throwable t) {
+            return SCREENLAYOUT_LAYOUTDIR_LTR;
+        }
+    }
     public int orientation = ORIENTATION_PORTRAIT;
-    public int screenLayout = SCREENLAYOUT_SIZE_NORMAL | SCREENLAYOUT_LONG_NO | SCREENLAYOUT_LAYOUTDIR_LTR;
+    public int screenLayout = SCREENLAYOUT_SIZE_NORMAL | SCREENLAYOUT_LONG_NO | macapkDefaultLayoutDir();
     public int screenWidthDp = 360;
     public int screenHeightDp = 640;
     public int smallestScreenWidthDp = 360;
@@ -610,7 +623,7 @@ public final class Configuration implements Comparable<Configuration>, android.o
         // fixUpLocaleList); inert while MACAPK_CONFIG_LOCALE_LIST is off.
         mLocaleList = null;
         orientation = ORIENTATION_PORTRAIT;
-        screenLayout = SCREENLAYOUT_SIZE_NORMAL | SCREENLAYOUT_LONG_NO | SCREENLAYOUT_LAYOUTDIR_LTR;
+        screenLayout = SCREENLAYOUT_SIZE_NORMAL | SCREENLAYOUT_LONG_NO | macapkDefaultLayoutDir();
         screenWidthDp = 360; screenHeightDp = 640; smallestScreenWidthDp = 360;
         densityDpi = android.util.DisplayMetrics.DENSITY_DEVICE_STABLE;
         uiMode = UI_MODE_TYPE_NORMAL | UI_MODE_NIGHT_NO;
@@ -1014,7 +1027,19 @@ public final class Configuration implements Comparable<Configuration>, android.o
     // from the locale's writing direction. Was hardcoded LTR + a no-op setter,
     // so an Arabic/Hebrew/Farsi Configuration reported LTR.
     public int getLayoutDirection() {
-        return (screenLayout & SCREENLAYOUT_LAYOUTDIR_MASK) == SCREENLAYOUT_LAYOUTDIR_RTL ? 1 : 0;
+        final int dir = screenLayout & SCREENLAYOUT_LAYOUTDIR_MASK;
+        // On a device the layout-direction bits are never left UNDEFINED: the
+        // system configuration sets them together with the locale. Ours can
+        // arrive with a locale and no bits ("he-IL" with screenLayout 0x02),
+        // which mirrored nothing for a Hebrew/Arabic user; read the locale then.
+        if (dir == SCREENLAYOUT_LAYOUTDIR_UNDEFINED) {
+            try {
+                Locale loc = locale;
+                if (loc != null && !java.awt.ComponentOrientation.getOrientation(loc).isLeftToRight()) return 1;
+            } catch (Throwable ignored) {}
+            return 0;
+        }
+        return dir == SCREENLAYOUT_LAYOUTDIR_RTL ? 1 : 0;
     }
     public void setLayoutDirection(java.util.Locale loc) {
         boolean rtl = false;

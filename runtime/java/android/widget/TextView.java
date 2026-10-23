@@ -4555,11 +4555,64 @@ public class TextView extends View
     private void macapkDrawLine(android.graphics.Canvas canvas, android.text.Spanned sp,
                                  String line, int srcStart, int srcCount,
                                  float x, float baselineY, android.text.TextPaint p) {
-        if (sp == null) { canvas.drawText(line, x, baselineY, p); return; }
+        if (sp == null) {
+            if (android.text.MacApkBidi.hasRtl(line, 0, line.length())) {
+                boolean paraRtl;
+                try { paraRtl = android.text.MacApkBidi.isRtlParagraph(getText(), srcStart); }
+                catch (Throwable t) { paraRtl = android.text.MacApkBidi.isRtlParagraph(line, 0); }
+                canvas.drawTextRun(line, 0, line.length(), 0, line.length(), x, baselineY, paraRtl, p);
+            } else {
+                canvas.drawText(line, x, baselineY, p);
+            }
+            return;
+        }
         if (mDrawBase == null) mDrawBase = new android.text.TextPaint();
         mDrawBase.set(p);
         float cx = x;
         final int end = Math.min(srcStart + srcCount, sp.length());
+        final int visLen = Math.max(0, Math.min(line.length(), Math.min(srcCount, end - srcStart)));
+        if (visLen > 0 && android.text.MacApkBidi.hasRtl(line, 0, visLen)) {
+            // Cut at every style run and every bidi level change, then paint the
+            // pieces in visual order, each with its own direction (AOSP TextLine).
+            int[] bounds = new int[line.length() + 1];
+            int nb = 0;
+            for (int rs = srcStart; rs < end; ) {
+                int re = sp.nextSpanTransition(rs, end, android.text.style.CharacterStyle.class);
+                if (re <= rs || re > end) re = end;
+                bounds[nb++] = re - srcStart;
+                rs = re;
+            }
+            int[] pieces = android.text.MacApkBidi.visualPieces(line.substring(0, visLen), bounds, nb,
+                    android.text.MacApkBidi.isRtlParagraph(sp, srcStart));
+            for (int k = 0; k < pieces.length; k += 3) {
+                int rs = srcStart + pieces[k], re = srcStart + pieces[k + 1];
+                p.set(mDrawBase);
+                android.text.style.CharacterStyle[] runSpans =
+                    sp.getSpans(rs, re, android.text.style.CharacterStyle.class);
+                if (runSpans != null) {
+                    for (android.text.style.CharacterStyle cs : runSpans) {
+                        if (cs == null) continue;
+                        if (sp.getSpanStart(cs) >= re || sp.getSpanEnd(cs) <= rs) continue;
+                        try { cs.updateDrawState(p); } catch (Throwable ignored) {}
+                    }
+                }
+                String run = line.substring(pieces[k], pieces[k + 1]);
+                float runW = p.measureText(run);
+                if (p.bgColor != 0) {
+                    if (mSpanBgPaint == null) mSpanBgPaint = new android.graphics.Paint();
+                    mSpanBgPaint.setColor(p.bgColor);
+                    canvas.drawRect(cx, baselineY + p.ascent(), cx + runW,
+                        baselineY + p.descent(), mSpanBgPaint);
+                }
+                canvas.drawTextRun(run, 0, run.length(), 0, run.length(), cx,
+                        baselineY + p.baselineShift, (pieces[k + 2] & 1) != 0, p);
+                cx += runW;
+            }
+            p.set(mDrawBase);
+            if (srcCount < line.length())
+                canvas.drawText(line.substring(srcCount), cx, baselineY, p);
+            return;
+        }
         int runStart = srcStart;
         while (runStart < end) {
             int runEnd = sp.nextSpanTransition(runStart, end,
@@ -4615,22 +4668,33 @@ public class TextView extends View
         // resolves up the tree in View.getTextAlignment(), landing on GRAVITY
         // at the root. Measured victim: AntennaPod's welcome TextViews
         // (match_parent + textAlignment="center") drew flush-left.
+        // START/END and NORMAL follow the paragraph direction (first strong
+        // character, AOSP's default FIRSTSTRONG_LTR heuristic); VIEW_START/
+        // VIEW_END follow the view's resolved layout direction.
+        final float right = Math.max(0f, availW - contentW);
+        boolean textRtl = false;
+        try { textRtl = android.text.MacApkBidi.isRtlParagraph(getText(), 0); } catch (Throwable ignored) {}
+        final boolean viewRtl = isLayoutRtl();
         switch (getTextAlignment()) {
             case android.view.View.TEXT_ALIGNMENT_CENTER:
                 return Math.max(0f, (availW - contentW) / 2f);
             case android.view.View.TEXT_ALIGNMENT_TEXT_END:
+                return textRtl ? 0f : right;
             case android.view.View.TEXT_ALIGNMENT_VIEW_END:
-                return Math.max(0f, availW - contentW);
+                return viewRtl ? 0f : right;
             case android.view.View.TEXT_ALIGNMENT_TEXT_START:
+                return textRtl ? right : 0f;
             case android.view.View.TEXT_ALIGNMENT_VIEW_START:
-                return 0f;
+                return viewRtl ? right : 0f;
             default: // TEXT_ALIGNMENT_GRAVITY (or unresolved): fall through to gravity
         }
-        int h = gravity & android.view.Gravity.HORIZONTAL_GRAVITY_MASK;
-        if (h == android.view.Gravity.CENTER_HORIZONTAL) return Math.max(0f, (availW - contentW) / 2f);
-        if (h == (android.view.Gravity.RIGHT & android.view.Gravity.HORIZONTAL_GRAVITY_MASK))
-            return Math.max(0f, availW - contentW);
-        return 0f;
+        int h = gravity & android.view.Gravity.RELATIVE_HORIZONTAL_GRAVITY_MASK;
+        if ((h & android.view.Gravity.HORIZONTAL_GRAVITY_MASK) == android.view.Gravity.CENTER_HORIZONTAL)
+            return Math.max(0f, (availW - contentW) / 2f);
+        if (h == android.view.Gravity.LEFT) return 0f;     // absolute
+        if (h == android.view.Gravity.RIGHT) return right; // absolute
+        if (h == android.view.Gravity.END) return textRtl ? 0f : right;
+        return textRtl ? right : 0f;                        // START / unset: ALIGN_NORMAL
     }
     private float verticalGravityOffset(int availH, float contentH) {
         int v = gravity & android.view.Gravity.VERTICAL_GRAVITY_MASK;

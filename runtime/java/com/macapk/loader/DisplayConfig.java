@@ -445,7 +445,9 @@ public final class DisplayConfig {
         final int changes = filterDiff(sdk, serverDiff, lastReported, next, buckets, true);
         if ((changes & ~handled) != 0) {
             a.macapkSetLastReportedConfig(next);
-            if (RELAUNCH_ON && ActivityHost.macapkRecreate(a)) {
+            boolean localeChanged = (changes & (Configuration.CONFIG_LOCALE
+                | Configuration.CONFIG_LAYOUT_DIRECTION)) != 0;
+            if ((RELAUNCH_ON || localeChanged) && ActivityHost.macapkRecreate(a)) {
                 NativeLog.i(TAG, "relaunching " + a.getClass().getName() + " (changed 0x"
                     + Integer.toHexString(changes) + " not declared in configChanges 0x"
                     + Integer.toHexString(handled) + ")");

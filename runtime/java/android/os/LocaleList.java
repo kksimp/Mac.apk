@@ -9,14 +9,13 @@ import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public final class LocaleList implements Parcelable {
     private final Locale[] locales;
     private static final LocaleList EMPTY = new LocaleList();
     private static LocaleList defaultList;
     private static Locale defaultLocale = Locale.getDefault();
+    private static LocaleList systemList;
 
     // Pseudo-locales used for RTL / accented pseudo-translation testing.
     // matchesLanguageAndScript() must never treat these as a script match
@@ -138,9 +137,15 @@ public final class LocaleList implements Parcelable {
 
     public static LocaleList getEmptyLocaleList() { return EMPTY; }
 
-    public static LocaleList getDefault() {
-        if (defaultList == null) defaultList = readAppleLanguagesOrdered();
+    public static synchronized LocaleList getDefault() {
+        if (defaultList == null) defaultList = macapkGetSystemLocales();
         return defaultList;
+    }
+
+    /** Host identity must survive process-default and application-locale changes. */
+    public static synchronized LocaleList macapkGetSystemLocales() {
+        if (systemList == null) systemList = readAppleLanguagesOrdered();
+        return systemList;
     }
 
     // macOS's per-user RANKED language preference (System Settings > General >
@@ -168,14 +173,14 @@ public final class LocaleList implements Parcelable {
                 while ((line = r.readLine()) != null) out.append(line).append('\n');
             }
             p.waitFor();
-            // `defaults read` prints an NSPropertyList array as one quoted
-            // element per line, e.g. (\n    "fr-FR",\n    "en-US"\n)\n --
-            // BCP-47 tags never contain a quote or backslash, so extracting
-            // quoted substrings in order needs no real plist/JSON parser.
+            // OpenStep arrays can contain quoted or unquoted language tags.
             List<Locale> ordered = new ArrayList<>();
-            Matcher m = Pattern.compile("\"([^\"]+)\"").matcher(out);
-            while (m.find()) {
-                ordered.add(Locale.forLanguageTag(m.group(1)));
+            String array = out.toString().trim();
+            if (array.startsWith("(") && array.endsWith(")")) {
+                for (String entry : array.substring(1, array.length() - 1).split(",")) {
+                    String tag = entry.trim().replaceAll("^\"|\"$", "");
+                    if (!tag.isEmpty()) ordered.add(Locale.forLanguageTag(tag));
+                }
             }
             if (!ordered.isEmpty()) {
                 return new LocaleList(ordered.toArray(new Locale[0]));
@@ -187,8 +192,9 @@ public final class LocaleList implements Parcelable {
     }
 
     public static LocaleList getAdjustedDefault() { return getDefault(); }
-    public static void setDefault(LocaleList list) { defaultList = list; }
-    public static void setDefault(LocaleList list, int index) {
+    public static void setDefault(LocaleList list) { setDefault(list, 0); }
+    public static synchronized void setDefault(LocaleList list, int index) {
+        macapkGetSystemLocales();
         defaultList = list;
         if (list != null && index >= 0 && index < list.size()) {
             defaultLocale = list.get(index);

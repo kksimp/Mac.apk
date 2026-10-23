@@ -674,6 +674,22 @@ public abstract class PackageManager {
             ai.metaData = archiveMetaData(m);
         }
         info.applicationInfo = ai;
+        // Installed-registry lookups also use this archive path. Like AOSP's
+        // PackageInfoUtils.generateWithComponents, return requested features
+        // under GET_CONFIGURATIONS so callers can discover feature-based plugins.
+        if ((flags & GET_CONFIGURATIONS) != 0 && !m.reqFeatures.isEmpty()) {
+            FeatureInfo[] features = new FeatureInfo[m.reqFeatures.size()];
+            for (int i = 0; i < features.length; i++) {
+                com.macapk.loader.Manifest.FeatureEntry e = m.reqFeatures.get(i);
+                FeatureInfo fi = new FeatureInfo();
+                fi.name = e.name;
+                fi.version = e.version;
+                fi.reqGlEsVersion = e.reqGlEsVersion;
+                if (e.required) fi.flags |= FeatureInfo.FLAG_REQUIRED;
+                features[i] = fi;
+            }
+            info.reqFeatures = features;
+        }
         // GET_PERMISSIONS: AOSP fills BOTH halves for a parsed archive
         // (PackageParser.generatePackageInfo, android11-release
         // core/java/android/content/pm/PackageParser.java:803-825):

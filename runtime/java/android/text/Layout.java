@@ -1402,6 +1402,7 @@ public abstract class Layout {
         mDrawBase.set(p);
         float cx = x;
         final int end = srcStart + line.length();
+        android.text.style.MetricAffectingSpan drawnRep = null;
         int runStart = srcStart;
         while (runStart < end) {
             int runEnd = sp.nextSpanTransition(runStart, end, android.text.style.CharacterStyle.class);
@@ -1417,6 +1418,24 @@ public abstract class Layout {
                     if (sp.getSpanStart(cs) >= runEnd || sp.getSpanEnd(cs) <= runStart) continue;
                     try { cs.updateDrawState(p); } catch (Throwable ignored) {}
                 }
+            }
+            // A ReplacementSpan's run is painted by the span, never as text
+            // (AOSP TextLine.handleReplacement); see MacApkReplacement.
+            android.text.style.MetricAffectingSpan repSpan =
+                    MacApkReplacement.covering(sp, runStart, runEnd);
+            if (repSpan != null) {
+                // A style transition inside the replaced range splits it into
+                // several runs; the span paints once, on the first of them.
+                if (repSpan != drawnRep) {
+                    drawnRep = repSpan;
+                    int r0 = Math.max(sp.getSpanStart(repSpan), srcStart);
+                    int r1 = Math.min(sp.getSpanEnd(repSpan), end);
+                    cx += MacApkReplacement.draw(canvas,
+                            (android.text.style.ReplacementSpan) repSpan.getUnderlying(),
+                            sp, r0, r1, cx, baselineY, p);
+                }
+                runStart = runEnd;
+                continue;
             }
             String run = line.substring(runStart - srcStart, runEnd - srcStart);
             float runW = p.measureText(run);

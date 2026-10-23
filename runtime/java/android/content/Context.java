@@ -140,9 +140,7 @@ public abstract class Context {
     // a delivery timer + listener registrations, so it must be a stable
     // per-Context instance (AOSP also caches it via SystemServiceRegistry).
     private android.hardware.SensorManager macapkSensorManager;
-    /** ONE LocaleManager per Context. The per-app locale selection lives in an
-     *  instance field, so handing out a fresh manager per getSystemService()
-     *  call made set-then-get return empty. AOSP uses a CachedServiceFetcher. */
+    /** Cached facade; LocaleManager shares stored state through SharedPrefsImpl. */
     private android.app.LocaleManager macapkLocaleManager;
     private android.location.LocationManager macapkLocationManager;
     public android.content.res.Resources.Theme getTheme() {
@@ -1382,7 +1380,7 @@ public abstract class Context {
                 // CachedServiceFetcher like every other manager, and API 33 is
                 // exactly where AppCompatDelegate hands locale duty to it.
                 if (macapkLocaleManager == null) {
-                    macapkLocaleManager = new android.app.LocaleManager();
+                    macapkLocaleManager = new android.app.LocaleManager(this);
                 }
                 result = macapkLocaleManager;
                 break;

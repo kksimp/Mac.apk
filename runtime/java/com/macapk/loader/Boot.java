@@ -1556,7 +1556,9 @@ public final class Boot {
         // is that push (MACAPK_SYSTEM_RES_FOLLOW, gated inside Resources);
         // without it Resources.getSystem() answered 720x1280 forever and
         // Solitaire CG sized its cards for a 720px screen.
-        Resources.updateSystemConfiguration(cfg, metrics, null);
+        Configuration systemConfig = new Configuration(cfg);
+        systemConfig.setLocales(android.os.LocaleList.macapkGetSystemLocales());
+        Resources.updateSystemConfiguration(systemConfig, metrics, null);
         // Wire the resource index so openRawResource(id) works. Since
         // v1.0.1589/1590 the index reads the installed apk set in place
         // (every member's resources.arsc + its file rows); apkPath is what
@@ -1759,6 +1761,8 @@ public final class Boot {
         String dataSubdir = new File(appDir).getName();
         File persistentDataDir = new File(androidRoot,
                 "data/data/" + dataSubdir);
+        android.app.LocaleManager.macapkRestoreApplicationLocales(
+                manifest.packageName, persistentDataDir, resources);
         File filesDir = new File(persistentDataDir, "files"); filesDir.mkdirs();
         File cacheDir = new File(persistentDataDir, "cache"); cacheDir.mkdirs();
         NativeLog.i(TAG, "data dir: " + persistentDataDir.getAbsolutePath());
@@ -3334,10 +3338,10 @@ public final class Boot {
         return built;
     }
 
-    /** DisplayConfig's entry: the rebuilt index, or null (logged) when there is
+    /** Configuration-change entry: the rebuilt index, or null (logged) when there is
      *  no APK yet or the build fails -- the caller then keeps the live one,
      *  which is the same choice the appearance flip makes. */
-    static ResourceIndex macapkNewResourceIndex(Configuration cfg) {
+    public static ResourceIndex macapkNewResourceIndex(Configuration cfg) {
         if (sApkPath == null || cfg == null) return null;
         synchronized (sNightLock) {
             try {
@@ -3431,12 +3435,16 @@ public final class Boot {
                     // thread). `next` was copied before that, so applying it as
                     // is would revert the new size. Take the display fields from
                     // the live configuration -- a flip changes uiMode only --
-                    // and rebuild if the index was selected for the old size.
+                    // and retain any locale selected while the worker ran.
+                    // Rebuild if the index was selected for an older size or locale.
                     ResourceIndex useIdx = idx;
-                    if (DisplayConfig.adoptDisplayFields(res.getConfiguration(), next)
-                            && idx.macapkSelectionChangesFor(next)) {
+                    Configuration live = res.getConfiguration();
+                    DisplayConfig.adoptDisplayFields(live, next);
+                    next.setLocales(live.getLocales());
+                    if (idx.macapkSelectionChangesFor(next)) {
                         ResourceIndex again = macapkNewResourceIndex(next);
-                        if (again != null) useIdx = again;
+                        if (again == null) return;
+                        useIdx = again;
                     }
                     Resources.macapkSetResourceIndex(useIdx);
                     // The Application and every Activity share ONE Resources

@@ -37,10 +37,27 @@ public final class MacApkPackageManager extends PackageManager {
     private final String dataDir;
     /** The data dir to REPORT as ApplicationInfo.dataDir (see makeAppInfo). */
     private volatile String reportedDataDir;
+    private android.content.SharedPreferences componentPreferences;
 
     /** v1.0.1641: set by Application once Boot knows the app's data dir. */
-    public void macapkSetReportedDataDir(String dir) {
+    public synchronized void macapkSetReportedDataDir(String dir) {
         this.reportedDataDir = dir;
+        if (dir != null && !dir.isEmpty()) {
+            final java.io.File data = new java.io.File(dir);
+            android.content.Context storage = new android.content.ContextWrapper(null) {
+                @Override public String getPackageName() { return packageName; }
+                @Override public java.io.File getDataDir() { return data; }
+                @Override public java.io.File getFilesDir() { return new java.io.File(data, "files"); }
+            };
+            componentPreferences = SharedPrefsImpl.macapkGet(storage, "macapk.component_enabled");
+            for (java.util.Map.Entry<String, ?> entry : componentPreferences.getAll().entrySet()) {
+                Object value = entry.getValue();
+                if (value instanceof Integer && ((Integer) value == COMPONENT_ENABLED_STATE_ENABLED
+                        || (Integer) value == COMPONENT_ENABLED_STATE_DISABLED)) {
+                    componentEnabledState.put(entry.getKey(), (Integer) value);
+                }
+            }
+        }
     }
     private final String nativeLibraryDir;
 
@@ -2353,7 +2370,7 @@ public final class MacApkPackageManager extends PackageManager {
      *  the AOSP source says otherwise and the source wins. It also means the
      *  stored value can only ever be ENABLED or DISABLED, which is what makes
      *  the two-line override read in macapkIsComponentEnabled correct. */
-    @Override public void setComponentEnabledSetting(
+    @Override public synchronized void setComponentEnabledSetting(
             ComponentName componentName, int newState, int flags) {
         if (componentName == null) return;
         switch (newState) {
@@ -2369,6 +2386,13 @@ public final class MacApkPackageManager extends PackageManager {
         }
         String cls = componentName.getClassName();
         if (cls == null) return;
+        if (componentPreferences != null && (newState == COMPONENT_ENABLED_STATE_ENABLED
+                || newState == COMPONENT_ENABLED_STATE_DISABLED || newState == COMPONENT_ENABLED_STATE_DEFAULT)) {
+            android.content.SharedPreferences.Editor edit = componentPreferences.edit();
+            if (newState == COMPONENT_ENABLED_STATE_DEFAULT) edit.remove(cls);
+            else edit.putInt(cls, newState);
+            if (!edit.commit()) throw new IllegalStateException("Cannot persist component enabled state");
+        }
         switch (newState) {
             case COMPONENT_ENABLED_STATE_ENABLED:
             case COMPONENT_ENABLED_STATE_DISABLED:

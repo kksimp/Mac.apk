@@ -5437,7 +5437,9 @@ public class Resources {
                     // The phone defaults until Boot's bind push (see
                     // updateSystemConfiguration), not the unset delta that
                     // `new Configuration()` is under MACAPK_CONFIG_UNSET_CTOR.
-                    r = sSystem = new Resources(null, dm, Configuration.macapkPhoneDefaults());
+                    Configuration systemConfig = Configuration.macapkPhoneDefaults();
+                    systemConfig.setLocales(android.os.LocaleList.macapkGetSystemLocales());
+                    r = sSystem = new Resources(null, dm, systemConfig);
                 }
             }
         }
@@ -7365,6 +7367,7 @@ public class Resources {
         try { this.config.setTo(config); } catch (Throwable ignored) {}
         if (configChanges == 0) return;
         try { macapkDrawableCache.clear(); } catch (Throwable ignored) {}
+        macapkCslFileMiss.clear();
         try { flushLayoutCache(); } catch (Throwable ignored) {}
     }
 
@@ -7405,6 +7408,7 @@ public class Resources {
         // :482-488 the caches, by the change set (see the eviction note above).
         if (configChanges == 0) return;
         try { macapkDrawableCache.clear(); } catch (Throwable ignored) {}
+        macapkCslFileMiss.clear();
         try { flushLayoutCache(); } catch (Throwable ignored) {}
     }
 

@@ -1,17 +1,5 @@
-// android.app.LocaleManager -- the API-33 per-app locale service. Apps
-// (and androidx.appcompat's AppLocalesStorageHelper) set/read their
-// preferred UI locales through it. AOSP:
-//   https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/core/java/android/app/LocaleManager.java
-//
-// Previously a bare stub, so any app that called getApplicationLocales /
-// setApplicationLocales (Settings-style language pickers, AppCompat 1.6+
-// per-app language) hit a NoSuchMethodError. We back it with a stored
-// LocaleList that defaults to the system locale; setting it updates the
-// JVM default locale so subsequent Locale.getDefault() / formatting
-// reflects the choice, round-trips through getApplicationLocales, AND
-// (see setApplicationLocales below) dispatches a Configuration change to
-// the current top Activity so the running UI actually re-renders in the
-// new language, the same way a real device-level locale change would.
+// API-33 application locales: requested state lives in existing per-file preferences.
+// https://raw.githubusercontent.com/aosp-mirror/platform_frameworks_base/android14-release/core/java/android/app/LocaleManager.java
 package android.app;
 
 import android.os.LocaleList;
@@ -19,67 +7,84 @@ import android.os.LocaleList;
 import java.util.Locale;
 
 public class LocaleManager {
-    public LocaleManager() {}
+    private final android.content.Context context;
 
-    // The app's currently-selected locales. Empty == "follow the system",
-    // which is what AOSP returns when the app has set no override.
-    private volatile LocaleList applicationLocales = LocaleList.getEmptyLocaleList();
+    public LocaleManager() { this(null); }
+    public LocaleManager(android.content.Context context) { this.context = context; }
 
-    // Captured once at class-load, before any app has ever called
-    // setApplicationLocales -- the true boot-time system locale, so a caller
-    // that clears its override (empty LocaleList = "follow system", the AOSP
-    // contract) can be restored to the real system locale rather than
-    // whatever locale happened to be active most recently.
-    private static final Locale SYSTEM_LOCALE = Locale.getDefault();
-
-    /** AOSP: set this app's preferred UI locales. An empty list clears the
-     *  override (revert to system). We also push the primary locale to the
-     *  JVM default so date/number formatting and Locale.getDefault() follow
-     *  -- correct here (not the cross-process bleed AOSP's real per-app
-     *  override guards against) because Mac.apk hosts exactly one app per
-     *  JVM process, so "JVM-global default" and "this app's process default"
-     *  are the same scope; real Android's own ActivityThread.handleConfigurationChanged
-     *  path calls Locale.setDefault() too when applying a locale change,
-     *  for the same single-process-per-app reason.
-     *
-     *  AOSP's setApplicationLocales additionally drives a per-app
-     *  configuration change that recreates/onConfigurationChanged's the
-     *  calling app's activities so the UI actually re-renders in the new
-     *  language (API 33 LocaleManager). Previously nothing dispatched that
-     *  here: the value round-tripped correctly but the screen never changed,
-     *  which is indistinguishable from a broken language picker to the user.
-     *  We mirror it by building a locale-updated Configuration off the
-     *  current top activity's Resources and dispatching it exactly the way a
-     *  real device-level config change would (Activity.dispatchConfigurationChanged,
-     *  which updates Resources, calls onConfigurationChanged, and fans out to
-     *  the Application's ComponentCallbacks -- see Activity.java). ActivityHost
-     *  (com.macapk.loader, our ActivityThread analogue) is Mac.apk's one-window
-     *  "task stack", so its top entry is the whole live Activity stack to
-     *  scope this to. */
-    public void setApplicationLocales(LocaleList locales) {
-        if (locales == null) locales = LocaleList.getEmptyLocaleList();
-        this.applicationLocales = locales;
-        Locale primary = locales.size() > 0 ? locales.get(0) : SYSTEM_LOCALE;
-        try {
-            if (primary != null) Locale.setDefault(primary);
-        } catch (Throwable ignored) {}
-        try {
-            Activity top = com.macapk.loader.ActivityHost.peek();
-            if (top != null) {
-                android.content.res.Resources res = top.getResources();
-                android.content.res.Configuration cur = (res != null) ? res.getConfiguration() : null;
-                android.content.res.Configuration next = new android.content.res.Configuration(cur);
-                next.setLocale(primary);
-                top.dispatchConfigurationChanged(next);
-            }
-        } catch (Throwable ignored) {}
+    private android.content.SharedPreferences preferences() {
+        android.content.Context owner = context != null ? context : Application.macapk_get();
+        return com.macapk.loader.SharedPrefsImpl.macapkGet(owner, "macapk.application_locales");
     }
 
-    /** AOSP: returns the app's selected locales, or the empty list if it
-     *  follows the system. */
+    /** Store the requested list; the effective list also includes system fallbacks. */
+    public void setApplicationLocales(LocaleList locales) {
+        if (locales == null) locales = LocaleList.getEmptyLocaleList();
+        android.content.SharedPreferences prefs = preferences();
+        synchronized (prefs) {
+            if (getApplicationLocales().equals(locales)) return;
+            if (!prefs.edit().putString("locales", locales.toLanguageTags()).commit()) {
+                throw new IllegalStateException("Unable to persist application locales");
+            }
+        }
+        Runnable apply = () -> {
+            Application app = Application.macapk_get();
+            if (app == null || prefs != com.macapk.loader.SharedPrefsImpl.macapkGet(
+                    app, "macapk.application_locales")) return;
+            android.content.res.Configuration next = applyToResources(app.getResourcesDirect());
+            app.dispatchConfigurationChanged(new android.content.res.Configuration(next));
+            Activity top = com.macapk.loader.ActivityHost.peek();
+            if (top != null) com.macapk.loader.DisplayConfig.deliverToActivity(top, next);
+            android.view.ViewRootImpl.scheduleLayout();
+        };
+        android.os.Looper looper = android.os.Looper.getMainLooper();
+        if (Thread.currentThread() == looper.getThread()) apply.run();
+        else {
+            android.os.Handler handler = android.os.Looper.MACAPK_REAL_LOOPER
+                ? android.os.Handler.macapkCreateOwnerOnly(looper) : new android.os.Handler(looper);
+            handler.post(apply);
+        }
+    }
+
     public LocaleList getApplicationLocales() {
-        LocaleList l = applicationLocales;
-        return l != null ? l : LocaleList.getEmptyLocaleList();
+        return LocaleList.forLanguageTags(preferences().getString("locales", ""));
+    }
+
+    private LocaleList effectiveLocales() {
+        java.util.LinkedHashSet<Locale> combined = new java.util.LinkedHashSet<>();
+        LocaleList requested = getApplicationLocales();
+        LocaleList system = getSystemLocales();
+        for (int i = 0; i < requested.size(); i++) combined.add(requested.get(i));
+        for (int i = 0; i < system.size(); i++) combined.add(system.get(i));
+        return new LocaleList(combined.toArray(new Locale[0]));
+    }
+
+    private android.content.res.Configuration applyToResources(android.content.res.Resources res) {
+        LocaleList effective = effectiveLocales();
+        android.content.res.Configuration next = new android.content.res.Configuration(res.getConfiguration());
+        next.setLocales(effective);
+        Object index = android.content.res.Resources.macapkGetResourceIndex();
+        if (index instanceof com.macapk.loader.ResourceIndex
+                && ((com.macapk.loader.ResourceIndex) index).macapkSelectionChangesFor(next)) {
+            Object built = com.macapk.loader.Boot.macapkNewResourceIndex(next);
+            if (built == null) throw new IllegalStateException("Unable to select application locale resources");
+            android.content.res.Resources.macapkSetResourceIndex(built);
+        }
+        Locale.setDefault(effective.get(0));
+        LocaleList.setDefault(effective);
+        res.updateConfiguration(next, null);
+        return next;
+    }
+
+    /** Boot restores preferences before application classes and callbacks run. */
+    public static void macapkRestoreApplicationLocales(String packageName, java.io.File dataDir,
+                                                       android.content.res.Resources resources) {
+        android.content.Context storage = new android.content.ContextWrapper(null) {
+            @Override public String getPackageName() { return packageName; }
+            @Override public java.io.File getDataDir() { return dataDir; }
+            @Override public java.io.File getFilesDir() { return new java.io.File(dataDir, "files"); }
+        };
+        new LocaleManager(storage).applyToResources(resources);
     }
 
     /** AOSP getApplicationLocales(String packageName): system-app overload.
@@ -91,10 +96,9 @@ public class LocaleManager {
         setApplicationLocales(locales);
     }
 
-    /** AOSP: the device's system locales. Mac.apk has a single locale, so
-     *  this mirrors the JVM default list. */
+    /** Host locales are independent of application/process defaults. */
     public LocaleList getSystemLocales() {
-        return LocaleList.getDefault();
+        return LocaleList.macapkGetSystemLocales();
     }
 
     // ---- Override LocaleConfig (API 34) ----

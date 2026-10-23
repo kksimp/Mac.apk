@@ -6153,6 +6153,12 @@ public class View implements android.graphics.drawable.Drawable.Callback,
                     && o.mRadius > 0f) {
                 return o.mRadius;
             }
+            // A rect with mixed corner radii is a PATH outline; its largest
+            // radius gives a round rect inside it (Outline.macapkPathShadowRadius).
+            if (o.mMode == android.graphics.Outline.MODE_PATH
+                    && o.macapkPathShadowRadius > 0f) {
+                return o.macapkPathShadowRadius;
+            }
         } catch (Throwable ignored) {}
         return -1f;
     }

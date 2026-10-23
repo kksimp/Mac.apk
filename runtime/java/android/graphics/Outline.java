@@ -31,11 +31,21 @@ public final class Outline {
      *  only BACKGROUND sets it explicitly. Nine VW.out.*.alpha rows were this
      *  one character. */
     public float mAlpha;
+    /** Mac.apk-internal (not AOSP): for a PATH outline that is a rect with
+     *  per-corner radii (GradientDrawable's radius array), the largest of those
+     *  radii, else NaN. The shadow casters (WindowOverlayStack.drawWindowShadow,
+     *  View.macapkShadowRadiusPx) draw round rects only; with this they cast
+     *  the round rect of the path's bounds and this radius, which lies inside
+     *  the shape. Clipping and ripple masks still use the exact path. */
+    public float macapkPathShadowRadius = Float.NaN;
 
     public Outline() {}
     public Outline(Outline src) { set(src); }
 
-    public void setEmpty() { mMode = MODE_EMPTY; mPath = null; mRect.setEmpty(); mRadius = Float.NEGATIVE_INFINITY; }
+    public void setEmpty() {
+        mMode = MODE_EMPTY; mPath = null; mRect.setEmpty(); mRadius = Float.NEGATIVE_INFINITY;
+        macapkPathShadowRadius = Float.NaN;
+    }
     public boolean isEmpty() { return mMode == MODE_EMPTY; }
     /** AOSP, by PLATFORM level: up to API 32 an outline can clip unless it is a
      *  PATH (android12L-release Outline.java, `return mMode != MODE_PATH;`); from
@@ -75,6 +85,7 @@ public final class Outline {
         mRect.set(left, top, right, bottom);
         mRadius = radius;
         mPath = null;
+        macapkPathShadowRadius = Float.NaN;
     }
     public void setRoundRect(Rect rect, float radius) {
         if (rect != null) setRoundRect(rect.left, rect.top, rect.right, rect.bottom, radius);
@@ -92,6 +103,7 @@ public final class Outline {
         mPath.reset();
         mPath.addOval(left, top, right, bottom, Path.Direction.CW);
         mRect.setEmpty();
+        macapkPathShadowRadius = Float.NaN;
     }
     public void setOval(Rect rect) {
         if (rect != null) setOval(rect.left, rect.top, rect.right, rect.bottom);
@@ -105,6 +117,7 @@ public final class Outline {
         mPath.reset();
         mPath.addPath(path);
         mRect.setEmpty();
+        macapkPathShadowRadius = Float.NaN;
     }
     public float getRadius() { return mRadius; }
     public boolean getRect(Rect outRect) {
@@ -120,6 +133,7 @@ public final class Outline {
         mRadius = src.mRadius;
         mAlpha = src.mAlpha;
         mPath = (src.mPath == null) ? null : new Path(src.mPath);
+        macapkPathShadowRadius = src.macapkPathShadowRadius;
     }
     public void offset(int dx, int dy) {
         if (mMode == MODE_ROUND_RECT) mRect.offset(dx, dy);

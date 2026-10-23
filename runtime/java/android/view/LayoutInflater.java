@@ -3573,6 +3573,47 @@ public class LayoutInflater {
             macapkReplaySingleLine(tvSl, elem, sitems);
         }
         applyMaterialButtonStyle(view, sitems, elem);
+        macapkApplyThemeElevation(view, elem, sitems);
+    }
+
+    /** AOSP View(Context, AttributeSet, int, int) reads android:elevation through
+     *  obtainStyledAttributes, whose last fallback, after the XML attribute, the
+     *  style= items and the default style, is the view's own THEME. So a theme
+     *  overlay that sets android:elevation (app:theme on a view, wrapped into a
+     *  ContextThemeWrapper by AppCompat's inflater) raises that view. Our View
+     *  constructor makes that read only for a view given a default style
+     *  (MACAPK_VIEW_CTOR_ELEVATION); for one built with defStyleAttr and
+     *  defStyleRes both 0, the plain XML case, elevation came only from the
+     *  element and its style here, so a theme overlay left it at Z 0.
+     *
+     *  Z orders touch dispatch, not only shadows: WhatsApp's welcome screen
+     *  centres a scroll view that, on a short screen, reaches up under its top
+     *  bar. On Android the bar's overlay gives it 4dp and the bar takes the taps
+     *  over its overflow button first; at Z 0 the scroll view took them.
+     *  MACAPK_THEME_ELEVATION=0 turns this off. */
+    private static final boolean MACAPK_THEME_ELEVATION =
+        !"0".equals(System.getenv("MACAPK_THEME_ELEVATION"));
+    private void macapkApplyThemeElevation(View view, Element elem,
+                                           java.util.Map<String, String> sitems) {
+        if (!MACAPK_THEME_ELEVATION || view == null || view.getElevation() != 0f) return;
+        if (elem.hasAttributeNS(MACAPK_ANDROID_NS, "elevation")) return;
+        if (sitems != null && sitems.containsKey("elevation")) return;
+        final Context vc = view.getContext();
+        if (vc == null) return;
+        try {
+            android.content.res.TypedArray ta = vc.getTheme()
+                .obtainStyledAttributes(new int[]{android.R.attr.elevation});
+            try {
+                if (ta.hasValue(0)) {
+                    float e = ta.getDimension(0, 0f);
+                    if (e > 0f) view.setElevation(e);
+                }
+            } finally {
+                ta.recycle();
+            }
+        } catch (Throwable ignored) {
+            // No theme answer: AOSP would fall through to the 0 default as well.
+        }
     }
 
     /** BISECT GATE shared by name with android.widget.TextView and

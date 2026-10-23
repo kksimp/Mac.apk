@@ -61,6 +61,12 @@ public final class BinaryXmlParser {
 
     /** Namespace for the value-type annotations. */
     public static final String MACAPK_TYPE_NS = "http://macapk/axml-type";
+    /** An attribute's NAME in the app's resource table, when the document's own
+     *  name string differs from it (see setAttr), and the attr's resource id.
+     *  Parser-internal: DomXmlResourceParser hides both from attribute
+     *  iteration and consults them only for by-name and by-id lookups. */
+    public static final String MACAPK_ALIAS_NS = "http://macapk/axml-alias";
+    public static final String MACAPK_ATTRID_NS = "http://macapk/axml-attrid";
     private static final String ANDROID_NS =
         "http://schemas.android.com/apk/res/android";
 
@@ -169,10 +175,21 @@ public final class BinaryXmlParser {
     private static void writeElement(StringBuilder sb, Element el) {
         sb.append('<').append(el.getTagName());
         org.w3c.dom.NamedNodeMap attrs = el.getAttributes();
+        boolean aliasNs = false, attrIdNs = false;
         for (int i = 0; i < attrs.getLength(); i++) {
             org.w3c.dom.Node a = attrs.item(i);
             String qn = a.getNodeName();
             if (MACAPK_TYPE_NS.equals(a.getNamespaceURI())) continue;
+            // The alias / attr-id records travel with the text too, so they need
+            // their prefixes declared (on the element itself), or the text is
+            // not well-formed and every reader of it fails.
+            if (!aliasNs && MACAPK_ALIAS_NS.equals(a.getNamespaceURI())) {
+                sb.append(" xmlns:macapkAlias=\"").append(MACAPK_ALIAS_NS).append('"');
+                aliasNs = true;
+            } else if (!attrIdNs && MACAPK_ATTRID_NS.equals(a.getNamespaceURI())) {
+                sb.append(" xmlns:macapkAttrId=\"").append(MACAPK_ATTRID_NS).append('"');
+                attrIdNs = true;
+            }
             sb.append(' ').append(qn).append("=\"");
             escape(sb, a.getNodeValue());
             sb.append('"');
@@ -381,8 +398,20 @@ public final class BinaryXmlParser {
         int data     = i32(a + 16);
 
         String name = poolStr(nameIdx);
+        final boolean namedInDocument = !name.isEmpty();
         if (name.isEmpty() && nameIdx >= 0 && nameIdx < resourceMap.length) {
-            String known = WELL_KNOWN_ATTRS.get(resourceMap[nameIdx]);
+            // A shrunk APK (Meta's: WhatsApp, Instagram) strips every attribute
+            // name string from its compiled XML and keeps only the resource map,
+            // so a layout's android:id / layout_width arrive nameless. Recover
+            // the name from the attr id: the platform table for 0x0101xxxx, the
+            // app's own table for its attrs.
+            int rid = resourceMap[nameIdx];
+            String known = WELL_KNOWN_ATTRS.get(rid);
+            if (known == null) known = FrameworkAttrIds.name(rid);
+            if (known == null && names != null && rid != 0) {
+                String tn = names.typeName(rid);
+                if (tn != null && tn.startsWith("attr/")) known = tn.substring(5);
+            }
             if (known != null) name = known;
         }
         if (name.isEmpty()) return;   // unusable attribute
@@ -482,6 +511,27 @@ public final class BinaryXmlParser {
             // guessing from the text form.
             if (!"string".equals(typeTag)) {
                 el.setAttributeNS(MACAPK_TYPE_NS, "macapkType:" + name, typeTag);
+            }
+            // A shrunk APK (WhatsApp) keeps attribute NAMES in some compiled XML
+            // (res/xml MotionScenes) while its resource table has the attr's name
+            // removed (APKTOOL_RENAMED_0x...). A device matches styleable slots
+            // by the resource-map ID, so it never notices; our TypedArray matches
+            // by the TABLE name and getAttributeNameResource by the document
+            // name, so `constraintSetStart` was invisible to both -- MotionLayout
+            // then had no start state, skipped its measure, and the Settings
+            // header (back arrow, profile) laid out at 0x0. Record the table
+            // spelling and the id beside the attribute.
+            if (namedInDocument && attrId != 0 && (attrId >>> 24) == 0x7f && names != null) {
+                String tn = names.typeName(attrId);
+                if (tn != null && tn.startsWith("attr/")) {
+                    String tableName = tn.substring(5);
+                    if (!tableName.isEmpty() && !tableName.equals(name)) {
+                        // Only where the names disagree, so an APK with intact
+                        // names parses exactly as before.
+                        el.setAttributeNS(MACAPK_ALIAS_NS, "macapkAlias:" + tableName, value);
+                        el.setAttributeNS(MACAPK_ATTRID_NS, "macapkAttrId:" + name, Integer.toString(attrId));
+                    }
+                }
             }
         } catch (Throwable t) {
             // DOM name validation can reject odd attr names from

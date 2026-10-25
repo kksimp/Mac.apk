@@ -2210,15 +2210,22 @@ public final class ResourceIndex {
                 // this does the same. Types whose STRING value is real content
                 // (string/plurals/array/...) are NOT in the set, so a plain
                 // <string> can never be mistaken for a file.
-                // NARROW ON PURPOSE: accept a non-res/ value ONLY when it is
-                // literally a packed token we know how to serve
-                // ("<L>|<hexOff>|<hexLen>|..."). Keying on the token's shape means
-                // an app without packed resources sees byte-identical ingest --
-                // an earlier, looser rule ("any file-backed TYPE") would have
-                // added rows for ordinary apps too and changed getValue's branch
-                // for them, which is fleet risk this fix does not need.
+                // Resource optimizers also shorten real ZIP paths (for example
+                // r/mht.xml). Accept those only for file-backed resource types
+                // and only when the owning APK contains the exact file. A plain
+                // string whose text happens to match a ZIP entry stays a value.
                 if (!row.value.startsWith("res/")
-                        && !macapkLooksLikePackedToken(row.value)) continue;
+                        && !macapkLooksLikePackedToken(row.value)) {
+                    if (!FILE_ALIAS_TYPES.contains(row.type)
+                            && !"color".equals(row.type)
+                            && !"navigation".equals(row.type)) continue;
+                    try {
+                        java.util.zip.ZipEntry file = macapkMemberZip(mi).getEntry(row.value);
+                        if (file == null || file.isDirectory()) continue;
+                    } catch (java.io.IOException unreadableMember) {
+                        continue;
+                    }
+                }
                 Integer sc = cfgScore.get(row.config);
                 if (sc == null) {
                     sc = macapkFileCfgScore(row.config);
@@ -2639,6 +2646,20 @@ public final class ResourceIndex {
     private static final int MACAPK_ATTR_TYPE_ENUM  = 1 << 16;
     private static final int MACAPK_ATTR_TYPE_FLAGS = 1 << 17;
 
+    /** Keep references tied to their resource ID after collapsed names have
+     *  been assigned distinct names by macapkIngestRows. The reader's original
+     *  formatted name may be shared by thousands of otherwise different IDs. */
+    private String macapkIngestReference(int type, int id, String fallback) {
+        boolean attr = type == ArscReader.TYPE_ATTRIBUTE
+                || type == ArscReader.TYPE_DYNAMIC_ATTRIBUTE;
+        boolean ref = type == ArscReader.TYPE_REFERENCE
+                || type == ArscReader.TYPE_DYNAMIC_REFERENCE;
+        if (!attr && !ref) return fallback;
+        String[] target = idToTypeName.get(id);
+        if (target == null) return fallback;
+        return (attr ? "?" : "@") + target[0] + "/" + target[1];
+    }
+
     /** One row into the map the matching text loader would have filled.
      *  Each branch's contract is the corresponding load*Values method. */
     private void macapkIngestRow(ArscReader.Row row, int[] n) {
@@ -2658,6 +2679,7 @@ public final class ResourceIndex {
             rawTypedById.put(row.resId,
                 new Object[] { row.dataType, row.data, row.value });
         }
+        String value = macapkIngestReference(row.dataType, row.data, row.value);
         switch (row.type) {
             case "string":
                 if (!row.complex) {
@@ -2667,7 +2689,7 @@ public final class ResourceIndex {
                     // References ("@string/x") arrive formatted and are
                     // chased at read time by macapkResolveStringChain,
                     // same as the text path.
-                    stringValues.put(name, row.value);
+                    stringValues.put(name, value);
                     ++n[0];
                 }
                 return;
@@ -2679,7 +2701,7 @@ public final class ResourceIndex {
                         // keywords (other/zero/one/two/few/many) for a
                         // plurals bag; anything else is unresolvable.
                         if (it.name != null && !it.name.isEmpty()) {
-                            forms.put(it.name, it.value);
+                            forms.put(it.name, macapkIngestReference(it.dataType, it.data, it.value));
                         }
                     }
                     if (!forms.isEmpty()) { pluralValues.put(name, forms); ++n[1]; }
@@ -2703,7 +2725,8 @@ public final class ResourceIndex {
                     boolean allInt = count > 0;
                     for (int i = 0; i < count; ++i) {
                         ArscReader.MapItem it = row.items.get(i);
-                        arr[i] = it.value != null ? it.value : "";
+                        String itemValue = macapkIngestReference(it.dataType, it.data, it.value);
+                        arr[i] = itemValue != null ? itemValue : "";
                         allInt &= (it.dataType == ArscReader.TYPE_INT_DEC
                                 || it.dataType == ArscReader.TYPE_INT_HEX);
                     }
@@ -2755,7 +2778,7 @@ public final class ResourceIndex {
                             // is a small widening over the text loader
                             // (which only stored "@"), and resolveColorRef
                             // already handles it.
-                            colorRefs.put(name, row.value);
+                            colorRefs.put(name, value);
                             colorValues.remove(name);
                             ++n[6];
                             return;
@@ -2773,35 +2796,39 @@ public final class ResourceIndex {
                     // parent="" semantic for free, and the
                     // MACAPK_STYLE_PARENT_EMPTY escape hatch (a text-decode
                     // repair knob) intentionally does not apply.
-                    String parent = row.parentRef != 0 ? row.parent : null;
+                    String parent = row.parentRef != 0
+                            ? macapkIngestReference(ArscReader.TYPE_REFERENCE, row.parentRef, row.parent)
+                            : null;
                     Map<String, String> items = new HashMap<>();
                     for (ArscReader.MapItem it : row.items) {
                         String k = macapkStyleItemKey(it.name);
-                        if (k != null) items.put(k, it.value);
+                        String[] itemName = idToTypeName.get(it.nameRef);
+                        if (itemName != null && "attr".equals(itemName[0])) k = itemName[1];
+                        if (k != null) items.put(k, macapkIngestReference(it.dataType, it.data, it.value));
                     }
                     styleByName.put(name, new StyleDef(name, parent, items));
                     ++n[7];
                 }
                 return;
             case "dimen":
-                if (!row.complex && !row.value.isEmpty()) {
+                if (!row.complex && !value.isEmpty()) {
                     // Covers plain <dimen> (formatted "16.0dp"), references
                     // ("@dimen/x", chased at read time), AND the float
                     // <item type="dimen"> form the text loader missed (it
                     // only read <dimen> tags).
-                    dimenValues.put(name, row.value);
+                    dimenValues.put(name, value);
                     ++n[9];
                 }
                 return;
             case "fraction":
-                if (!row.complex && !row.value.isEmpty()) {
-                    fractionValues.put(name, row.value);
+                if (!row.complex && !value.isEmpty()) {
+                    fractionValues.put(name, value);
                     ++n[9];
                 }
                 return;
             case "bool":
-                if (!row.complex && !row.value.isEmpty()) {
-                    boolValues.put(name, row.value);   // "true"/"false"/"@bool/x"
+                if (!row.complex && !value.isEmpty()) {
+                    boolValues.put(name, value);   // "true"/"false"/"@bool/x"
                     ++n[10];
                 }
                 return;
@@ -2843,8 +2870,8 @@ public final class ResourceIndex {
                 if (!row.complex && FILE_ALIAS_TYPES.contains(row.type)
                         && (row.dataType == ArscReader.TYPE_REFERENCE
                             || row.dataType == ArscReader.TYPE_DYNAMIC_REFERENCE)
-                        && row.value.startsWith("@") && row.value.indexOf('/') > 0) {
-                    fileAliases.put(row.type + "/" + name, row.value);
+                        && value.startsWith("@") && value.indexOf('/') > 0) {
+                    fileAliases.put(row.type + "/" + name, value);
                     ++n[8];
                 }
         }
@@ -5968,6 +5995,14 @@ public final class ResourceIndex {
     }
     /** Look up integer-resource value by ID. Resources.getInteger(id). */
     public Integer integerForId(int id) {
+        if ((id >>> 24) == 0x01) {
+            Object[] value = macapkFwValueOf(id);
+            if (value == null) return null;
+            int type = (Integer) value[0];
+            // Match Resources.getInteger's integer-typed value contract,
+            // including framework references resolved by macapkFwValueOf.
+            return type >= 0x10 && type <= 0x1f ? (Integer) value[1] : null;
+        }
         String[] tn = idToTypeName.get(id);
         if (tn == null) return null;
         if (!"integer".equals(tn[0])) return null;

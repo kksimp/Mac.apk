@@ -380,9 +380,16 @@ public final class BinaryXmlParser {
         int dataType = u8(a + 15);
         int data     = i32(a + 16);
 
+        int attrId = (nameIdx >= 0 && nameIdx < resourceMap.length) ? resourceMap[nameIdx] : 0;
         String name = poolStr(nameIdx);
-        if (name.isEmpty() && nameIdx >= 0 && nameIdx < resourceMap.length) {
-            String known = WELL_KNOWN_ATTRS.get(resourceMap[nameIdx]);
+        // A resource optimizer may keep the numeric attribute ID but replace
+        // its pool name with an invalid or shared spelling. The resource map
+        // is authoritative, including the app's distinct synthesized names.
+        String tableName = names != null && attrId != 0 ? names.typeName(attrId) : null;
+        if (tableName != null && tableName.startsWith("attr/")) {
+            name = tableName.substring(5);
+        } else if (attrId != 0) {
+            String known = WELL_KNOWN_ATTRS.get(attrId);
             if (known != null) name = known;
         }
         if (name.isEmpty()) return;   // unusable attribute
@@ -390,7 +397,6 @@ public final class BinaryXmlParser {
         // The attr this value is assigned to (the resource map pairs each
         // attribute-name string with the attr's resource id) -- what the
         // enum/flag symbol tables are keyed by.
-        int attrId = (nameIdx >= 0 && nameIdx < resourceMap.length) ? resourceMap[nameIdx] : 0;
         String value;
         String typeTag;
         switch (dataType) {
@@ -467,11 +473,19 @@ public final class BinaryXmlParser {
         }
 
         String nsUri = nsIdx >= 0 ? poolStr(nsIdx) : "";
+        // Some optimized XML also erases the namespace strings. A compiled
+        // framework attribute still has Android identity through its ID.
+        if ((attrId >>> 24) == 0x01) nsUri = ANDROID_NS;
+        else if (attrId != 0 && nsUri.isEmpty())
+            nsUri = "http://schemas.android.com/apk/res-auto";
         try {
             if (!nsUri.isEmpty()) {
                 String prefix = nsPrefix.get(nsUri);
                 if (prefix == null || prefix.isEmpty()) {
                     prefix = ANDROID_NS.equals(nsUri) ? "android" : "ns";
+                }
+                if (el.lookupNamespaceURI(prefix) == null) {
+                    el.setAttributeNS("http://www.w3.org/2000/xmlns/", "xmlns:" + prefix, nsUri);
                 }
                 el.setAttributeNS(nsUri, prefix + ":" + name, value);
             } else {

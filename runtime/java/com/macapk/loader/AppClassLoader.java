@@ -64,6 +64,13 @@ import java.util.List;
 // adds no behaviour over BaseDexClassLoader here, so this is a hierarchy fix,
 // not a behaviour change.
 public final class AppClassLoader extends dalvik.system.PathClassLoader {
+    // Parallel-capable. ART never serializes a whole class loader: classes load
+    // under per-class locks. On HotSpot, a loader that does not register gets
+    // getClassLoadingLock(name) == the loader itself, so every thread loading
+    // ANY class waits on one lock (JFR on WhatsApp: 718 waits, the UI thread
+    // up to 695 ms). Each class up the chain to URLClassLoader must register.
+    static { ClassLoader.registerAsParallelCapable(); }
+
     private static final String TAG = "Mac.apk.AppCl";
     /** Guards the per-class loadClass/findClass info lines (~25K/boot for
      *  Reddit, ~13K for GD Lite). Derived from NativeLog.isLoggable(INFO)
@@ -774,7 +781,9 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
                 byte[] raw = remapRewrite(direct != null ? direct : in.readAllBytes());
                 ClassFileRewriter.Result r =
                     ClassFileRewriter.maybeRewrite(raw, classDotted);
-                if (r.rewritten) {
+                if (r.rewritten && !QUIET_CLASSLOAD) {
+                    // Quiet too: WhatsApp rewrites ~1,400 classes per boot, one
+                    // INFO line each.
                     NativeLog.i(TAG, "findClass(" + classDotted
                         + ") -> defineClass [rewritten: " + r.reason + "]");
                 } else if (!QUIET_CLASSLOAD) {

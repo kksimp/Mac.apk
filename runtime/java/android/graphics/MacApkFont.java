@@ -1153,6 +1153,37 @@ public final class MacApkFont {
      *  may be a sized derived instance; canDisplay reads the cmap, which
      *  deriving does not change. */
     public static Font fallbackBaseFor(int cp, Font primary) {
+        // Cached per (primary, codepoint): the answer only depends on the
+        // primary's cmap/weight and the fixed chain, but measureText asks it
+        // for every character of every string on every frame. JFR on WhatsApp
+        // (Hebrew, which Roboto lacks, so every letter walks the chain): this
+        // was the top self frame on the UI thread. BMP only, a 256-entry page
+        // per touched block; racy fills are benign (same value either way).
+        if (primary == null || cp < 0 || cp > 0xFFFF) return fallbackBaseForUncached(cp, primary);
+        Object[][] pages = sFallbackPages.get(primary);
+        if (pages == null) {
+            // One entry per sized primary; a text-size animation makes a new
+            // Font every frame, so the map is bounded rather than left to grow.
+            if (sFallbackPages.size() >= FALLBACK_CACHE_FONTS) sFallbackPages.clear();
+            pages = new Object[256][];
+            Object[][] prev = sFallbackPages.putIfAbsent(primary, pages);
+            if (prev != null) pages = prev;
+        }
+        Object[] page = pages[cp >>> 8];
+        if (page == null) pages[cp >>> 8] = page = new Object[256];
+        Object v = page[cp & 0xFF];
+        if (v == null) {
+            Font f = fallbackBaseForUncached(cp, primary);
+            page[cp & 0xFF] = v = (f == null ? FALLBACK_NONE : f);
+        }
+        return v == FALLBACK_NONE ? null : (Font) v;
+    }
+    private static final Object FALLBACK_NONE = new Object();
+    private static final int FALLBACK_CACHE_FONTS = 256;
+    private static final java.util.concurrent.ConcurrentHashMap<Font, Object[][]> sFallbackPages =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static Font fallbackBaseForUncached(int cp, Font primary) {
         if (primary != null && primary.canDisplay(cp)) return null;
         ensureBase();
         ensureFallbacks();

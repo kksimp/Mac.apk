@@ -260,8 +260,7 @@ public final class ResourceIndex {
     // with (whose own field initializer is Locale.getDefault(), i.e. the
     // host's language on macOS), so rebuilding the index after an in-app
     // language switch re-resolves against the new locale.
-    private String cfgLanguage = "";    // lowercase ISO-639, "" when unknown
-    private String cfgRegion   = "";    // uppercase ISO-3166, "" when unknown
+    private final android.os.LocaleList cfgLocales;
 
     /** `apkPath` is the installed base.apk (v1.0.1585; the split_*.apk
      *  siblings are the rest of the app, see InstalledSplits). Every member's
@@ -270,6 +269,7 @@ public final class ResourceIndex {
      *  v1.0.1590 step 9b: the `File apktoolDir` parameter the constructors
      *  carried for the text tree is gone with it. */
     public ResourceIndex(android.content.res.Configuration cfg, String apkPath) {
+        cfgLocales = cfg != null ? cfg.getLocales() : android.os.LocaleList.getDefault();
         if (cfg != null) {
             cfgScreenWidthDp         = cfg.screenWidthDp;
             cfgScreenHeightDp        = cfg.screenHeightDp;
@@ -283,17 +283,6 @@ public final class ResourceIndex {
         }
         cfgScreenLayout = (cfg != null) ? cfg.screenLayout
                                         : macapkDerivedScreenLayout(cfgScreenWidthDp, cfgScreenHeightDp);
-        java.util.Locale loc = (cfg != null && cfg.locale != null)
-            ? cfg.locale : java.util.Locale.getDefault();
-        if (loc != null) {
-            // Locale.getLanguage() returns the same legacy ISO-639 codes
-            // Android's resource table stores ("iw"/"in"/"ji"), so the two
-            // spellings already agree and need no remapping.
-            String lang = loc.getLanguage();
-            if (lang != null) cfgLanguage = lang.toLowerCase(java.util.Locale.ROOT);
-            String ctry = loc.getCountry();
-            if (ctry != null) cfgRegion = ctry.toUpperCase(java.util.Locale.ROOT);
-        }
         // ---- the data source: resources.arsc, of every member of the installed set ----
         // Ingested directly (ArscReader, byte-verified vs apktool at
         // v1.0.756-757 and on the whole corpus 2026-09-20: 189,595 ids /
@@ -944,7 +933,7 @@ public final class ResourceIndex {
         final int sl = cfgScreenLayout & macapkLayoutBitsSelectedBy(thr);
         return cfgDensityDpi + "|" + cfgNight + "|" + cfgOrientation + "|"
             + w + "x" + h + "|" + sw
-            + "|" + cfgLanguage + "-" + cfgRegion + "|" + cfgResSdk
+            + "|" + cfgLocales.toLanguageTags() + "|" + cfgResSdk
             + (MACAPK_RES_SIZECLASS ? "|sl" + Integer.toHexString(sl) : "");
     }
 
@@ -1090,6 +1079,7 @@ public final class ResourceIndex {
      *  the sidecar exists) answers "any dp change", which only costs a rebuild. */
     public boolean macapkSelectionChangesFor(android.content.res.Configuration next) {
         if (next == null) return false;
+        if (!cfgLocales.equals(next.getLocales())) return true;
         int o = next.orientation != 0 ? next.orientation : 1;
         if (o != cfgOrientation) return true;
         if (next.densityDpi > 0 && next.densityDpi != cfgDensityDpi) return true;
@@ -3063,8 +3053,9 @@ public final class ResourceIndex {
      *  screen size > aspect > orientation > night > version) so the most
      *  specific compatible dir wins on ascending-sort apply. */
     private int qualifierScore(String quals) {
-        if (quals.isEmpty()) return macapkSizeClassBand(0);
+        if (quals.isEmpty()) return macapkDefaultLocaleScore() + macapkSizeClassBand(0);
         int score = 0;
+        int localeScore = macapkDefaultLocaleScore();
         int sizeClass = 0;   // the SCREENLAYOUT_SIZE_* this config names; 0 = none
         String[] parts = quals.split("-");
         for (int qi = 0; qi < parts.length; ++qi) {
@@ -3223,23 +3214,18 @@ public final class ResourceIndex {
             //   values-b+sr+Latn+RS               (BCP-47, API 21+; the
             //                                      subtags are '+'-joined
             //                                      so the token stays whole)
-            // AOSP's ResTable_config::match() requires the language to be
-            // equal and, when the directory declares a region, the region to
-            // be equal as well; anything else is not a match. So a
-            // non-matching locale dir falls through to the conservative drop
-            // below exactly as before -- this branch only ever ADDS the dirs
-            // the device locale actually selects. That also makes the
-            // 3-letter uiMode qualifier "car" a non-issue: it would have to
-            // BE the device language to be accepted.
-            String lang = null, region = null;
+            // Match language and script against the ordered configuration
+            // locales; exact-region resources outrank same-script regional
+            // fallbacks. Unmatched locale configurations are excluded.
+            String lang = null, region = null, script = null;
             boolean regionFromNextToken = false;
             if (q.length() > 2 && q.startsWith("b+")) {
                 String[] sub = q.substring(2).split("\\+");
                 lang = sub[0];
                 for (int k = 1; k < sub.length; ++k) {
-                    // A 2-letter or 3-digit subtag is the region; a 4-letter
-                    // subtag is the script, which we have no preference to
-                    // match against and therefore neither require nor reject.
+                    // BCP 47 carries an optional four-letter script and a
+                    // two-letter or three-digit region.
+                    if (sub[k].length() == 4) script = sub[k];
                     if (sub[k].length() == 2
                         || (sub[k].length() == 3 && allDigits(sub[k]))) {
                         region = sub[k];
@@ -3252,16 +3238,14 @@ public final class ResourceIndex {
                     regionFromNextToken = true;
                 }
             }
-            if (lang != null && !cfgLanguage.isEmpty()
-                && lang.equalsIgnoreCase(cfgLanguage)
-                && (region == null || region.equalsIgnoreCase(cfgRegion))) {
-                if (regionFromNextToken) ++qi;   // consume the -r<REGION> token
-                // Bands chosen so ANY locale match outranks every qualifier
-                // scored above (max ~28000 combined), and an exact-region
-                // match outranks a language-only match no matter what lower-
-                // precedence qualifiers the language-only dir also carries.
-                score += 100000;
-                if (region != null) score += 50000;
+            if (lang != null) {
+                String tag = lang + (script == null ? "" : "-" + script)
+                    + (region == null ? "" : "-" + region);
+                java.util.Locale candidate = java.util.Locale.forLanguageTag(tag);
+                int match = macapkLocaleScore(candidate);
+                if (match < 0) return -1;
+                if (regionFromNextToken) ++qi;
+                localeScore = match;
                 continue;
             }
             // foreign locale, foreign density, uiMode, mcc/mnc, screen-size
@@ -3269,7 +3253,59 @@ public final class ResourceIndex {
             // conservatively.
             return -1;
         }
-        return score + macapkSizeClassBand(sizeClass);
+        return score + localeScore + macapkSizeClassBand(sizeClass);
+    }
+
+    private int macapkDefaultLocaleScore() {
+        // AOSP ResourcesManager negotiates with English supported, and
+        // ResTable_config::isLocaleBetterThan gives no-language resources
+        // preference for US English. This prevents a secondary system
+        // language from replacing the default strings after selecting en-US.
+        // https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android13-release/libs/androidfw/ResourceTypes.cpp
+        for (int i = 0; i < cfgLocales.size(); i++) {
+            java.util.Locale desired = cfgLocales.get(i);
+            if ("en".equals(desired.getLanguage()) && !"XA".equals(desired.getCountry())) {
+                int preference = "US".equals(desired.getCountry()) ? 40000 : 10000;
+                return 1_000_000_000 - Math.min(i, 999) * 1_000_000 + preference;
+            }
+        }
+        return 0;
+    }
+
+    private static String resourceScript(java.util.Locale locale) {
+        if (!locale.getScript().isEmpty()) return locale.getScript();
+        // Chinese resource tables commonly use regions while macOS supplies
+        // an explicit script with an unrelated formatting region (zh-Hans-JP).
+        if ("zh".equals(locale.getLanguage())) {
+            String region = locale.getCountry();
+            return ("TW".equals(region) || "HK".equals(region) || "MO".equals(region))
+                ? "Hant" : "Hans";
+        }
+        return "";
+    }
+
+    private int macapkLocaleScore(java.util.Locale candidate) {
+        for (int i = 0; i < cfgLocales.size(); i++) {
+            java.util.Locale desired = cfgLocales.get(i);
+            if (!candidate.getLanguage().equals(desired.getLanguage())) continue;
+            boolean pseudo = "en-XA".equals(candidate.toLanguageTag())
+                || "ar-XB".equals(candidate.toLanguageTag())
+                || "en-XA".equals(desired.toLanguageTag()) || "ar-XB".equals(desired.toLanguageTag());
+            if (pseudo && !candidate.equals(desired)) continue;
+            String script = resourceScript(candidate);
+            String desiredScript = resourceScript(desired);
+            if (!script.isEmpty() && !desiredScript.isEmpty() && !script.equals(desiredScript)) continue;
+            // Rank preferred languages before all other qualifiers. Within a
+            // language, exact region wins, then explicit script, then generic.
+            // Region-only Chinese resources infer their script (CN -> Hans,
+            // TW -> Hant), so zh-Hans-JP can use zh-CN without selecting zh-TW.
+            int specificity = candidate.getCountry().isEmpty() ? 30000
+                : candidate.getCountry().equals(desired.getCountry()) ? 60000 : 20000;
+            if (candidate.getCountry().isEmpty() && "en".equals(candidate.getLanguage())) specificity = 50000;
+            if (!candidate.getScript().isEmpty()) specificity += 30000;
+            return 1_000_000_000 - Math.min(i, 999) * 1_000_000 + specificity;
+        }
+        return -1;
     }
 
     /** MACAPK_RES_SIZECLASS (2026-09-25), default ON: match the screen-size

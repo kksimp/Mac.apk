@@ -5501,10 +5501,55 @@ public class TextView extends View
         return new android.graphics.drawable.Drawable[]{
             mDrawableLeft, mDrawableTop, mDrawableRight, mDrawableBottom };
     }
+    /** AOSP getCompoundDrawablesRelative (android14 TextView.java:3384-3400)
+     *  returns the start/end pair that was set. When only absolute drawables
+     *  are set AOSP's start/end are null; ours keeps its older answer there,
+     *  the absolute pair read as start/end, now mirrored for an RTL view, so a
+     *  get-then-setCompoundDrawablesRelative round trip keeps each icon on its
+     *  side. */
     public android.graphics.drawable.Drawable[] getCompoundDrawablesRelative() {
-        // LTR: start==left, end==right (we don't track RTL on TextView).
+        if (mMacapkRelativeDrawables) {
+            return new android.graphics.drawable.Drawable[]{
+                mDrawableStart, mDrawableTop, mDrawableEnd, mDrawableBottom };
+        }
+        final boolean rtl = macapkRtl();
         return new android.graphics.drawable.Drawable[]{
-            mDrawableLeft, mDrawableTop, mDrawableRight, mDrawableBottom };
+            rtl ? mDrawableRight : mDrawableLeft, mDrawableTop,
+            rtl ? mDrawableLeft : mDrawableRight, mDrawableBottom };
+    }
+
+    // ---- RELATIVE compound drawables (start / end) --------------------------
+    // AOSP keeps drawableStart / drawableEnd beside the absolute pair and
+    // RESOLVES them against the layout direction (TextView.resolveDrawables /
+    // Drawables.resolveWithLayoutDirection, android14 :1011-1060, re-run from
+    // onResolveDrawables on every RTL change): in an RTL view the START drawable
+    // shows on the RIGHT. Ours mapped start->left unconditionally, so in an
+    // RTL layout (a Hebrew or Arabic locale) every relative icon sat on the
+    // wrong side -- and MaterialButton, which publishes its icon with
+    // setCompoundDrawablesRelative and, for RTL, a NEGATIVE iconLeft offset
+    // meant for the right-hand slot, drew it entirely outside the button:
+    // Privacy Friendly Notes' FAB-menu close button was an empty pill.
+    private android.graphics.drawable.Drawable mDrawableStart, mDrawableEnd;
+    private boolean mMacapkRelativeDrawables;
+    /** True while start/end drawables are set (AOSP Drawables.mOverride): the
+     *  inflater uses it to let XML drawableStart/End win over drawableLeft/Right
+     *  whatever their attribute order, as AOSP's constructor does. */
+    public boolean macapkHasRelativeDrawables() { return mMacapkRelativeDrawables; }
+
+    private boolean macapkRtl() {
+        try { return isLayoutRtl(); } catch (Throwable t) { return false; }
+    }
+
+    private void macapkShowRelative() {
+        final boolean rtl = macapkRtl();
+        macapkSetShowing(rtl ? mDrawableEnd : mDrawableStart, mDrawableTop,
+                         rtl ? mDrawableStart : mDrawableEnd, mDrawableBottom);
+    }
+
+    @Override
+    public void onRtlPropertiesChanged(int layoutDirection) {
+        super.onRtlPropertiesChanged(layoutDirection);
+        if (mMacapkRelativeDrawables) macapkShowRelative();
     }
     public int  getTotalPaddingLeft() { return getCompoundPaddingLeft(); }
     public int  getTotalPaddingRight() { return getCompoundPaddingRight(); }
@@ -5530,6 +5575,17 @@ public class TextView extends View
                                        android.graphics.drawable.Drawable top,
                                        android.graphics.drawable.Drawable right,
                                        android.graphics.drawable.Drawable bottom) {
+        // AOSP: "We're switching to absolute, discard relative."
+        mMacapkRelativeDrawables = false;
+        mDrawableStart = null;
+        mDrawableEnd = null;
+        macapkSetShowing(left, top, right, bottom);
+    }
+    /** The drawables actually shown, absolute sides (AOSP mShowing[]). */
+    private void macapkSetShowing(android.graphics.drawable.Drawable left,
+                                  android.graphics.drawable.Drawable top,
+                                  android.graphics.drawable.Drawable right,
+                                  android.graphics.drawable.Drawable bottom) {
         mDrawableLeft = left; mDrawableTop = top;
         mDrawableRight = right; mDrawableBottom = bottom;
         // Bounds are the CALLER's to own -- AOSP's setCompoundDrawables only
@@ -5555,11 +5611,25 @@ public class TextView extends View
                                                android.graphics.drawable.Drawable top,
                                                android.graphics.drawable.Drawable end,
                                                android.graphics.drawable.Drawable bottom) {
-        // LTR mapping (no RTL tracking on TextView): start->left, end->right.
-        setCompoundDrawables(start, top, end, bottom);
+        // AOSP setCompoundDrawablesRelative (:3218-3290): store start/end and
+        // resolve them against the layout direction (see mDrawableStart).
+        mDrawableStart = start;
+        mDrawableEnd = end;
+        mDrawableTop = top;
+        mDrawableBottom = bottom;
+        mMacapkRelativeDrawables = start != null || end != null;
+        if (mMacapkRelativeDrawables) {
+            macapkShowRelative();
+        } else {
+            macapkSetShowing(null, top, null, bottom);
+        }
     }
     public void setCompoundDrawablesRelativeWithIntrinsicBounds(int start, int top, int end, int bottom) {
-        setCompoundDrawablesWithIntrinsicBounds(start, top, end, bottom);
+        android.content.res.Resources res = null;
+        try { res = getResources(); } catch (Throwable ignored) {}
+        setCompoundDrawablesRelativeWithIntrinsicBounds(
+            macapkDrawableFromRes(res, start), macapkDrawableFromRes(res, top),
+            macapkDrawableFromRes(res, end), macapkDrawableFromRes(res, bottom));
     }
     public void setCompoundDrawablesRelativeWithIntrinsicBounds(
         android.graphics.drawable.Drawable start, android.graphics.drawable.Drawable top,
@@ -5568,7 +5638,7 @@ public class TextView extends View
         // intrinsic bounds before storing (AOSP contract).
         macapkSetIntrinsicBounds(start); macapkSetIntrinsicBounds(top);
         macapkSetIntrinsicBounds(end);   macapkSetIntrinsicBounds(bottom);
-        setCompoundDrawables(start, top, end, bottom);
+        setCompoundDrawablesRelative(start, top, end, bottom);
     }
     public void setCompoundDrawablesWithIntrinsicBounds(
         android.graphics.drawable.Drawable left, android.graphics.drawable.Drawable top,

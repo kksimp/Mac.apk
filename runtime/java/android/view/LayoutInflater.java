@@ -4714,6 +4714,70 @@ public class LayoutInflater {
                     }
                     return;
                 }
+                case "drawableLeft":
+                case "drawableStart":
+                case "drawableTop":
+                case "drawableRight":
+                case "drawableEnd":
+                case "drawableBottom": {
+                    // AOSP TextView's constructor reads all six with
+                    // a.getDrawable(...) and installs them with
+                    // setCompoundDrawablesWithIntrinsicBounds +
+                    // setRelativeDrawablesIfNeeded (TextView.java android14
+                    // :1243-1271, :1630-1643). Nothing here ever read them, so an
+                    // XML compound icon never appeared: no AlertDialog
+                    // single/multi-choice row had its radio or checkbox
+                    // (AppCompat's select_dialog_singlechoice_material puts
+                    // ?android:listChoiceIndicatorSingle in drawableStart -- every
+                    // ListPreference dialog), and no `android:drawableStart` icon
+                    // in any app layout showed. start/end go through the RELATIVE
+                    // setter, which resolves them against the layout direction,
+                    // and win over left/right as AOSP's setRelativeDrawablesIfNeeded
+                    // makes them.
+                    if (view instanceof android.widget.TextView tvcd) {
+                        android.graphics.drawable.Drawable dr = macapkResolveCompoundDrawable(view, value);
+                        if (dr == null) return;
+                        if ("drawableStart".equals(attr) || "drawableEnd".equals(attr)) {
+                            // AOSP Drawables.resolveWithLayoutDirection (JB-MR1+):
+                            // once start/end are defined (mOverride) they REPLACE
+                            // left/right on both sides -- an end that is not set
+                            // leaves its side empty, it does not inherit
+                            // drawableLeft. Starting from the mirrored absolute
+                            // pair put AppCompat's select_dialog_singlechoice
+                            // radio (drawableLeft AND drawableStart) on both sides
+                            // under RTL.
+                            android.graphics.drawable.Drawable[] rel = tvcd.getCompoundDrawablesRelative();
+                            if (!tvcd.macapkHasRelativeDrawables()) { rel[0] = null; rel[2] = null; }
+                            if ("drawableStart".equals(attr)) rel[0] = dr; else rel[2] = dr;
+                            tvcd.setCompoundDrawablesRelativeWithIntrinsicBounds(rel[0], rel[1], rel[2], rel[3]);
+                            return;
+                        }
+                        if ("drawableTop".equals(attr) || "drawableBottom".equals(attr)) {
+                            // Keep whichever start/end (or left/right) pair is
+                            // already set: the relative view of it re-resolves
+                            // to the same sides.
+                            if (!tvcd.macapkHasRelativeDrawables()) {
+                                // No start/end: stay ABSOLUTE, or a drawableLeft
+                                // would turn into a start icon and flip under RTL.
+                                android.graphics.drawable.Drawable[] abs = tvcd.getCompoundDrawables();
+                                if ("drawableTop".equals(attr)) abs[1] = dr; else abs[3] = dr;
+                                tvcd.setCompoundDrawablesWithIntrinsicBounds(abs[0], abs[1], abs[2], abs[3]);
+                                return;
+                            }
+                            android.graphics.drawable.Drawable[] rel = tvcd.getCompoundDrawablesRelative();
+                            if ("drawableTop".equals(attr)) rel[1] = dr; else rel[3] = dr;
+                            tvcd.setCompoundDrawablesRelativeWithIntrinsicBounds(rel[0], rel[1], rel[2], rel[3]);
+                            return;
+                        }
+                        // drawableLeft/Right after a drawableStart/End: the
+                        // relative pair already overrides both sides (above).
+                        if (tvcd.macapkHasRelativeDrawables()) return;
+                        android.graphics.drawable.Drawable[] cur = tvcd.getCompoundDrawables();
+                        if ("drawableLeft".equals(attr)) cur[0] = dr; else cur[2] = dr;
+                        tvcd.setCompoundDrawablesWithIntrinsicBounds(cur[0], cur[1], cur[2], cur[3]);
+                    }
+                    return;
+                }
                 case "drawablePadding": {
                     // AOSP TextView ctor (:1374-1376): a DIMENSION, fed to
                     // setCompoundDrawablePadding. It is load-bearing for layout,
@@ -5979,6 +6043,82 @@ public class LayoutInflater {
         if (v == null || !MACAPK_A3_NULL_BG_DECLARED) return false;
         String t = v.trim();
         return t.equals("@null") || t.equals("@empty");
+    }
+
+    /** A compound-drawable attribute value as TypedArray.getDrawable reads it:
+     *  a `?attr` chased through the view's theme (the applyBackground chase),
+     *  then a platform drawable (by name or compiled id), an app drawable / mipmap
+     *  / colour reference, or a colour literal. A platform drawable the table can
+     *  only answer with the empty stand-in (the Material radio / checkbox are
+     *  animated-selectors of animated vectors) falls back to the synthesized
+     *  indicator Resources keeps for exactly those two
+     *  (MacapkCompoundButtonDrawable). Null when nothing resolves. */
+    private android.graphics.drawable.Drawable macapkResolveCompoundDrawable(View view, String value) {
+        if (value == null) return null;
+        value = value.trim();
+        if (value.isEmpty() || macapkIsNullBackground(value)) return null;
+        android.content.res.Resources r = view.getResources();
+        if (r == null) return null;
+        android.content.res.Resources.Theme th = null;
+        try { if (view.getContext() != null) th = view.getContext().getTheme(); }
+        catch (Throwable ignored) {}
+        String cur = value;
+        String lastAttr = null;
+        if (cur.startsWith("?") && th != null) {
+            for (int hop = 0; hop < 4 && cur.startsWith("?"); hop++) {
+                String attr = cur.substring(1);
+                if (attr.startsWith("android:attr/")) attr = "android:" + attr.substring(13);
+                else if (attr.startsWith("attr/")) attr = attr.substring(5);
+                lastAttr = attr;
+                String raw = th.resolveAttrRaw(attr);
+                if (raw == null) break;
+                raw = raw.trim();
+                if (raw.isEmpty() || raw.equals(cur)) break;
+                cur = raw;
+            }
+        }
+        if (cur.startsWith("?") || macapkIsNullBackground(cur)) return null;
+        android.graphics.drawable.Drawable dr = null;
+        try {
+            if (cur.startsWith("#")) {
+                Integer c = macapkResolveColorValue(cur, th);
+                if (c != null) dr = new android.graphics.drawable.ColorDrawable(c);
+            } else if (cur.startsWith("@android:drawable/")) {
+                String fw = cur.substring(18);
+                // Theme.Material's listChoiceIndicatorSingle/Multiple point at
+                // btn_radio_material_anim / btn_check_material_anim: animated
+                // selectors of animated vectors that the platform table loads
+                // but nothing here can paint, so the row reserved the room and
+                // drew no radio (Privacy Friendly Notes' ListPreference dialog, a Material 3
+                // theme whose overlay does not restate the attr). Use the
+                // synthesized Material indicator, as for an unresolved attr.
+                if ("btn_radio_material_anim".equals(fw)) fw = "btn_radio_material";
+                else if ("btn_check_material_anim".equals(fw)) fw = "btn_check_material";
+                dr = r.macapkFrameworkDrawableByName(fw, th);
+            } else if (cur.startsWith("@0x") || cur.startsWith("@0X")) {
+                int id = (int) Long.parseLong(cur.substring(3), 16);
+                if (id != 0) dr = r.getDrawable(id, th);
+            } else if (cur.startsWith("@")) {
+                int id = parseResourceId(cur);
+                if (id != 0) dr = r.getDrawable(id, th);
+            }
+        } catch (Throwable ignored) {
+            dr = null;
+        }
+        if (dr instanceof android.graphics.drawable.VectorDrawable vd
+                && (vd.macapkUnresolvedStub || vd.macapkPaintsNothing())) {
+            dr = null;
+        }
+        if (dr == null && lastAttr != null) {
+            String a = lastAttr.startsWith("android:") ? lastAttr.substring(8) : lastAttr;
+            String synth = a.startsWith("listChoiceIndicatorSingle") ? "btn_radio_material"
+                         : a.startsWith("listChoiceIndicatorMultiple") ? "btn_check_material"
+                         : null;
+            if (synth != null) {
+                try { dr = r.macapkFrameworkDrawableByName(synth, th); } catch (Throwable ignored) {}
+            }
+        }
+        return dr;
     }
 
     /** Resolve a color VALUE string: hex literal, `@color/X`,

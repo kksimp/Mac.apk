@@ -172,7 +172,14 @@ public class BitmapDrawable extends Drawable {
             // AOSP: when a tile mode is active the destination is the full
             // bounds and the shader supplies the repetition (gravity does not
             // participate -- copyBounds(mDstRect), mOpticalInsets = NONE).
-            canvas.drawRect(mContainer, getPaint());
+            final android.graphics.ColorFilter tf = macapkTintFilter();
+            final boolean tinted = tf != null && paint.getColorFilter() == null;
+            if (tinted) paint.setColorFilter(tf);
+            try {
+                canvas.drawRect(mContainer, getPaint());
+            } finally {
+                if (tinted) paint.setColorFilter(null);
+            }
             return;
         }
 
@@ -181,7 +188,36 @@ public class BitmapDrawable extends Drawable {
         // Pass the configured paint (alpha / color filter) so Glide/Coil
         // cross-fade transitions (which tween BitmapDrawable alpha) actually
         // fade instead of popping. v1.0.423.
-        canvas.drawBitmap(bitmap, mSrcRect, mDstRect, paint);
+        // AOSP BitmapDrawable.draw: "if (mTintFilter != null && paint.getColorFilter()
+        // == null) paint.setColorFilter(mTintFilter)". The tint was stored on the
+        // Drawable base and never drawn, so every white PNG glyph an app tints at
+        // runtime (WhatsApp's toolbar back/search icons, PalGate's buttons) stayed
+        // white on a light surface.
+        final android.graphics.ColorFilter tf = macapkTintFilter();
+        final boolean tinted = tf != null && paint.getColorFilter() == null;
+        if (tinted) paint.setColorFilter(tf);
+        try {
+            canvas.drawBitmap(bitmap, mSrcRect, mDstRect, paint);
+        } finally {
+            if (tinted) paint.setColorFilter(null);
+        }
+    }
+
+    // One filter per (colour, mode), reused across frames like AOSP's mTintFilter
+    // (updateTintFilter), so the canvas's filtered-image cache keeps hitting.
+    private android.graphics.PorterDuffColorFilter mMacapkTintFilter;
+    private int mMacapkTintColor;
+    private android.graphics.PorterDuff.Mode mMacapkTintFilterMode;
+    private android.graphics.ColorFilter macapkTintFilter() {
+        final android.graphics.PorterDuff.Mode mode = mTintMode;
+        if (mTintList == null || mode == null) return null;
+        final int color = macapkEffectiveTint();
+        if (mMacapkTintFilter == null || color != mMacapkTintColor || mode != mMacapkTintFilterMode) {
+            mMacapkTintFilter = new android.graphics.PorterDuffColorFilter(color, mode);
+            mMacapkTintColor = color;
+            mMacapkTintFilterMode = mode;
+        }
+        return mMacapkTintFilter;
     }
 
     /** AOSP Gravity.apply(gravity, w, h, container, outRect, layoutDirection).

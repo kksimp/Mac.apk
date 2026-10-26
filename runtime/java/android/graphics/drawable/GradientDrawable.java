@@ -521,6 +521,19 @@ public class GradientDrawable extends Drawable {
                     p.addRoundRect(new RectF(bounds.left, bounds.top, bounds.right, bounds.bottom),
                             st.mRadiusArray, Path.Direction.CW);
                     outline.setPath(p);
+                    // A per-corner radius array is a PATH outline, as in AOSP,
+                    // and clipping and ripple masks follow it exactly. The
+                    // shadow casters here draw round rects only, so a popup or
+                    // card with android:topLeftRadius etc. cast no shadow at
+                    // all -- WhatsApp's overflow menu sat shadowless on the
+                    // white screen. Hand them the LARGEST corner radius: the
+                    // round rect it gives is the shape itself when the corners
+                    // match, and otherwise lies inside it (a shadow may fall
+                    // short of a square corner, never stick out past a round one).
+                    float max = 0f;
+                    for (float v : st.mRadiusArray) max = Math.max(max, v);
+                    outline.macapkPathShadowRadius =
+                            Math.min(max, Math.min(bounds.width(), bounds.height()) * 0.5f);
                     return;
                 }
                 float rad = 0;

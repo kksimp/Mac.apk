@@ -791,6 +791,7 @@ public class LayoutInflater {
                 dbf.setNamespaceAware(true);
                 DocumentBuilder db = dbf.newDocumentBuilder();
                 doc = db.parse(xmlStream);
+                macapkDropAttrIdRecords(doc.getDocumentElement());
             } else {
                 // AOSP's inflate(int,...) reads the layout through
                 // `res.getLayout(resource)`, NOT openRawResource. That matters for
@@ -826,6 +827,31 @@ public class LayoutInflater {
             return new android.widget.FrameLayout(context);
         } finally {
             if (xmlStream != null) try { xmlStream.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    /** BinaryXmlParser's attr-id records (MACAPK_ATTRID_NS, written beside an
+     *  attribute whose name the resource table spells differently) exist for
+     *  DomXmlResourceParser.getAttributeNameResource. This inflater's own loops
+     *  match attributes by LOCAL name in any namespace, and a record's local
+     *  name is the attribute it describes while its value is an attr id, so it
+     *  would be applied over the real value. They are dropped from every layout
+     *  this class parses; the alias records stay, since TypedArray looks the
+     *  attribute up by its table name. */
+    private static void macapkDropAttrIdRecords(Element e) {
+        if (e == null) return;
+        NamedNodeMap attrs = e.getAttributes();
+        java.util.List<org.w3c.dom.Attr> drop = null;
+        for (int i = 0; attrs != null && i < attrs.getLength(); i++) {
+            Node a = attrs.item(i);
+            if (com.macapk.loader.BinaryXmlParser.MACAPK_ATTRID_NS.equals(a.getNamespaceURI())) {
+                if (drop == null) drop = new java.util.ArrayList<>();
+                drop.add((org.w3c.dom.Attr) a);
+            }
+        }
+        if (drop != null) for (org.w3c.dom.Attr a : drop) e.removeAttributeNode(a);
+        for (Node c = e.getFirstChild(); c != null; c = c.getNextSibling()) {
+            if (c instanceof Element ce) macapkDropAttrIdRecords(ce);
         }
     }
 
@@ -1090,6 +1116,7 @@ public class LayoutInflater {
                     dbf.setNamespaceAware(true);
                     DocumentBuilder db = dbf.newDocumentBuilder();
                     try { doc = db.parse(s); } finally { try { s.close(); } catch (Throwable ignored) {} }
+                    macapkDropAttrIdRecords(doc.getDocumentElement());
                 }
                 Element rootElem = doc.getDocumentElement();
                 if (rootElem != null) {
@@ -1954,11 +1981,53 @@ public class LayoutInflater {
             if ("layout_weight".equals(attr)) {
                 if (lp instanceof android.widget.LinearLayout.LayoutParams llp) {
                     try { llp.weight = Float.parseFloat(value.trim()); }
-                    catch (NumberFormatException ignored) {}
+                    catch (NumberFormatException nfe) {
+                        // A reference ("@integer/x", resolved per configuration:
+                        // WhatsApp's home pane is @integer = 1, 40 on sw600dp).
+                        // parseFloat threw on it, so the weight stayed 0 and the
+                        // whole home screen measured 0px wide.
+                        Float ref = macapkResolveNumberRef(value);
+                        if (ref != null) llp.weight = ref;
+                    }
                 }
                 return;
             }
         } catch (Throwable ignored) {}
+    }
+
+    /** The number a resource reference ("@integer/x", "@dimen/x", apktool's
+     *  "@integer/APKTOOL_RENAMED_0x7f0c003d") stands for, or null. */
+    private Float macapkResolveNumberRef(String v) {
+        if (v == null) return null;
+        v = v.trim();
+        if (!v.startsWith("@")) return null;
+        try {
+            android.content.res.Resources r = (context != null) ? context.getResources() : null;
+            if (r == null) return null;
+            int id = 0;
+            int k = v.indexOf("APKTOOL_RENAMED_0x");
+            if (k >= 0) {
+                id = (int) Long.parseLong(v.substring(k + 18), 16);
+            } else {
+                String body = v.substring(1);
+                int slash = body.indexOf('/');
+                if (slash > 0) {
+                    String type = body.substring(0, slash), name = body.substring(slash + 1);
+                    String pkg = context.getPackageName();
+                    if (type.startsWith("android:")) { type = type.substring(8); pkg = "android"; }
+                    id = r.getIdentifier(name, type, pkg);
+                }
+            }
+            if (id == 0) return null;
+            try { return (float) r.getInteger(id); } catch (Throwable ignored) {}
+            android.util.TypedValue tv = new android.util.TypedValue();
+            r.getValue(id, tv, true);
+            if (tv.type == android.util.TypedValue.TYPE_FLOAT) return tv.getFloat();
+            if (tv.type >= android.util.TypedValue.TYPE_FIRST_INT
+                    && tv.type <= android.util.TypedValue.TYPE_LAST_INT) return (float) tv.data;
+            if (tv.string != null) return Float.parseFloat(tv.string.toString().trim());
+        } catch (Throwable ignored) {}
+        return null;
     }
 
     /** Apply a RelativeLayout-specific `layout_*` attribute. The
@@ -2041,13 +2110,25 @@ public class LayoutInflater {
             return ViewGroup.LayoutParams.WRAP_CONTENT;  // -2
         }
         Float dim = parseDimensionPx(s);
-        if (dim != null) return (int) (float) dim;
+        if (dim != null) return macapkPixelSize(dim);
         try { return Integer.parseInt(s); } catch (NumberFormatException ignored) {}
         return ViewGroup.LayoutParams.WRAP_CONTENT;
     }
     private Integer parseDimensionPxInt(String s) {
         Float f = parseDimensionPx(s);
-        return f == null ? null : (int) (float) f;
+        return f == null ? null : macapkPixelSize(f);
+    }
+    /** AOSP TypedValue.complexToDimensionPixelSize: round to nearest, but a
+     *  non-zero size never collapses to 0 -- it becomes 1px (or -1). The
+     *  getLayoutDimension / getDimensionPixelSize readers behind layout_width,
+     *  padding and margins all go through it. Truncating instead turned a
+     *  0.3dp divider into 0 (MATCH_CONSTRAINT in a ConstraintLayout), which
+     *  stretched it over the screen and squeezed the list below it to nothing. */
+    private static int macapkPixelSize(float f) {
+        final int res = (int) (f >= 0 ? f + 0.5f : f - 0.5f);
+        if (res != 0) return res;
+        if (f == 0f) return 0;
+        return f > 0 ? 1 : -1;
     }
 
     /** BISECT GATE (2026-09-26, default ON; docs/fleet-newpipe-vlc-residual_2026-09-26.md).

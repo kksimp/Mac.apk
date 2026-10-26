@@ -5981,9 +5981,16 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         // content underneath.
         //
         // v1.0.128: theme-aware fill via `?attr/colorSurface`.
+        // A TOOLBAR is not filled (MACAPK_TOOLBAR_CHROME): AOSP's Toolbar has
+        // no default background, so one without a background is transparent
+        // and shows whatever is behind it -- typically its AppBarLayout, whose
+        // style background (?attr/colorPrimary, Material's
+        // MaterialShapeDrawable included) is drawn. Filling the Toolbar with
+        // colorSurface painted a white band over that colour: PalGate's blue
+        // app bar came out white and its white "OK" button vanished into it.
         if (name.endsWith("AppBarLayout")
-            || name.endsWith("Toolbar")
-            || name.endsWith("MaterialToolbar")) {
+            || (MACAPK_TOOLBAR_CHROME
+                && (name.endsWith("Toolbar") || name.endsWith("MaterialToolbar")))) {
             int fill = backgroundColor;
             if ((fill & 0xFF000000) != 0) return; // already opaque
             // Honor an EXPLICIT background (incl. transparent). F-Droid's
@@ -6001,6 +6008,10 @@ public class View implements android.graphics.drawable.Drawable.Callback,
             return;
         }
     }
+    /** Gate: MACAPK_TOOLBAR_CHROME=1 restores the colorSurface fill behind a
+     *  Toolbar / MaterialToolbar with no background (see macapkPaintMaterialChrome). */
+    static final boolean MACAPK_TOOLBAR_CHROME =
+        "1".equals(System.getenv("MACAPK_TOOLBAR_CHROME"));
     protected void onDraw(android.graphics.Canvas canvas)      {}
     protected void dispatchDraw(android.graphics.Canvas canvas) {}
 

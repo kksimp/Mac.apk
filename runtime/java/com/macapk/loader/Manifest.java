@@ -323,6 +323,45 @@ public final class Manifest {
             this.uriPermissionPatterns = uriPatterns;
             this.pathPermissions = pathPerms;
         }
+        private volatile String resolvedAuthorities;
+        /** android:authorities as a device's package parser hands it on. AOSP
+         *  reads it with TypedArray.getNonConfigurationString
+         *  (ParsedProviderUtils.parseProvider), which RESOLVES a string
+         *  reference, so `android:authorities="@string/x"` reaches the provider
+         *  map, ProviderInfo.authority and every ContentResolver lookup as the
+         *  string's text. The binary manifest keeps the reference ("@0x7f100000"
+         *  from BinaryXmlParser, "@string/x" from a text decode), and using that
+         *  token as is registered the provider under "@0x7f100000": every
+         *  content:// query an app made of its OWN provider then came back null
+         *  (NoNonsense Notes: no lists and no notes, and an NPE from each drawer
+         *  count loader). Resolved once against `res` (the app's Resources);
+         *  the raw value is the answer when it is no reference or cannot be
+         *  resolved. */
+        public String resolvedAuthorities(android.content.res.Resources res) {
+            String done = resolvedAuthorities;
+            if (done != null) return done;
+            String raw = authorities;
+            if (raw == null || !raw.startsWith("@")) return raw;
+            if (res == null) {
+                android.app.Application app = android.app.Application.getInstance();
+                res = app != null ? app.getResources() : null;
+                if (res == null) return raw;
+            }
+            String out = raw;
+            try {
+                int id = MacApkPackageManager.resolveResRef(raw, "string");
+                if (id != 0) {
+                    String s = res.getString(id);
+                    if (s != null && !s.isEmpty()) out = s;
+                }
+            } catch (Throwable t) {
+                NativeLog.w(TAG, "provider " + name + ": android:authorities " + raw
+                    + " did not resolve: " + t);
+                return raw;
+            }
+            resolvedAuthorities = out;
+            return out;
+        }
         /** This entry with a different `exported` (the targetSdk-dependent
          *  default is only known once <uses-sdk> has been read). */
         ProviderEntry withExported(boolean exp) {

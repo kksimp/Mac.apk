@@ -324,12 +324,38 @@ public class SQLiteCursorImpl extends AbstractWindowedCursor {
             NativeSqlite.nativeFinalize(stmt);
             stmt = 0;
         }
+        // AOSP SQLiteCursor.close -> AbstractCursor.close: unregister the self
+        // observer from the resolver and tell data-set observers the rows are
+        // gone (now that the observer plumbing below is live, a closed cursor
+        // must not stay in the resolver's observer list).
+        if (MACAPK_CURSOR_OBSERVERS) super.close();
     }
-    @Override public void registerContentObserver(ContentObserver o)   {}
-    @Override public void unregisterContentObserver(ContentObserver o) {}
-    @Override public void registerDataSetObserver(DataSetObserver o)   {}
-    @Override public void unregisterDataSetObserver(DataSetObserver o) {}
-    @Override public void setNotificationUri(android.content.ContentResolver cr, android.net.Uri uri) {}
+    // These four were empty overrides that SHADOWED AbstractCursor's working
+    // observer plumbing for every SQLite cursor: a provider's
+    // cursor.setNotificationUri(cr, uri) registered nothing, so
+    // ContentResolver.notifyChange reached no CursorLoader and every
+    // loader-backed list stayed stale until the app restarted (NoNonsense
+    // Notes: a list created from the drawer never appeared in it; the
+    // resolver showed observers=0 for every notifyChange). AOSP SQLiteCursor
+    // inherits them unchanged from AbstractCursor. MACAPK_CURSOR_OBSERVERS=0
+    // restores the no-ops.
+    static final boolean MACAPK_CURSOR_OBSERVERS =
+        !"0".equals(System.getenv("MACAPK_CURSOR_OBSERVERS"));
+    @Override public void registerContentObserver(ContentObserver o) {
+        if (MACAPK_CURSOR_OBSERVERS) super.registerContentObserver(o);
+    }
+    @Override public void unregisterContentObserver(ContentObserver o) {
+        if (MACAPK_CURSOR_OBSERVERS) super.unregisterContentObserver(o);
+    }
+    @Override public void registerDataSetObserver(DataSetObserver o) {
+        if (MACAPK_CURSOR_OBSERVERS) super.registerDataSetObserver(o);
+    }
+    @Override public void unregisterDataSetObserver(DataSetObserver o) {
+        if (MACAPK_CURSOR_OBSERVERS) super.unregisterDataSetObserver(o);
+    }
+    @Override public void setNotificationUri(android.content.ContentResolver cr, android.net.Uri uri) {
+        if (MACAPK_CURSOR_OBSERVERS && cr != null && uri != null) super.setNotificationUri(cr, uri);
+    }
 
     // ---- C library primitives the window's JNI layer relies on ----------
     // These are here rather than in a shared util because they are not

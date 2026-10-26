@@ -3731,8 +3731,11 @@ public final class Boot {
                     (android.content.ContentProvider) instance;
                 android.content.pm.ProviderInfo info =
                     new android.content.pm.ProviderInfo();
+                // The STRING a "@string/x" android:authorities names, as AOSP's
+                // parser hands it on (Manifest.ProviderEntry.resolvedAuthorities).
+                final String authorities = entry.resolvedAuthorities(application.getResources());
                 info.name        = entry.name;
-                info.authority   = entry.authorities;
+                info.authority   = authorities;
                 info.packageName = application.getPackageName();
                 info.initOrder   = entry.initOrder;
                 info.exported    = entry.exported;
@@ -3763,9 +3766,9 @@ public final class Boot {
                 // against a content:// URI actually dispatch to this
                 // provider. Manifest-driven (authorities come straight
                 // from android:authorities), so it is app-agnostic.
-                if (entry.authorities != null && !entry.authorities.isEmpty()) {
+                if (authorities != null && !authorities.isEmpty()) {
                     android.content.ContentProviderRegistry.register(
-                        entry.authorities, provider);
+                        authorities, provider);
                 }
             } catch (ClassNotFoundException cnf) {
                 // Many APKs declare optional providers (different

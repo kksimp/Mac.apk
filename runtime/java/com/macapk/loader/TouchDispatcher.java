@@ -1881,7 +1881,20 @@ public final class TouchDispatcher {
         if (android.os.Looper.macapkIsActivityThread()) return false; // already on loop
         if (active == null) return false;
         View root = active.macapkContentView();
-        return root != null && !hostInputTree(root);   // UI-thread input unless OS-main renders
+        // An activity with NO content yet is one being created right now: the
+        // launch pushed it (ActivityHost.performLaunch) and its onCreate is
+        // running, or about to, on the loop. Its input belongs on the loop too
+        // -- AOSP binds a window's input receiver to its own looper, and nothing
+        // reaches a window before it exists -- so it must queue behind onCreate,
+        // not run beside it. Delivering it directly ran the app's key handling on
+        // the host thread INSIDE another thread's onCreate: the Enter release
+        // that follows a search submit reached NoNonsense Notes' ActivitySearch
+        // mid-create, AppCompat attached its delegate from the wrong thread, and
+        // onCreate threw "AppCompat has already installed itself into the
+        // Window" (or lost android.R.id.content), leaving the search screen
+        // blank. The OS-main exception (hostInputTree) needs a tree to name.
+        if (root == null) return true;
+        return !hostInputTree(root);   // UI-thread input unless OS-main renders
     }
 
     /** MACAPK_INPUT_UI_THREAD (default ON, 2026-09-30): which content trees

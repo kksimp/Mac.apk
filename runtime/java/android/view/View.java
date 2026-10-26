@@ -7378,6 +7378,16 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         if (!android.os.Looper.MACAPK_REAL_LOOPER) return;
         mDrawableStateDirty = true;
         drawableStateChanged();
+        // AOSP View.refreshDrawableState (android14 View.java:23683-23691):
+        //     ViewParent parent = mParent;
+        //     if (parent != null) parent.childDrawableStateChanged(this);
+        // This is how a group with addStatesFromChildren (TextInputLayout and
+        // its inputFrame) learns that its EditText became focused, so the box
+        // stroke and the floating label switch to the focused colors.
+        ViewParent p = parent;
+        if (p != null) {
+            try { p.childDrawableStateChanged(this); } catch (Throwable ignored) {}
+        }
     }
 
     protected int[] onCreateDrawableState(int extraSpace) {

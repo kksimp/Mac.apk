@@ -3905,8 +3905,9 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
     // parent, and before duplicateParentState was parsed at all no view could
     // have the flag, so it cannot reproduce the F-Droid cards regression.
     //
-    // AOSP also throws here when FLAG_ADD_STATES_FROM_CHILDREN is set; we do not
-    // implement addStatesFromChildren at all, so there is nothing to check.
+    // AOSP also throws here when FLAG_ADD_STATES_FROM_CHILDREN is set; ours
+    // skips a duplicating child in addStatesFromChildren instead (see
+    // onCreateDrawableState below), so there is nothing to check.
     private boolean macapkNotifyChildrenOnDrawableStateChange = false;
     @Override public void drawableStateChanged() {
         super.drawableStateChanged();
@@ -4228,9 +4229,58 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
     public void suppressLayout(boolean suppress) { mLayoutSuppressed = suppress; }
     public boolean isLayoutSuppressed() { return mLayoutSuppressed; }
 
+    // AOSP ViewGroup FLAG_ADD_STATES_FROM_CHILDREN (android14 ViewGroup.java):
+    //     public void setAddStatesFromChildren(boolean addsStates) {
+    //         if (addsStates) mGroupFlags |= FLAG_ADD_STATES_FROM_CHILDREN;
+    //         else mGroupFlags &= ~FLAG_ADD_STATES_FROM_CHILDREN;
+    //         refreshDrawableState(); }
+    //     protected int[] onCreateDrawableState(int extraSpace) {
+    //         if ((mGroupFlags & FLAG_ADD_STATES_FROM_CHILDREN) == 0)
+    //             return super.onCreateDrawableState(extraSpace);
+    //         int need = 0; for each child: need += child.getDrawableState().length;
+    //         int[] state = super.onCreateDrawableState(extraSpace + need);
+    //         for each child: state = mergeDrawableStates(state, child.getDrawableState());
+    //         return state; }
+    //     public void childDrawableStateChanged(View child) {
+    //         if ((mGroupFlags & FLAG_ADD_STATES_FROM_CHILDREN) != 0) refreshDrawableState(); }
+    // The flag was stored and never read, so a TextInputLayout never saw its
+    // EditText's state_focused: the outline stayed the idle grey and the
+    // label kept the idle color while the field had focus. AOSP forbids a
+    // duplicateParentState child under such a group (it throws); we skip
+    // those children instead, which also keeps the two mirrors from recursing.
     private boolean mAddStatesFromChildren;
-    public void setAddStatesFromChildren(boolean addsStates) { mAddStatesFromChildren = addsStates; }
+    private boolean mMacapkInChildStateChange;
+    public void setAddStatesFromChildren(boolean addsStates) {
+        mAddStatesFromChildren = addsStates;
+        refreshDrawableState();
+    }
     public boolean addStatesFromChildren() { return mAddStatesFromChildren; }
+    @Override protected int[] onCreateDrawableState(int extraSpace) {
+        if (!mAddStatesFromChildren || !android.os.Looper.MACAPK_REAL_LOOPER) {
+            return super.onCreateDrawableState(extraSpace);
+        }
+        final int n = children.size();
+        int need = 0;
+        int[][] childStates = new int[n][];
+        for (int i = 0; i < n; i++) {
+            View c = children.get(i);
+            if (c == null || c.isDuplicateParentStateEnabled()) continue;
+            int[] cs = c.getDrawableState();
+            childStates[i] = cs;
+            if (cs != null) need += cs.length;
+        }
+        int[] state = super.onCreateDrawableState(extraSpace + need);
+        for (int i = 0; i < n; i++) {
+            if (childStates[i] != null) state = mergeDrawableStates(state, childStates[i]);
+        }
+        return state;
+    }
+    @Override public void childDrawableStateChanged(View child) {
+        if (!mAddStatesFromChildren || mMacapkInChildStateChange) return;
+        if (child != null && child.isDuplicateParentStateEnabled()) return;
+        mMacapkInChildStateChange = true;
+        try { refreshDrawableState(); } finally { mMacapkInChildStateChange = false; }
+    }
 
     private boolean mTouchscreenBlocksFocus;
     public void setTouchscreenBlocksFocus(boolean touchscreenBlocksFocus) {

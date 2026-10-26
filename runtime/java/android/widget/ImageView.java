@@ -94,6 +94,47 @@ public class ImageView extends View {
             }
             ta.recycle();
         } catch (Throwable ignored) {}
+        if (MACAPK_IMAGEVIEW_THEME_TINT) macapkApplyStyledTint(c, a, defStyleAttr, defStyleRes);
+    }
+
+    /** AOSP ImageView.<init> (android14 ImageView.java:213-230):
+     *      if (a.hasValue(R.styleable.ImageView_tint)) {
+     *          mDrawableTintList = a.getColorStateList(R.styleable.ImageView_tint);
+     *          mHasDrawableTint = true;
+     *          // Prior to L, this attribute would always set a color filter with
+     *          // blending mode SRC_ATOP. Preserve that default behavior.
+     *          mDrawableBlendMode = BlendMode.SRC_ATOP; mHasDrawableBlendMode = true;
+     *      }
+     *  obtainStyledAttributes answers from the view's XML, its style, the
+     *  default style AND, last, the THEME -- so a theme item
+     *  `<item name="android:tint">?iconTint</item>` tints every ImageView that
+     *  does not say otherwise. NoNonsense Notes' ThemeNnnLight does exactly
+     *  that (iconTint = black_alpha85) over white-filled vector icons; we read
+     *  android:tint only from the XML attribute (LayoutInflater's "tint" case),
+     *  so its settings icons drew white on the light grey list -- previously
+     *  hidden by VectorDrawable's white-to-#333 stand-in. Read here, only when
+     *  the attribute resolves, so an untinted ImageView is untouched; the
+     *  inflater's direct XML case still runs afterwards and wins.
+     *  MACAPK_IMAGEVIEW_THEME_TINT=0 restores the XML-only read. */
+    static final boolean MACAPK_IMAGEVIEW_THEME_TINT =
+        !"0".equals(System.getenv("MACAPK_IMAGEVIEW_THEME_TINT"));
+    private void macapkApplyStyledTint(Context c, android.util.AttributeSet a,
+                                       int defStyleAttr, int defStyleRes) {
+        try {
+            android.content.res.TypedArray ta = c.obtainStyledAttributes(
+                a, new int[]{0x01010121 /* android.R.attr.tint */}, defStyleAttr, defStyleRes);
+            try {
+                if (ta.hasValue(0)) {
+                    android.content.res.ColorStateList csl = ta.getColorStateList(0);
+                    if (csl != null) {
+                        setImageTintList(csl);
+                        setImageTintMode(android.graphics.PorterDuff.Mode.SRC_ATOP);
+                    }
+                }
+            } finally {
+                ta.recycle();
+            }
+        } catch (Throwable ignored) {}
     }
 
     public void setImageBitmap(android.graphics.Bitmap b) {

@@ -3010,6 +3010,36 @@ public class TextView extends View
             // macapkActiveInput path), which is the same shape AOSP's
             // onEditorAction(int) uses when an IME action button is tapped
             // (TextView.java:7965-7969 passes null there too).
+            // A MULTI-LINE field takes Enter as a NEWLINE, on both routes. AOSP:
+            // TextView.onCreateInputConnection sets IME_FLAG_NO_ENTER_ACTION for
+            // every isMultilineInputType field ("Multi-line text editors should
+            // always show an enter key", android14 TextView.java:9061-9064), so a
+            // keyboard's Enter commits '\n' there instead of an editor action; and
+            // doKeyDown lets a hardware Enter through to the key listener (which
+            // inserts '\n') unless shouldAdvanceFocusOnEnter() -- singleLine, or
+            // an email / URI variation. Both used to end below as an editor
+            // action (soft route) or a swallowed key, so Enter never started a new
+            // line in any note editor (NoNonsense Notes, whose title is the first
+            // line, could not have a body). The test is AOSP's isMultilineInputType
+            // on the declared input type, so a field we cannot prove multi-line
+            // keeps the old behaviour.
+            if (macapkEnterInsertsNewline()) {
+                // A keyboard's Enter reaches the field as a KEYCODE_ENTER key
+                // event (LatinIME sendDownUpKeyEvent), so the app's listener is
+                // asked first on both routes, as doKeyDown does.
+                final android.view.KeyEvent kev = ev != null ? ev
+                    : new android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN,
+                                                android.view.KeyEvent.KEYCODE_ENTER);
+                if (editorActionListener == null || !macapkEditorActionConsumes(kev)) {
+                    if (MACAPK_TEXT_CARET) {
+                        macapkInsertAtSelection("\n");
+                    } else {
+                        CharSequence ins = macapkFilterInsertion("\n", cur.length(), cur.length());
+                        if (ins != null && ins.length() > 0) macapkSetTextAndNotify(cur + ins);
+                    }
+                }
+                return true;
+            }
             // Soft-input route (no KeyEvent) == the IME's action button, which
             // AOSP delivers as onEditorAction(actionId): listener first, then the
             // NEXT/PREVIOUS/DONE defaults, and a subclass override runs too.
@@ -3028,14 +3058,15 @@ public class TextView extends View
                             this, macapkActionIdForEnterEvent(), ev)) return true;
                 } catch (Throwable ignore) {}
             }
-            // SCOPED DELTA from AOSP, unchanged from before this fix: AOSP would
-            // now fall through and let a MULTI-LINE field insert the newline
-            // through its key listener. We consume instead. Our KeyListener chain
-            // is inert (see onKeyDown's header), so falling through would drop the
-            // key rather than insert anything, and turning it into a literal '\n'
-            // for every field we cannot prove is multi-line would put newlines
-            // into game name/room-code fields that today commit cleanly. Revisit
-            // together with a real ArrowKeyMovementMethod/KeyListener edit path.
+            // SCOPED DELTA from AOSP, for a field we cannot prove multi-line (a
+            // provable one took the newline above): AOSP would now fall through
+            // and let the key listener decide. We consume instead. Our
+            // KeyListener chain is inert (see onKeyDown's header), so falling
+            // through would drop the key rather than insert anything, and
+            // turning it into a literal '\n' for every field we cannot prove is
+            // multi-line would put newlines into game name/room-code fields that
+            // today commit cleanly. Revisit together with a real
+            // ArrowKeyMovementMethod/KeyListener edit path.
             return true;
         }
         if (unicodeChar >= 32 && unicodeChar != 127) {
@@ -3054,6 +3085,30 @@ public class TextView extends View
             return true;
         }
         return false;   // non-text key (arrows, etc.) -> let the game handle it
+    }
+
+    /** Enter starts a new line here: AOSP's isMultilineInputType(getInputType())
+     *  (`(type & (TYPE_MASK_CLASS | TYPE_TEXT_FLAG_MULTI_LINE)) ==
+     *  (TYPE_CLASS_TEXT | TYPE_TEXT_FLAG_MULTI_LINE)`) and not
+     *  shouldAdvanceFocusOnEnter() (singleLine, or the email / URI
+     *  variations), android14 TextView.java:7495-7498, :9310-9325. */
+    private boolean macapkEnterInsertsNewline() {
+        final int t = getInputType();
+        final int ml = android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE;
+        if ((t & (android.text.InputType.TYPE_MASK_CLASS | ml))
+                != (android.text.InputType.TYPE_CLASS_TEXT | ml)) return false;
+        if (isSingleLine()) return false;
+        final int variation = t & android.text.InputType.TYPE_MASK_VARIATION;
+        return variation != android.text.InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
+            && variation != android.text.InputType.TYPE_TEXT_VARIATION_URI;
+    }
+
+    private boolean macapkEditorActionConsumes(android.view.KeyEvent ev) {
+        try {
+            return editorActionListener.onEditorAction(this, macapkActionIdForEnterEvent(), ev);
+        } catch (Throwable ignore) {
+            return false;
+        }
     }
 
     /** The selection an edit applies to, as AOSP's key listeners read it:
@@ -4815,11 +4870,12 @@ public class TextView extends View
      *    applySingleLine(singleLine, !isPassword, ...) (TextView.java:6912),
      *    which lands on setTransformationMethod(SingleLineTransformationMethod
      *    .getInstance()) or setTransformationMethod(null) depending on the
-     *    multi-line flag. Our setSingleLine() never installs
-     *    SingleLineTransformationMethod at all, so mirroring the single-line
-     *    half here would newline-collapse every single-line TextView in the
-     *    fleet -- a much wider change than this lane. We clear to null, which
-     *    is AOSP's own multi-line answer and matches the rest of this tree.
+     *    multi-line flag. Only the setSingleLine() API installs
+     *    SingleLineTransformationMethod here (MACAPK_SINGLELINE_TRANSFORM),
+     *    so mirroring the single-line half here would newline-collapse every
+     *    field whose inputType merely lacks textMultiLine -- a much wider
+     *    change than this lane. We clear to null, which is AOSP's own
+     *    multi-line answer and matches the rest of this tree.
      *  - No setTypefaceFromAttrs(MONOSPACE): AOSP switches password fields to
      *    a monospace face so the dots align. Cosmetic, and our Paint has no
      *    typeface-by-index selection. */
@@ -4838,8 +4894,8 @@ public class TextView extends View
         // Only the FLAG is applied here. The rest of applySingleLine (setLines(1),
         // setHorizontallyScrolling, SingleLineTransformationMethod, the
         // MAX_LENGTH_FOR_SINGLE_LINE_EDIT_TEXT filter) stays out for the reason
-        // already recorded above this method: this tree has no
-        // SingleLineTransformationMethod wiring, and installing the layout half
+        // already recorded above this method: only setSingleLine() installs
+        // SingleLineTransformationMethod, and installing the layout half
         // here would newline-collapse fields fleet-wide. The flag on its own is
         // what isSingleLine() -- and therefore macapkActionIdForEnterEvent() --
         // needs to answer correctly, and it is also the value AOSP's
@@ -4945,7 +5001,48 @@ public class TextView extends View
         if (s) maxLines = 1;
         if (s) { macapkSetMin(1, true); macapkSetMax(1, true); }
         else   { macapkSetMax(Integer.MAX_VALUE, true); }
+        // AOSP setSingleLine -> applySingleLine(singleLine, true, true, true)
+        // (android14 TextView.java:11915-11940):
+        //     if (singleLine) { setLines(1); setHorizontallyScrolling(true);
+        //         setTransformationMethod(SingleLineTransformationMethod.getInstance()); }
+        //     else { ...; setTransformationMethod(null); }
+        // Without the transformation a single-line view kept its '\n': it
+        // MEASURED only the first paragraph while the one-line draw path ran
+        // the whole text on, so it ellipsized almost at once. MEASURED:
+        // NoNonsense Notes' search result row (title + "\n" + body, wrap_content,
+        // setSingleLine(true) when "rows" = 1) measured 99 px and showed
+        // "Shopping li ...". Scoped: the API call only (setInputType still sets
+        // the flag alone, see setInputType), and an app transformation such as
+        // a password mask is left in place. MACAPK_SINGLELINE_TRANSFORM=0
+        // restores the old behaviour.
+        if (MACAPK_SINGLELINE_TRANSFORM) {
+            final android.text.method.TransformationMethod sl =
+                android.text.method.SingleLineTransformationMethod.getInstance();
+            if (s) {
+                // Replace whatever is installed, as AOSP does -- AppCompat's
+                // setTransformationMethod override re-wraps it in emoji2's
+                // EmojiTransformationMethod, which every AppCompatTextView
+                // already carries -- except a password mask: our inflater
+                // applies XML singleLine AFTER the constructor chain, where
+                // AOSP's applySingleLine runs before setInputType installs it.
+                if (!(mTransformationMethod instanceof android.text.method.PasswordTransformationMethod)) {
+                    setTransformationMethod(sl);
+                    mMacapkSingleLineTransform = true;
+                }
+            } else if (mMacapkSingleLineTransform) {
+                // AOSP's applySingleLine(false, ...) clears the transformation.
+                // Only undo one this method installed, so a field that was
+                // never set single-line here keeps its own.
+                mMacapkSingleLineTransform = false;
+                setTransformationMethod(null);
+            }
+        }
     }
+    static final boolean MACAPK_SINGLELINE_TRANSFORM =
+        !"0".equals(System.getenv("MACAPK_SINGLELINE_TRANSFORM"));
+    /** setSingleLine(true) installed SingleLineTransformationMethod (possibly
+     *  re-wrapped by an AppCompat subclass, so not comparable by identity). */
+    private boolean mMacapkSingleLineTransform;
     public void setSingleLine() { setSingleLine(true); }
 
     /** AOSP TextView.isSingleLine() (android14-release TextView.java:7405-7408),

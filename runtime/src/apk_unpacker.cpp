@@ -977,13 +977,44 @@ BinaryManifestInfo ParseBinaryManifest(const std::string& d) {
                     uint32_t clen = u16(p); p += 2;
                     if (clen & 0x8000) { clen = ((clen & 0x7fff) << 16) | u16(p); p += 2; }
                     std::string s; s.reserve(clen);
+                    // UTF-16 -> UTF-8, surrogate pairs included -- the same
+                    // decode readOneString() above already does for the arsc
+                    // pool. This USED to keep 7-bit chars verbatim and degrade
+                    // everything wider to '?', on the assumption that a label
+                    // that needed them would be resolved on the Java side
+                    // later. But an <application android:label> given as a
+                    // LITERAL (not an @string ref) is read straight from this
+                    // pool and handed to the installer for the bundle name and
+                    // meta.json, so a CJK literal label became "????" -- e.g.
+                    // 三國志·戰略版（T港澳）, com.qookkagame.sgzzlb.hkmo.xianfeng,
+                    // 2026-10-27. (A @string-ref label still goes through the
+                    // arsc resolver, which was always UTF-8-correct.)
                     for (uint32_t c = 0; c < clen && p + 1 < n; ++c, p += 2) {
-                        uint32_t ch = u16(p);
-                        // Keep 7-bit chars verbatim (package ids, version
-                        // strings); wider chars degrade to '?' -- labels
-                        // that need them come from the Java side later.
-                        if (ch < 0x80) s.push_back(char(ch));
-                        else s.push_back('?');
+                        uint32_t cp = u16(p);
+                        if (cp >= 0xd800 && cp <= 0xdbff
+                                && c + 1 < clen && p + 3 < n) {
+                            uint32_t lo = u16(p + 2);
+                            if (lo >= 0xdc00 && lo <= 0xdfff) {
+                                cp = 0x10000 + ((cp - 0xd800) << 10)
+                                   + (lo - 0xdc00);
+                                p += 2; ++c;
+                            }
+                        }
+                        if (cp < 0x80) {
+                            s.push_back(char(cp));
+                        } else if (cp < 0x800) {
+                            s.push_back(char(0xc0 | (cp >> 6)));
+                            s.push_back(char(0x80 | (cp & 0x3f)));
+                        } else if (cp < 0x10000) {
+                            s.push_back(char(0xe0 | (cp >> 12)));
+                            s.push_back(char(0x80 | ((cp >> 6) & 0x3f)));
+                            s.push_back(char(0x80 | (cp & 0x3f)));
+                        } else {
+                            s.push_back(char(0xf0 | (cp >> 18)));
+                            s.push_back(char(0x80 | ((cp >> 12) & 0x3f)));
+                            s.push_back(char(0x80 | ((cp >> 6) & 0x3f)));
+                            s.push_back(char(0x80 | (cp & 0x3f)));
+                        }
                     }
                     pool[i] = s;
                 }

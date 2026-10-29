@@ -10,6 +10,7 @@
 #include "macapk/native_methods.h"
 #include "macapk/gms_signin.h"
 #include "macapk/cocoa_bridge.h"
+#include "macapk/native_host_crypto.h"
 #include "macapk/self_capture.h"   // SelfCaptureGlWanted
 #include "macapk/gles_bridge.h"
 
@@ -4498,6 +4499,7 @@ void RegisterAllNativeMethods(JNIEnv* env) {
     Bind(env, "com/macapk/loader/NativeImageCodec", kNativeImageCodecMethods,
          sizeof(kNativeImageCodecMethods) / sizeof(kNativeImageCodecMethods[0]));
     sqlite::RegisterNativeSqliteMethods(env);
+    RegisterHostCryptoNativeMethods(env);
     osnative::RegisterNativeOsMethods(env);
     audio::RegisterNativeAudioMethods(env);
     audioin::RegisterAudioInputMethods(env);

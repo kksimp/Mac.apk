@@ -27,7 +27,7 @@
 //     connect by HOSTNAME and set ServerNames explicitly.
 //   - use a PRIVATE SSLContext, never SSLContext.getDefault(): the global
 //     default is mutable by guest code sharing this JVM.
-//   - a bare Socket obeys the JVM-global socksProxyHost; use Proxy.NO_PROXY.
+//   - a bare Socket obeys guest-mutable socksProxyHost; use Proxy.NO_PROXY.
 package com.macapk.gms;
 
 import java.io.IOException;
@@ -283,8 +283,10 @@ public final class McsClient {
     private SSLSocket openSocket() throws IOException {
         IOException last = null;
         for (int port : PORTS) {
-            try {
-                Socket plain = new Socket(Proxy.NO_PROXY);   // ignore the guest-mutable socksProxyHost
+            Socket plain = null;
+            boolean complete = false;
+            try (com.macapk.loader.HostCrypto.Scope crypto = com.macapk.loader.HostCrypto.use()) {
+                plain = new Socket(Proxy.NO_PROXY);
                 plain.connect(new InetSocketAddress(HOST, port), CONNECT_TIMEOUT_MS);
                 plain.setKeepAlive(true);
                 plain.setTcpNoDelay(true);
@@ -296,10 +298,13 @@ public final class McsClient {
                 s.setSoTimeout(CONNECT_TIMEOUT_MS);
                 s.startHandshake();                               // a timeout here is fatal
                 s.setSoTimeout(READ_TICK_MS);
+                complete = true;
                 return s;
             } catch (IOException e) {
                 last = e;
                 log("port " + port + " failed: " + e);
+            } finally {
+                if (!complete && plain != null) try { plain.close(); } catch (IOException ignored) {}
             }
         }
         throw (last != null) ? last : new IOException("no MCS port answered");

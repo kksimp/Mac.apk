@@ -34,6 +34,8 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
+import javax.net.ssl.HttpsURLConnection;
+import com.macapk.loader.HostCrypto;
 
 public final class GmsHttp {
 
@@ -133,8 +135,20 @@ public final class GmsHttp {
                                     Map<String, String> headers, boolean gzipBody,
                                     int connectMs, int readMs)
             throws IOException {
+        // On Android this work is performed in GMS's own process. Keep its
+        // algorithms and HTTPS policy independent of application defaults.
+        try (HostCrypto.Scope crypto = HostCrypto.use()) {
+            return requestWithHostCrypto(method, url, body, headers, gzipBody, connectMs, readMs);
+        }
+    }
+
+    private static Response requestWithHostCrypto(String method, String url, byte[] body,
+                                    Map<String, String> headers, boolean gzipBody,
+                                    int connectMs, int readMs)
+            throws IOException {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         try {
+            if (c instanceof HttpsURLConnection tls) HostCrypto.configureServiceHttps(tls);
             c.setRequestMethod(method);
             c.setConnectTimeout(connectMs);
             c.setReadTimeout(readMs);

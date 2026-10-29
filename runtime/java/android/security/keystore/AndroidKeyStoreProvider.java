@@ -104,6 +104,7 @@ public class AndroidKeyStoreProvider extends Provider {
 
     // Mirrors AOSP install(): register the provider once. Idempotent.
     public static void install() {
+        com.macapk.loader.HostCrypto.initializeRuntime();
         if (Security.getProvider(PROVIDER_NAME) == null) {
             Security.addProvider(new AndroidKeyStoreProvider());
         }

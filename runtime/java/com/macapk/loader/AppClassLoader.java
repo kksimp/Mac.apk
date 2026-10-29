@@ -170,6 +170,10 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         this.apkFile         = apkSet.isEmpty() ? null : apkSet.get(0);
         this.apkZips         = new java.util.zip.ZipFile[apkSet.size()];
         this.apkZipFailed    = new boolean[apkSet.size()];
+        java.util.List<URL> originalResources=new java.util.ArrayList<>();
+        for(File member:apkSet)try { originalResources.add(member.toURI().toURL()); }
+        catch(java.net.MalformedURLException invalid) { throw new IllegalArgumentException("Invalid resource archive",invalid); }
+        macapkAddInitialResources(originalResources.toArray(new URL[0]));
     }
 
     // ---- Classpath resources served from the APK zip(s) ----
@@ -190,7 +194,7 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
     @Override
     public URL findResource(String name) {
         URL u = super.findResource(name);
-        if (u != null) return u;
+        if (u != null || macapkDexPathChanged()) return u;
         return apkEntryUrl(name);
     }
 
@@ -198,6 +202,7 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
     public java.util.Enumeration<URL> findResources(String name)
             throws IOException {
         java.util.Enumeration<URL> base = super.findResources(name);
+        if(macapkDexPathChanged())return base;
         java.util.List<URL> apk = apkEntryUrls(name);
         if (apk.isEmpty()) return base;
         java.util.List<URL> all = new java.util.ArrayList<>();
@@ -767,7 +772,8 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         // it carries the entry -- the SAME entry, through the same kind of
         // JarFile, that the URL lookup below would resolve. See
         // BOOTSPEED_JARREAD. A miss (or any trouble) takes the unchanged URL path.
-        byte[] direct = BOOTSPEED_JARREAD ? readClassJarEntry(resourcePath) : null;
+        byte[] direct = BOOTSPEED_JARREAD && !macapkDexPathChanged()
+            ? readClassJarEntry(resourcePath) : null;
         java.net.URL u = direct != null ? null : findResource(resourcePath);
         if (direct != null || u != null) {
             try (java.io.InputStream in = direct != null ? null : u.openStream()) {
@@ -817,7 +823,7 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         // eager behaviour is byte-for-byte unchanged. Bytes still go through
         // ClassFileRewriter -- the interception point is the same one the
         // eager path uses, so a rewrite fix applies to both.
-        dalvik.system.LazyDexSource lazy = lazySource();
+        dalvik.system.LazyDexSource lazy = macapkDexPathChanged() ? null : lazySource();
         if (lazy != null) {
             byte[] raw = remapRewrite(lazy.classBytes(srcDotted.replace('.', '/')));
             if (raw != null) {

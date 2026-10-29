@@ -8,6 +8,7 @@
 // JNI signatures at one location so the surface is auditable.
 
 #include "macapk/native_methods.h"
+#include "macapk/native_reflection.h"
 #include "macapk/gms_signin.h"
 #include "macapk/cocoa_bridge.h"
 #include "macapk/self_capture.h"   // SelfCaptureGlWanted
@@ -4438,6 +4439,7 @@ int JavaVsyncFire() { return JavaVsyncFireAt(JavaVsyncNanoTime()); }
 void RegisterAllNativeMethods(JNIEnv* env) {
     Bind(env, "com/macapk/loader/NativeLog",   kNativeInstallJniTrace,
          sizeof(kNativeInstallJniTrace) / sizeof(kNativeInstallJniTrace[0]));
+    RegisterReflectionNativeMethods(env);
     Bind(env, "com/macapk/loader/NativeLog",   kNativeLogMethods,
          sizeof(kNativeLogMethods)   / sizeof(kNativeLogMethods[0]));
     Bind(env, "com/macapk/loader/NativeLog",   kNativeQos,

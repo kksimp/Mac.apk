@@ -17,6 +17,7 @@ import java.net.URL;
 import java.net.URLClassLoader;
 
 public class BaseDexClassLoader extends URLClassLoader {
+    private final DexPathList pathList;
 
     /** AOSP signature. dexPath is a colon-separated list of code paths;
      *  optimizedDirectory + librarySearchPath are advisory on a real device
@@ -24,6 +25,7 @@ public class BaseDexClassLoader extends URLClassLoader {
     public BaseDexClassLoader(String dexPath, File optimizedDirectory,
                               String librarySearchPath, ClassLoader parent) {
         super(buildUrls(dexPath), parent);
+        pathList = new DexPathList(this, super.getURLs());
         // ART searches a loader's JNI libraries in path-sorted order; see
         // ArtJniLibraryOrder. Before anything can load through this loader.
         ArtJniLibraryOrder.apply(this);
@@ -33,6 +35,7 @@ public class BaseDexClassLoader extends URLClassLoader {
      *  (AppClassLoader, the no-dex DexClassLoader path). */
     protected BaseDexClassLoader(URL[] urls, ClassLoader parent) {
         super(urls, parent);
+        pathList = new DexPathList(this, urls);
         ArtJniLibraryOrder.apply(this);
     }
 
@@ -130,7 +133,40 @@ public class BaseDexClassLoader extends URLClassLoader {
 
     @Override
     protected Class<?> findClass(String name) throws ClassNotFoundException {
-        return super.findClass(binaryName(name));
+        String binary = binaryName(name);
+        if (!macapkDexPathChanged()) return super.findClass(binary);
+        URL resource = pathList.findResource(binary.replace('.', '/') + ".class");
+        if (resource == null) throw new ClassNotFoundException(binary);
+        try (java.io.InputStream in = resource.openStream()) {
+            byte[] bytes = in.readAllBytes();
+            return macapkDefineDexFileClass(binary, bytes);
+        } catch (java.io.IOException ex) { throw new ClassNotFoundException(binary, ex); }
+    }
+
+    /** Reflective element replacement must affect lookup order, including removal. */
+    protected final boolean macapkDexPathChanged() {
+        return pathList != null && pathList.changed();
+    }
+
+    protected final void macapkAddInitialResources(URL[] resources) {
+        pathList.addInitialResources(resources);
+    }
+
+    @Override public URL findResource(String name) {
+        return macapkDexPathChanged() ? pathList.findResource(name) : super.findResource(name);
+    }
+
+    @Override public java.util.Enumeration<URL> findResources(String name) throws java.io.IOException {
+        return macapkDexPathChanged() ? pathList.findResources(name) : super.findResources(name);
+    }
+
+    @Override protected void addURL(URL url) {
+        super.addURL(url);
+        if (pathList != null) pathList.addURL(url);
+    }
+
+    @Override public void close() throws java.io.IOException {
+        try { super.close(); } finally { pathList.close(); }
     }
 
     /** DexFile.loadClass(name, loader) entry point: define {@code binaryName}
@@ -256,6 +292,7 @@ public class BaseDexClassLoader extends URLClassLoader {
     /** The open half of {@link #macapkOpenNow}: force every jar open. */
     final void macapkOpen() {
         super.findResource("META-INF/MACAPK-OPEN-NOW");
+        pathList.open();
     }
 
     /** The release half of {@link #macapkOpenNow}: unlink this loader's

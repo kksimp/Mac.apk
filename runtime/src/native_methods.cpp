@@ -12,6 +12,7 @@
 #include "macapk/cocoa_bridge.h"
 #include "macapk/self_capture.h"   // SelfCaptureGlWanted
 #include "macapk/gles_bridge.h"
+#include "macapk/user_verification_bridge.h"
 
 #include <atomic>
 #include <cstdint>
@@ -4500,6 +4501,7 @@ void RegisterAllNativeMethods(JNIEnv* env) {
     sqlite::RegisterNativeSqliteMethods(env);
     osnative::RegisterNativeOsMethods(env);
     audio::RegisterNativeAudioMethods(env);
+    RegisterUserVerificationNativeMethods(env);
     audioin::RegisterAudioInputMethods(env);
     media::RegisterNativeMediaMethods(env);
     video::RegisterNativeVideoMethods(env);

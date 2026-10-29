@@ -1,7 +1,6 @@
 // android.hardware.biometrics.BiometricPrompt -- the system biometric
-// auth dialog. Mac.apk has no biometric hardware, so authenticate()
-// immediately reports onAuthenticationError(BIOMETRIC_ERROR_HW_UNAVAILABLE)
-// on the supplied executor -- the honest "no biometric hardware" path.
+// auth dialog. The opt-in host bridge uses a real LocalAuthentication
+// challenge; unsupported Android strengths and unbound crypto operations fail.
 // The Builder + AuthenticationCallback + nested types must exist for
 // androidx.biometric and direct callers to compile. Error constant
 // values mirror AOSP BiometricConstants.
@@ -65,6 +64,9 @@ public class BiometricPrompt {
     private final int mLogoRes;
     private final int mAuthenticators;
     private final boolean mConfirmationRequired;
+    private final boolean mDeviceCredentialAllowed;
+    private final Executor mNegativeExecutor;
+    private final DialogInterface.OnClickListener mNegativeListener;
 
     private BiometricPrompt(Builder b) {
         mTitle = b.mTitle;
@@ -77,6 +79,9 @@ public class BiometricPrompt {
         mLogoRes = b.mLogoRes;
         mAuthenticators = b.mAuthenticators;
         mConfirmationRequired = b.mConfirmationRequired;
+        mDeviceCredentialAllowed = b.mDeviceCredentialAllowed;
+        mNegativeExecutor = b.mNegativeExecutor;
+        mNegativeListener = b.mNegativeListener;
     }
 
     /** AOSP :886. Declared @NonNull because build() refuses an empty title. */
@@ -105,23 +110,37 @@ public class BiometricPrompt {
 
     public void authenticate(CancellationSignal cancel, Executor executor,
             AuthenticationCallback callback) {
-        reportUnavailable(executor, callback);
+        authenticateInternal(null,cancel,executor,callback);
     }
-
     public void authenticate(CryptoObject crypto, CancellationSignal cancel,
             Executor executor, AuthenticationCallback callback) {
-        reportUnavailable(executor, callback);
+        java.util.Objects.requireNonNull(crypto,"crypto");
+        authenticateInternal(crypto,cancel,executor,callback);
     }
-
-    private void reportUnavailable(Executor executor, AuthenticationCallback callback) {
-        if (callback == null) return;
-        Runnable r = () -> {
-            try {
-                callback.onAuthenticationError(BIOMETRIC_ERROR_HW_NOT_PRESENT,
-                        "No biometric hardware");
-            } catch (Throwable ignored) {}
-        };
-        if (executor != null) executor.execute(r); else r.run();
+    private int effectiveAuthenticators(CryptoObject crypto){
+        // AOSP: explicit flags override the deprecated credential toggle;
+        // otherwise non-crypto defaults to WEAK and crypto defaults to STRONG.
+        if(mAuthenticators!=0)return mAuthenticators;
+        int mask=crypto==null?BiometricManager.Authenticators.BIOMETRIC_WEAK:BiometricManager.Authenticators.BIOMETRIC_STRONG;
+        return mDeviceCredentialAllowed?mask|BiometricManager.Authenticators.DEVICE_CREDENTIAL:mask;
+    }
+    private void authenticateInternal(CryptoObject crypto,CancellationSignal cancel,Executor executor,AuthenticationCallback callback){
+        java.util.Objects.requireNonNull(cancel,"cancel");java.util.Objects.requireNonNull(executor,"executor");java.util.Objects.requireNonNull(callback,"callback");
+        int mask=effectiveAuthenticators(crypto);
+        if(crypto!=null&&((mask&BiometricManager.Authenticators.BIOMETRIC_WEAK)&~BiometricManager.Authenticators.BIOMETRIC_STRONG)!=0)
+            throw new IllegalArgumentException("Only Strong biometrics supported with crypto");
+        Object operation=crypto==null?null:crypto.mCrypto;
+        String reason=mTitle==null?"验证您的身份":mTitle.toString();
+        if(mDescription!=null&&mDescription.length()!=0)reason+="："+mDescription;
+        com.macapk.loader.UserVerificationBridge.authenticate(mask,reason,operation,
+            mNegativeButtonText==null?null:mNegativeButtonText.toString(),cancel,executor,
+            (success,type,error,message)->{
+                if(success)callback.onAuthenticationSucceeded(new AuthenticationResult(crypto,type));
+                else if(error==BIOMETRIC_ERROR_NEGATIVE_BUTTON&&mNegativeListener!=null){
+                    Executor negative=mNegativeExecutor==null?executor:mNegativeExecutor;
+                    negative.execute(()->mNegativeListener.onClick(null,DialogInterface.BUTTON_NEGATIVE));
+                }else callback.onAuthenticationError(error,message);
+            });
     }
 
     // AOSP-conformance (framework_lint vs android-30 stub jar): AOSP does not
@@ -213,8 +232,8 @@ public class BiometricPrompt {
          * caller always needs a real title.
          */
         public BiometricPrompt build() {
-            final boolean willShowDeviceCredentialButton = mDeviceCredentialAllowed
-                    || (mAuthenticators & BiometricManager.Authenticators.DEVICE_CREDENTIAL) != 0;
+            final boolean willShowDeviceCredentialButton = mAuthenticators==0?mDeviceCredentialAllowed
+                    : (mAuthenticators & BiometricManager.Authenticators.DEVICE_CREDENTIAL) != 0;
 
             if (mTitle == null || mTitle.length() == 0) {
                 throw new IllegalArgumentException("Title must be set and non-empty");

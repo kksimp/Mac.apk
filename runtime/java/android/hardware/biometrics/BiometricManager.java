@@ -1,6 +1,6 @@
 // android.hardware.biometrics.BiometricManager -- queries whether the
-// device can do biometric auth. Mac.apk has no biometric hardware, so
-// canAuthenticate reports BIOMETRIC_ERROR_NO_HARDWARE. The Authenticators
+// device can do biometric auth. The opt-in LocalAuthentication bridge
+// queries real host capability and refuses to claim Android Class-3 strength. The Authenticators
 // flag constants must exist for callers (and androidx.biometric) to
 // compile. Values mirror AOSP.
 package android.hardware.biometrics;
@@ -26,8 +26,8 @@ public class BiometricManager {
 
     public BiometricManager() {}
 
-    public int canAuthenticate() { return BIOMETRIC_ERROR_NO_HARDWARE; }
-    public int canAuthenticate(int authenticators) { return BIOMETRIC_ERROR_NO_HARDWARE; }
+    public int canAuthenticate() { return canAuthenticate(Authenticators.BIOMETRIC_WEAK); }
+    public int canAuthenticate(int authenticators) { return com.macapk.loader.UserVerificationBridge.canAuthenticate(authenticators); }
 
     /**
      * AOSP BiometricManager.java:778 getLastAuthenticationTime(int) -- when did
@@ -54,7 +54,7 @@ public class BiometricManager {
             throw new IllegalArgumentException(
                     "Only BIOMETRIC_STRONG and DEVICE_CREDENTIAL authenticators may be used.");
         }
-        return BIOMETRIC_NO_AUTHENTICATION;
+        return com.macapk.loader.UserVerificationBridge.lastAuthenticationTime(authenticators);
     }
 
     /** AOSP :565. Declared @NonNull, so a Strings object is always returned;
@@ -83,9 +83,15 @@ public class BiometricManager {
             mAuthenticators = authenticators;
         }
 
-        public CharSequence getButtonLabel() { return null; }
-        public CharSequence getPromptMessage() { return null; }
-        public CharSequence getSettingName() { return null; }
+        public CharSequence getButtonLabel() { return label(); }
+        public CharSequence getPromptMessage() { return label(); }
+        public CharSequence getSettingName() { return label(); }
+        private CharSequence label() {
+            if(com.macapk.loader.UserVerificationBridge.canAuthenticate(mAuthenticators)!=0)return null;
+            if((mAuthenticators & Authenticators.BIOMETRIC_WEAK)==Authenticators.BIOMETRIC_WEAK
+                    && com.macapk.loader.UserVerificationBridge.canAuthenticate(Authenticators.BIOMETRIC_WEAK)==0)return "使用 Touch ID";
+            return "使用 Mac 密码";
+        }
     }
 
     // KIND: an INTERFACE, not a final class. AOSP declares

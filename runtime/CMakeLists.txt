@@ -165,6 +165,7 @@ set(MACAPK_RUNTIME_SOURCES
     src/photos_bridge.mm
     src/document_picker.mm
     src/gms_signin.mm
+    src/user_verification_bridge.mm
     src/media_decode.mm
     # Ogg Vorbis decode for MediaCodec ("audio/vorbis"), reusing the
     # stb_vorbis.c already vendored below via a small synthetic-Ogg-page
@@ -205,6 +206,8 @@ set_source_files_properties(src/document_picker.mm PROPERTIES
 # photos_bridge.mm: PhotoKit completion handlers capture state across threads.
 set_source_files_properties(src/photos_bridge.mm PROPERTIES
     COMPILE_OPTIONS "-fobjc-arc")
+set_source_files_properties(src/user_verification_bridge.mm
+    PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 # video_caps_probe.mm: the host-probed MediaCodecInfo profile/level table;
 # ARC because the offline gate debug/vtcaps_gate.sh builds it standalone the
 # same way.
@@ -398,6 +401,8 @@ target_link_libraries(macapk-runtime PRIVATE
     "-framework CoreText"
     "-framework AVFAudio"
     "-framework AudioToolbox"
+    "-framework LocalAuthentication"
+    "-framework Security"
     # AudioConvertHostTimeToNanos (AudioTrack.getTimestamp()'s clock source,
     # audio_backend.mm) is exported by CoreAudio.framework specifically --
     # verified via the SDK's .tbd export lists, it is NOT re-exported by

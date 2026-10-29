@@ -39,35 +39,36 @@ import javax.crypto.spec.SecretKeySpec;
 //     would brick every encrypted pref file on the second launch);
 //   - deleting the app's data dir removes the keys together with the
 //     ciphertext they protect (the Android uninstall analogue).
-// What it does NOT preserve is hardware-backed non-extractability; the
-// returned keys are plain SecretKeySpec objects so the stock JCE
-// providers can operate on them (which is precisely what lets Tink's
-// AndroidKeystoreAesGcm Cipher.getInstance("AES/GCM/NoPadding") work
-// without an Android keymaster-routing Cipher provider).
+// Hardware-backed non-extractability is not provided. AES and new
+// authentication-bound private keys have opaque API handles; their guarded
+// software cipher/signature routes consult native OS authorization. Legacy
+// unrestricted RSA/EC and HMAC retain their previous JCE representations.
 //
 // All public methods are synchronized on the singleton: JCE hands out a
 // fresh KeyStoreSpi per KeyStore.getInstance and the EOS/Tink path uses
 // several concurrently.
 final class MacApkKeyStoreBackend {
     private static final int MAGIC = 0x4D414B53;   // "MAKS"
-    private static final int VERSION = 1;
-    // Key PAIRS live in a SEPARATE file with its own magic/version. Deliberate:
-    // keys.dat already holds every app's AES/HMAC material -- most importantly
-    // the EncryptedSharedPreferences master key that wraps a Tink keyset -- and
-    // widening its record format would force a version bump whose mismatch path
-    // DISCARDS the file. Bricking every encrypted pref file is not an acceptable
-    // price for adding a feature next to it, so key pairs get their own store.
+    // Version 2 embeds authorization beside each key. Version 1 remains readable;
+    // no authentication policy can be reconstructed for those legacy records.
+    private static final int VERSION = 2;
+    // Pair and symmetric stores each retain their original V1 reader. V2 adds
+    // policy/generation inline so a detached or missing sidecar cannot silently
+    // turn an authentication-bound key into an unrestricted key on restart.
     private static final int PAIR_MAGIC = 0x4D414B50;   // "MAKP"
-    private static final int PAIR_VERSION = 1;
+    private static final int PAIR_VERSION = 2;
 
     private static final class Entry {
         final String algorithm;
         final byte[] key;
         final long created;
-        Entry(String algorithm, byte[] key, long created) {
+        final String generation;
+        final AndroidKeyStoreAuthPolicy policy;
+        Entry(String algorithm, byte[] key, long created, String generation, AndroidKeyStoreAuthPolicy policy) {
             this.algorithm = algorithm;
             this.key = key;
             this.created = created;
+            this.generation = generation; this.policy = policy;
         }
     }
 
@@ -78,16 +79,20 @@ final class MacApkKeyStoreBackend {
         final byte[] pkcs8;
         final byte[] certDer;
         final long created;
-        PairEntry(String algorithm, byte[] pkcs8, byte[] certDer, long created) {
+        final String generation;
+        final AndroidKeyStoreAuthPolicy policy;
+        PairEntry(String algorithm, byte[] pkcs8, byte[] certDer, long created, String generation, AndroidKeyStoreAuthPolicy policy) {
             this.algorithm = algorithm;
             this.pkcs8 = pkcs8;
             this.certDer = certDer;
             this.created = created;
+            this.generation = generation; this.policy = policy;
         }
     }
 
     private final Map<String, PairEntry> pairs = new LinkedHashMap<>();
     private boolean pairsLoaded = false;
+    private boolean pairsLoadFailed = false;
 
     private static final MacApkKeyStoreBackend INSTANCE =
         new MacApkKeyStoreBackend();
@@ -95,6 +100,7 @@ final class MacApkKeyStoreBackend {
 
     private final Map<String, Entry> entries = new LinkedHashMap<>();
     private boolean loaded = false;
+    private boolean loadFailed = false;
     private boolean warnedUnconfigured = false;
 
     private MacApkKeyStoreBackend() {}
@@ -124,27 +130,39 @@ final class MacApkKeyStoreBackend {
         if (f == null || !f.isFile()) return;
         try (FileInputStream fis = new FileInputStream(f);
              DataInputStream in = new DataInputStream(fis)) {
-            if (in.readInt() != PAIR_MAGIC || in.readInt() != PAIR_VERSION) return;
+            if (in.readInt() != PAIR_MAGIC) throw new IOException("Invalid key-pair format");
+            int version = in.readInt();
+            if (version != 1 && version != PAIR_VERSION) throw new IOException("Unknown key-pair format");
             int n = in.readInt();
+            if(n<0 || n>(f.length()-12)/20)throw new IOException("Invalid key-pair record count");
             for (int i = 0; i < n; i++) {
                 String alias = in.readUTF();
                 String alg = in.readUTF();
                 long created = in.readLong();
-                byte[] pk = new byte[in.readInt()]; in.readFully(pk);
-                byte[] cert = new byte[in.readInt()]; in.readFully(cert);
-                pairs.put(alias, new PairEntry(alg, pk, cert, created));
+                int pkLength=in.readInt();
+                if(pkLength<=0 || pkLength>(1<<20) || pkLength>in.available())throw new IOException("Invalid private-key length");
+                byte[] pk = new byte[pkLength]; in.readFully(pk);
+                int certLength=in.readInt();
+                if(certLength<=0 || certLength>(1<<20) || certLength>in.available())throw new IOException("Invalid certificate length");
+                byte[] cert = new byte[certLength]; in.readFully(cert);
+                String generation = version >= 2 ? in.readUTF() : java.util.UUID.randomUUID().toString();
+                AndroidKeyStoreAuthPolicy policy = version >= 2 ? AndroidKeyStoreAuthPolicy.read(in) : AndroidKeyStoreAuthPolicy.NONE;
+                if(pairs.put(alias, new PairEntry(alg, pk, cert, created, generation, policy))!=null)
+                    throw new IOException("Duplicate key-pair alias");
             }
+            if(in.read()!=-1)throw new IOException("Trailing key-pair data");
         } catch (IOException e) {
             System.err.println("[AndroidKeyStore] failed to read " + f + ": " + e);
             pairs.clear();
+            pairsLoadFailed = true;
         }
     }
 
-    private void persistPairs() {
+    private boolean persistPairs() {
         File f = pairStorageFile();
-        if (f == null) return;
+        if (f == null) return false;
         File dir = f.getParentFile();
-        if (!dir.isDirectory() && !dir.mkdirs()) return;
+        if (!dir.isDirectory() && !dir.mkdirs()) return false;
         restrictPermissions(dir, true);
         File tmp = new File(dir, "keypairs.dat.tmp");
         try {
@@ -160,6 +178,7 @@ final class MacApkKeyStoreBackend {
                     out.writeLong(p.created);
                     out.writeInt(p.pkcs8.length);   out.write(p.pkcs8);
                     out.writeInt(p.certDer.length); out.write(p.certDer);
+                    out.writeUTF(p.generation); p.policy.write(out);
                 }
                 out.flush();
                 fos.getFD().sync();
@@ -169,18 +188,24 @@ final class MacApkKeyStoreBackend {
                 Files.move(tmp.toPath(), f.toPath(),
                     java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             }
+            return true;
         } catch (IOException e) {
             System.err.println("[AndroidKeyStore] failed to write " + f + ": " + e);
             tmp.delete();
+            return false;
         }
     }
 
     synchronized void putKeyPair(String alias, String algorithm,
-                                 byte[] pkcs8, byte[] certDer) {
+                                 byte[] pkcs8, byte[] certDer, AndroidKeyStoreAuthPolicy policy) {
         ensurePairsLoaded();
-        pairs.put(alias, new PairEntry(algorithm, pkcs8.clone(), certDer.clone(),
-                                       System.currentTimeMillis()));
-        persistPairs();
+        if (pairsLoadFailed) throw new java.security.ProviderException("Refusing to overwrite an unreadable key-pair store");
+        PairEntry previous = pairs.put(alias, new PairEntry(algorithm, pkcs8.clone(), certDer.clone(),
+                                       System.currentTimeMillis(), java.util.UUID.randomUUID().toString(), policy));
+        if (!persistPairs() && policy.required) {
+            if (previous == null) pairs.remove(alias); else pairs.put(alias, previous);
+            throw new java.security.ProviderException("Authentication-bound key policy could not be persisted");
+        }
     }
 
     synchronized boolean containsPair(String alias) {
@@ -193,8 +218,9 @@ final class MacApkKeyStoreBackend {
         PairEntry p = pairs.get(alias);
         if (p == null) return null;
         try {
-            return KeyFactory.getInstance(p.algorithm)
+            PrivateKey material = KeyFactory.getInstance(p.algorithm)
                 .generatePrivate(new PKCS8EncodedKeySpec(p.pkcs8));
+            return p.policy.required ? new AndroidKeyStorePrivateKey(alias, p.generation, p.algorithm, material, p.policy) : material;
         } catch (Exception e) {
             System.err.println("[AndroidKeyStore] cannot rebuild private key for "
                 + alias + ": " + e);
@@ -242,46 +268,48 @@ final class MacApkKeyStoreBackend {
         try (DataInputStream in =
                  new DataInputStream(new FileInputStream(f))) {
             if (in.readInt() != MAGIC) {
-                System.err.println("[AndroidKeyStore] " + f
-                    + ": bad magic, starting empty");
-                return;
+                throw new IOException("Invalid symmetric key-store format");
             }
             int ver = in.readInt();
-            if (ver != VERSION) {
-                System.err.println("[AndroidKeyStore] " + f
-                    + ": unknown version " + ver + ", starting empty");
-                return;
+            if (ver != 1 && ver != VERSION) {
+                throw new IOException("Unknown symmetric key-store version");
             }
             int count = in.readInt();
+            if(count<0 || count>(f.length()-12)/16)throw new IOException("Invalid symmetric key record count");
             for (int i = 0; i < count; i++) {
                 String alias = in.readUTF();
                 String algorithm = in.readUTF();
                 long created = in.readLong();
                 int len = in.readInt();
-                if (len < 0 || len > 1 << 20) {
+                if (len <= 0 || len > 1 << 20 || len>in.available()) {
                     throw new IOException("corrupt key length " + len);
                 }
                 byte[] key = new byte[len];
                 in.readFully(key);
-                entries.put(alias, new Entry(algorithm, key, created));
+                String generation = ver >= 2 ? in.readUTF() : java.util.UUID.randomUUID().toString();
+                AndroidKeyStoreAuthPolicy policy = ver >= 2 ? AndroidKeyStoreAuthPolicy.read(in) : AndroidKeyStoreAuthPolicy.NONE;
+                if(entries.put(alias, new Entry(algorithm, key, created, generation, policy))!=null)
+                    throw new IOException("Duplicate symmetric key alias");
             }
+            if(in.read()!=-1)throw new IOException("Trailing symmetric key data");
         } catch (IOException e) {
             System.err.println("[AndroidKeyStore] failed to read " + f
                 + ": " + e + "; starting empty");
             entries.clear();
+            loadFailed = true;
         }
     }
 
     // Atomic persist: write to a temp sibling, fsync, rename over. Owner-only
     // permissions on both the directory and the file (the Android analogue:
     // keystore blobs are not readable by other uids).
-    private void persist() {
+    private boolean persist() {
         File f = storageFile();
-        if (f == null) return;
+        if (f == null) return false;
         File dir = f.getParentFile();
         if (!dir.isDirectory() && !dir.mkdirs()) {
             System.err.println("[AndroidKeyStore] cannot create " + dir);
-            return;
+            return false;
         }
         restrictPermissions(dir, true);
         File tmp = new File(dir, "keys.dat.tmp");
@@ -297,6 +325,7 @@ final class MacApkKeyStoreBackend {
                     out.writeLong(e.getValue().created);
                     out.writeInt(e.getValue().key.length);
                     out.write(e.getValue().key);
+                    out.writeUTF(e.getValue().generation); e.getValue().policy.write(out);
                 }
                 out.flush();
                 fos.getFD().sync();
@@ -306,10 +335,12 @@ final class MacApkKeyStoreBackend {
                 Files.move(tmp.toPath(), f.toPath(),
                     java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             }
+            return true;
         } catch (IOException e) {
             System.err.println("[AndroidKeyStore] failed to write " + f
                 + ": " + e);
             tmp.delete();
+            return false;
         }
     }
 
@@ -337,7 +368,17 @@ final class MacApkKeyStoreBackend {
         ensureLoaded();
         Entry e = entries.get(alias);
         if (e == null) return null;
+        if ("AES".equalsIgnoreCase(e.algorithm)) return new AndroidKeyStoreAesKey(alias, e.generation, e.key, e.policy);
+        if (e.policy.required) throw new java.security.ProviderException("Unsupported authenticated secret-key algorithm");
         return new SecretKeySpec(e.key.clone(), e.algorithm);
+    }
+
+    synchronized void checkGeneration(String alias, String generation) throws java.security.InvalidKeyException {
+        ensureLoaded(); ensurePairsLoaded();
+        Entry symmetric = entries.get(alias); PairEntry asymmetric = pairs.get(alias);
+        if ((symmetric == null || !symmetric.generation.equals(generation))
+                && (asymmetric == null || !asymmetric.generation.equals(generation)))
+            throw new java.security.InvalidKeyException("Keystore key was replaced or deleted");
     }
 
     synchronized Date getCreationDate(String alias) {
@@ -348,10 +389,18 @@ final class MacApkKeyStoreBackend {
     }
 
     synchronized void putKey(String alias, String algorithm, byte[] key) {
+        putKey(alias, algorithm, key, AndroidKeyStoreAuthPolicy.NONE);
+    }
+
+    synchronized void putKey(String alias, String algorithm, byte[] key, AndroidKeyStoreAuthPolicy policy) {
         ensureLoaded();
-        entries.put(alias,
-            new Entry(algorithm, key.clone(), System.currentTimeMillis()));
-        persist();
+        if (loadFailed) throw new java.security.ProviderException("Refusing to overwrite an unreadable symmetric key store");
+        Entry previous = entries.put(alias,
+            new Entry(algorithm, key.clone(), System.currentTimeMillis(), java.util.UUID.randomUUID().toString(), policy));
+        if (!persist() && policy.required) {
+            if (previous == null) entries.remove(alias); else entries.put(alias, previous);
+            throw new java.security.ProviderException("Authentication-bound key policy could not be persisted");
+        }
     }
 
     synchronized void deleteEntry(String alias) {

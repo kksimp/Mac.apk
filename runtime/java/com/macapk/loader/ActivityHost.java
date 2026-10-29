@@ -2284,6 +2284,9 @@ public final class ActivityHost {
         if (act.kind == HostAction.Kind.APP_DETAILS) {
             return SpecialAccessHandler.handleAppDetails(intent, real, hostCover(true));
         }
+        if (act.kind == HostAction.Kind.DEVICE_CREDENTIAL) {
+            return DeviceCredentialHandler.handle(intent, real, hostCover(false));
+        }
         // DocumentsUI's picker: a full-screen activity on a device, so the
         // caller is paused AND stopped while it is up; the pick is the user's
         // own act inside the panel, so no recency gate applies.
@@ -2443,7 +2446,10 @@ public final class ActivityHost {
              *  CREATE_DOCUMENT): DocumentPickerHandler shows the macOS open/save
              *  panel and answers with HostDocumentsProvider URIs. v1.0.1653,
              *  MACAPK_DOC_PICKER. */
-            DOCUMENT_PICKER
+            DOCUMENT_PICKER,
+            /** Real macOS password verification for Android Keyguard's
+             * confirm-device-credential activity. */
+            DEVICE_CREDENTIAL
         }
         final Kind kind;
         final String url;
@@ -2558,6 +2564,9 @@ public final class ActivityHost {
         // MACAPK_APP_DETAILS_SETTINGS=0.
         if (SpecialAccessHandler.isAppDetailsIntent(intent)) {
             return new HostAction(HostAction.Kind.APP_DETAILS, null);
+        }
+        if (DeviceCredentialHandler.isCredentialIntent(intent)) {
+            return new HostAction(HostAction.Kind.DEVICE_CREDENTIAL, null);
         }
         // ACTION_SEND of TEXT -- matched on action + MIME type ONLY. See the
         // header for why reading EXTRA_TEXT here was the wrong question.
@@ -2772,6 +2781,10 @@ public final class ActivityHost {
         final ComponentName cn = intent.getComponent();
         if (cn != null) {
             final String pkg = cn.getPackageName();
+            // A caller may pin the exact Settings component returned by our
+            // resolver. It performs the same real host check as the implicit
+            // Keyguard intent, before cross-app resolution is considered.
+            if (DeviceCredentialHandler.isCredentialIntent(intent) && resolveImplicitToHost(intent)) return null;
             if (own == null || own.equals(pkg)) return intent;
             // The platform package installer, pinned by the caller (a store
             // picks InstallStart out of queryIntentActivities and setClassName()s
@@ -2975,6 +2988,8 @@ public final class ActivityHost {
             // and an IntentSender pairing names none. Re-key it to what is launched.
             android.app.Activity.macapkBindPendingResult(intent, routed);
             intent = routed;
+        } else if (DeviceCredentialHandler.isCredentialIntent(intent) && resolveImplicitToHost(intent)) {
+            return;
         } else if (intent.getComponent() == null) {
             // v1.0.690: an IMPLICIT intent (no explicit component). On a device
             // this resolves against installed apps' intent filters. Mac.apk has

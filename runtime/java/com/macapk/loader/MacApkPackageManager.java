@@ -2873,6 +2873,10 @@ public final class MacApkPackageManager extends PackageManager {
         // selector (see macapkIntentSelector).
         final String resolvedType = macapkResolvedType(intent);
         ComponentName explicit = query.getComponent();
+        if (explicit != null && DeviceCredentialHandler.isCredentialIntent(query)) {
+            out.add(DeviceCredentialHandler.resolveInfo());
+            return out;
+        }
         if (scope && explicit != null && !packageName.equals(explicit.getPackageName())) {
             // getActivityInfo(comp) for a package that is not installed is null
             // (ComputerEngine.java:527-528), so the list stays empty. The class
@@ -3055,6 +3059,8 @@ public final class MacApkPackageManager extends PackageManager {
                         ? SpecialAccessHandler.settingsResolveInfo(hostQuery)
                         : act.kind == ActivityHost.HostAction.Kind.APP_DETAILS
                         ? SpecialAccessHandler.appDetailsResolveInfo()
+                        : act.kind == ActivityHost.HostAction.Kind.DEVICE_CREDENTIAL
+                        ? DeviceCredentialHandler.resolveInfo()
                         : act.kind == ActivityHost.HostAction.Kind.DOCUMENT_PICKER
                         ? macapkDocumentsUiResolveInfo(hostQuery)
                         : act.kind == ActivityHost.HostAction.Kind.INSTALL_PACKAGE

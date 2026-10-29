@@ -77,6 +77,8 @@ public class AndroidKeyStoreKeyFactorySpi extends java.security.KeyFactorySpi {
         if (keySpecClass.isAssignableFrom(KeyInfo.class)) {
             return (T) keyInfoFor(key);
         }
+        if (key instanceof AndroidKeyStoreProtectedKey)
+            throw new java.security.spec.InvalidKeySpecException("Keystore secret material is not exportable");
         // Not a KeyInfo request: this is ordinary key translation, so hand it to
         // the JDK factory for this algorithm rather than reimplementing it.
         try {
@@ -93,11 +95,10 @@ public class AndroidKeyStoreKeyFactorySpi extends java.security.KeyFactorySpi {
      * software-backed key on this host.
      */
     private KeyInfo keyInfoFor(java.security.Key key) {
-        // AOSP fills the alias from the keystore's own record for the key. We do
-        // not carry a key->alias index, and the alias is informational: every
-        // security-relevant field below is identical either way, and returning a
-        // truthful KeyInfo is strictly more useful to the caller than an
-        // exception. So report it as empty rather than guessing.
+        if (key instanceof AndroidKeyStoreProtectedKey handle)
+            return handle.policy().info(handle.alias(), handle.bits());
+        // Legacy raw keys have no key-to-alias index. New protected handles
+        // returned above carry their actual alias and persisted policy.
         final String alias = "";
         int keySize = keySizeOf(key);
         return new KeyInfo(

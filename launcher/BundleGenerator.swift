@@ -300,7 +300,10 @@ enum BundleGenerator {
            let v = sanitizedLabel(versionName) {
             desired = "\(clean) \(v)"
         }
-        if usableLabel != nil { desired = apkSafeDirName(desired) }
+        if usableLabel != nil {
+            desired = apkSafeDirName(desired)
+            if desired.isEmpty { desired = apkSafeDirName(package) }
+        }
         // The pre-rename executable name, read from Info.plist rather than by
         // listing Contents/MacOS: a `.DS_Store` (or any stray file) appearing
         // during the minutes-long extraction window sorted FIRST in the old
@@ -590,6 +593,21 @@ enum BundleGenerator {
         var s = name.replacingOccurrences(of: ".apk", with: " apk",
                                           options: .caseInsensitive)
         s = s.replacingOccurrences(of: "[ ()]+", with: "-",
+                                   options: .regularExpression)
+        // Anything a file: URL percent-encodes breaks the same class of guest
+        // code a third way: code that looks a local page up by its RAW path
+        // while WebView.getUrl() hands back the percent-encoded spec (Chromium
+        // GURL encodes every non-ASCII byte, as on AOSP). Measured 2026-10-26
+        // on 三國志·戰略版（港澳版） (com.qookkagame.sgzzlb.hkmo): ejoysdk's
+        // BrowserInjection keys the login page's startup data by
+        // "/Applications/三國志·戰略版（港澳版）.app/.../index.html", the page's
+        // URL arrives as "/Applications/%E4%B8%89%E5%9C%8B...", the lookup
+        // misses, the page gets {} and its sign-in screen throws on
+        // pkg_info.country. Real Android data paths are plain ASCII
+        // (/data/user/0/<pkg>), so keep only RFC 3986 unreserved characters.
+        // A label with none left (all CJK, say) becomes "" and the callers
+        // fall back to the package name.
+        s = s.replacingOccurrences(of: "[^A-Za-z0-9._~-]+", with: "-",
                                    options: .regularExpression)
         while s.hasPrefix("-") { s.removeFirst() }
         while s.hasSuffix("-") { s.removeLast() }

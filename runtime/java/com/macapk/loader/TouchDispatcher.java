@@ -2570,6 +2570,25 @@ public final class TouchDispatcher {
      *  thread), so touchEvent builds mouse events for it. */
     private static volatile HostMouseState s_deliveringMouse;
 
+    // A window whose input queue was TAKEN (NativeActivity: every Unreal
+    // GameActivity) reads raw events with AMotionEvent_*, and the engine, not a
+    // view tree, decides what a SOURCE_MOUSE event means. Unreal 4's
+    // LaunchAndroid.cpp HandleInputCB sends any (source & SOURCE_MOUSE) event
+    // to its mouse branch and, with GAndroidEnableMouse off (the Android
+    // default), maps only gamepad "alternate mouse keys" and returns 1
+    // (handled) -- so the click never reaches its touch path, and handled=1 also
+    // skips our unhandled-event fallback. Measured on Rocket League Sideswipe
+    // 1.12.5 (libUE4.so 0x2dabaa4): every click since v1.0.2301 was swallowed.
+    // So a host press-drag-release on such a window stays a touchscreen finger,
+    // as it was before MACAPK_MOUSE_POINTER; the wheel keeps its SOURCE_MOUSE
+    // ACTION_SCROLL (dispatchWheel), which engines read by axis.
+    // MACAPK_NATIVE_QUEUE_MOUSE=1 sends the CursorInputMapper stream there too.
+    static final boolean NATIVE_QUEUE_MOUSE = "1".equals(System.getenv("MACAPK_NATIVE_QUEUE_MOUSE"));
+    /** Whether the host stream in progress goes out as a finger. Latched while
+     *  no pointer button is down, so one press-drag-release never changes form
+     *  midway (AppKit thread). */
+    private static boolean s_hostAsFinger;
+
     /** What CursorInputMapper builds for one main/hover event: one pointer,
      *  TOOL_TYPE_MOUSE, SOURCE_MOUSE, pressure 1 while a button is down. Device
      *  id 0, like the wheel step: no mouse InputDevice is registered. */
@@ -2595,10 +2614,16 @@ public final class TouchDispatcher {
      *  numbers map onto 1:1), the meta state, and the pointer in view points. */
     public void dispatchHostMouse(int buttonState, int metaState, float x, float y,
                                   float viewW, float viewH) {
-        if (!MOUSE_POINTER) {
-            // The pre-change path (the native side normally never calls in under
-            // =0; this keeps the Java entry honest for the gate's control arm):
-            // the primary button as a touchscreen finger, every other button dropped.
+        if ((s_hostMouseButtons & POINTER_DOWN_BUTTONS) == 0) {
+            s_hostAsFinger = !MOUSE_POINTER
+                    || (!NATIVE_QUEUE_MOUSE && hasTakenInputQueue(ActivityHost.peek()));
+        }
+        if (s_hostAsFinger) {
+            // The pre-change path, for a taken native input queue (above) and
+            // under MACAPK_MOUSE_POINTER=0 (the native side normally never calls
+            // in then; this keeps the Java entry honest for the gate's control
+            // arm): the primary button as a touchscreen finger, every other
+            // button dropped, and no hover.
             final int lastP = s_hostMouseButtons & MotionEvent.BUTTON_PRIMARY;
             s_hostMouseButtons = buttonState;
             final int nowP = buttonState & MotionEvent.BUTTON_PRIMARY;

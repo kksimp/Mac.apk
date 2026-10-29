@@ -25,7 +25,7 @@ namespace macapk {
 // Reconcile every native-lib directory under `<app_dir>/_apkt/lib/`.
 //
 // DEFAULT ON since v1.0.844: each ELF executable found is moved to
-//   `<libdir>/.macapk-elfexec/<name>` and replaced by a copy of
+//   `<libroot>/.macapk-elfexec/<abi>/<name>` and replaced by a copy of
 //   `<bin_dir>/macapk-elfexec`, mode 0755. This matches the platform -- real
 //   Android extracts these files, chmods them 0755 and lets the app fork them
 //   -- so it must NOT require an env var. An app shipping a helper binary

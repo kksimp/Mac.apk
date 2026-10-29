@@ -4,6 +4,7 @@ import android.content.ContentResolver;
 import android.content.res.AssetFileDescriptor;
 import android.content.res.AssetManager;
 import android.content.res.Resources;
+import android.graphics.drawable.AnimatedImageDrawable;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.net.Uri;
@@ -198,9 +199,16 @@ public final class ImageDecoder implements AutoCloseable {
 
     public static Drawable decodeDrawable(Source src, OnHeaderDecodedListener listener)
             throws IOException {
-        Bitmap bm = decodeBitmap(src, listener);
-        Source s = src;
-        return new BitmapDrawable(s != null ? s.getResources() : null, bm);
+        ImageDecoder dec = new ImageDecoder(src);
+        Bitmap bm = dec.doDecode(listener);
+        // AOSP returns AnimatedImageDrawable for multi-frame GIF/WebP; callers
+        // (e.g. ejoysdk LoadingDialogFragment) cast to it unconditionally.
+        if (dec.mInfo != null && dec.mInfo.isAnimated()) {
+            AnimatedImageDrawable aid = new AnimatedImageDrawable();
+            aid.macapkSetBitmap(bm);
+            return aid;
+        }
+        return new BitmapDrawable(src != null ? src.getResources() : null, bm);
     }
 
     public static ImageInfo decodeHeader(Source src) throws IOException {
@@ -239,8 +247,52 @@ public final class ImageDecoder implements AutoCloseable {
             opts.inJustDecodeBounds = true;
             BitmapFactory.decodeByteArray(mBytes, 0, mBytes.length, opts);
             mInfo = new ImageInfo(new Size(opts.outWidth, opts.outHeight),
-                    opts.outMimeType, false, ColorSpace.get(ColorSpace.Named.SRGB));
+                    opts.outMimeType, isAnimated(mBytes), ColorSpace.get(ColorSpace.Named.SRGB));
         }
+    }
+
+    /** True for a GIF with more than one image descriptor, or a WebP whose
+     *  VP8X header has the animation flag set. */
+    private static boolean isAnimated(byte[] b) {
+        if (b == null) return false;
+        if (b.length >= 13 && b[0] == 'G' && b[1] == 'I' && b[2] == 'F') {
+            int p = 13;
+            if ((b[10] & 0x80) != 0) p += 3 * (1 << ((b[10] & 0x07) + 1));
+            int frames = 0;
+            while (p < b.length) {
+                int tag = b[p] & 0xff;
+                if (tag == 0x2C) { // image descriptor
+                    if (++frames > 1) return true;
+                    if (p + 10 > b.length) return false;
+                    int flags = b[p + 9] & 0xff;
+                    p += 10;
+                    if ((flags & 0x80) != 0) p += 3 * (1 << ((flags & 0x07) + 1));
+                    p = skipGifSubBlocks(b, p + 1); // skip LZW min code size
+                } else if (tag == 0x21) { // extension
+                    p = skipGifSubBlocks(b, p + 2);
+                } else {
+                    return false; // trailer (0x3B) or garbage
+                }
+                if (p < 0) return false;
+            }
+            return false;
+        }
+        if (b.length >= 21 && b[0] == 'R' && b[1] == 'I' && b[2] == 'F' && b[3] == 'F'
+                && b[8] == 'W' && b[9] == 'E' && b[10] == 'B' && b[11] == 'P'
+                && b[12] == 'V' && b[13] == 'P' && b[14] == '8' && b[15] == 'X') {
+            return (b[20] & 0x02) != 0;
+        }
+        return false;
+    }
+
+    private static int skipGifSubBlocks(byte[] b, int p) {
+        while (p < b.length) {
+            int n = b[p] & 0xff;
+            p++;
+            if (n == 0) return p;
+            p += n;
+        }
+        return -1;
     }
 
     private Bitmap doDecode(OnHeaderDecodedListener listener) throws IOException {

@@ -650,7 +650,13 @@ public class FragmentManagerImpl extends FragmentManager implements LayoutInflat
         if (tag != null) f.macapkSetTag(tag);
         f.macapkSetAdded(true);
         added.add(f);
-        if (containerViewId != 0) fragmentContainerId.put(f, containerViewId);
+        if (containerViewId != 0) {
+            fragmentContainerId.put(f, containerViewId);
+            // AOSP BackStackRecord.doAddOp sets fragment.mContainerId here, i.e.
+            // before onCreate -- DialogFragment.onCreate reads it to decide
+            // whether it is embedded or shown as a dialog.
+            f.mContainerId = containerViewId;
+        }
         moveToState(f, curState);
     }
 

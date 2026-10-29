@@ -6,10 +6,12 @@
 // (extends Fragment implements DialogInterface.OnCancelListener,
 // DialogInterface.OnDismissListener). We mirror the public surface:
 // onCreateDialog, show/dismiss, the STYLE_* constants, and the dialog
-// accessors. The dialog itself uses our non-rendering android.app.Dialog,
-// so callback chains (onCancel/onDismiss) still fire.
+// accessors, and AOSP's lifecycle: the dialog is created in
+// onGetLayoutInflater, filled with the fragment's view in onActivityCreated,
+// shown in onStart, hidden in onStop and dismissed in onDestroyView.
 package android.app;
 
+import android.content.Context;
 import android.content.DialogInterface;
 import android.os.Bundle;
 import android.view.LayoutInflater;
@@ -37,79 +39,137 @@ public class DialogFragment extends Fragment
 
     public void setStyle(int style, int theme) { mStyle = style; if (theme != 0) mTheme = theme; }
 
-    /** AOSP show(FragmentManager,String): "adds the fragment to the given
-     *  FragmentManager" via a real transaction (`ft.add(this, tag);
-     *  ft.commit();`), so isAdded()/getFragmentManager() are correct for
-     *  the fragment's whole visible lifetime. Our FragmentManagerImpl
-     *  (runtime/java/android/app/FragmentManagerImpl.java) DOES run a real
-     *  add-transaction (onAttach/onCreate/... through the host's current
-     *  lifecycle state), unlike the previous version of this method which
-     *  discarded `manager` entirely -- see showNow() below. */
+    /** AOSP show(FragmentManager,String): only "adds the fragment to the
+     *  given FragmentManager" (`ft.add(this, tag); ft.commit();`). The
+     *  Dialog itself is created, filled and shown by the fragment lifecycle
+     *  (onGetLayoutInflater / onActivityCreated / onStart below), exactly as
+     *  in AOSP -- which is what makes apps that bypass show() and commit
+     *  their own add(fragment, tag) transaction (ejoysdk's
+     *  BrowserDialogFragment.show does this) get a visible dialog too. */
     public void show(FragmentManager manager, String tag) {
         mDismissed = false;
         mShownByMe = true;
-        showNow(manager, tag);
+        FragmentTransaction ft = manager.beginTransaction();
+        ft.add(this, tag);
+        ft.commit();
     }
     public int show(FragmentTransaction transaction, String tag) {
         mDismissed = false;
         mShownByMe = true;
-        boolean registered = false;
-        if (transaction != null) {
-            try {
-                transaction.add(this, tag);
-                registered = true;
-            } catch (Throwable ignored) {}
-        }
-        createAndShowDialog(registered);
-        if (transaction != null) {
-            try { return transaction.commit(); } catch (Throwable ignored) {}
-        }
-        return -1;
+        transaction.add(this, tag);
+        mViewDestroyed = false;
+        return transaction.commit();
     }
-    /** Registers this fragment with `manager` (so isAdded()/
-     *  getFragmentManager() become correct, matching real AOSP show()),
-     *  then builds and displays the actual Dialog. commitNow() is used
-     *  (synchronous) rather than AOSP's async commit() so isAdded() is
-     *  already true by the time this method returns -- a deliberate,
-     *  disclosed deviation from AOSP's exact transaction timing, chosen
-     *  because app code commonly checks isAdded() right after calling
-     *  show(). */
     public void showNow(FragmentManager manager, String tag) {
-        boolean registered = false;
-        if (manager != null) {
-            try {
-                manager.beginTransaction().add(this, tag).commitNow();
-                registered = true;
-            } catch (Throwable ignored) {}
-        }
-        createAndShowDialog(registered);
+        mDismissed = false;
+        mShownByMe = true;
+        FragmentTransaction ft = manager.beginTransaction();
+        ft.add(this, tag);
+        ft.commitNow();
     }
 
-    /** Builds and displays this fragment's Dialog. AOSP drives this via
-     *  the DialogFragment-specific onGetLayoutInflater() hook, called from
-     *  within the normal Fragment view-creation step; our simplified
-     *  FragmentManagerImpl doesn't know about DialogFragment at all -- it
-     *  only drives onAttach/onCreate/onActivityCreated/onStart/onResume --
-     *  so the dialog still has to be created and shown here regardless of
-     *  whether the fragment was successfully registered with a manager.
-     *  `alreadyCreated` is true when a transaction already ran onCreate
-     *  (and possibly onStart, depending on the host's lifecycle state) for
-     *  us, so those aren't invoked a second time. */
-    private void createAndShowDialog(boolean alreadyCreated) {
-        try {
-            if (!alreadyCreated) onCreate(null);
-            mDialog = onCreateDialog(null);
-            if (mDialog == null) {
-                // No custom dialog: build a default empty one so the
-                // lifecycle still completes.
-                mDialog = new Dialog(getContext());
+    // ---- AOSP DialogFragment lifecycle (frameworks/base/core/java/android/
+    //      app/DialogFragment.java, API 28) ----
+
+    @Override public void onAttach(Context context) {
+        super.onAttach(context);
+        if (!mShownByMe) {
+            // Not shown through show(): the app added us with its own
+            // transaction, so we are no longer dismissed.
+            mDismissed = false;
+        }
+    }
+
+    @Override public void onDetach() {
+        super.onDetach();
+        if (!mShownByMe && !mDismissed) {
+            mDismissed = true;
+        }
+    }
+
+    @Override public void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        // A fragment added into a container view is embedded, not a dialog.
+        mShowsDialog = mContainerId == 0;
+    }
+
+    /** AOSP: when showing as a dialog, the dialog is created here, and the
+     *  fragment's view is inflated with the dialog's context. */
+    @Override public LayoutInflater onGetLayoutInflater(Bundle savedInstanceState) {
+        if (!mShowsDialog) {
+            return super.onGetLayoutInflater(savedInstanceState);
+        }
+        mDialog = onCreateDialog(savedInstanceState);
+        if (mDialog != null) {
+            setupDialog(mDialog, mStyle);
+            LayoutInflater li = (LayoutInflater) mDialog.getContext()
+                    .getSystemService(Context.LAYOUT_INFLATER_SERVICE);
+            if (li != null) return li;
+        }
+        return super.onGetLayoutInflater(savedInstanceState);
+    }
+
+    /** AOSP setupDialog: applies the STYLE_* window features. */
+    public void setupDialog(Dialog dialog, int style) {
+        switch (style) {
+            case STYLE_NO_INPUT:
+                dialog.getWindow().addFlags(
+                        android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE);
+                // fall through
+            case STYLE_NO_FRAME:
+            case STYLE_NO_TITLE:
+                dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
+        }
+    }
+
+    /** AOSP: the view made by onCreateView becomes the dialog's content. */
+    @Override public void onActivityCreated(Bundle savedInstanceState) {
+        super.onActivityCreated(savedInstanceState);
+        if (!mShowsDialog) {
+            return;
+        }
+        View view = getView();
+        if (view != null) {
+            if (view.getParent() != null) {
+                throw new IllegalStateException(
+                        "DialogFragment can not be attached to a container view");
             }
-            mDialog.setOnCancelListener(this);
-            mDialog.setOnDismissListener(this);
-            mDialog.setCancelable(mCancelable);
-            if (!alreadyCreated) onStart();
+            mDialog.setContentView(view);
+        }
+        final Activity activity = getActivity();
+        if (activity != null) {
+            mDialog.setOwnerActivity(activity);
+        }
+        mDialog.setCancelable(mCancelable);
+        mDialog.setOnCancelListener(this);
+        mDialog.setOnDismissListener(this);
+    }
+
+    @Override public void onStart() {
+        super.onStart();
+        if (mDialog != null) {
+            mViewDestroyed = false;
             mDialog.show();
-        } catch (Throwable ignored) {}
+        }
+    }
+
+    @Override public void onStop() {
+        super.onStop();
+        if (mDialog != null) {
+            mDialog.hide();
+        }
+    }
+
+    /** AOSP: remove the dialog along with the fragment's view. mViewDestroyed
+     *  stops our onDismiss from removing the fragment a second time. */
+    @Override public void onDestroyView() {
+        super.onDestroyView();
+        if (mDialog != null) {
+            mViewDestroyed = true;
+            mDialog.dismiss();
+            mDialog = null;
+        }
     }
 
     /** Override point: returns the Dialog this fragment displays. AOSP
@@ -134,7 +194,7 @@ public class DialogFragment extends Fragment
         // never call addToBackStack (our FragmentManagerImpl's back stack
         // is an already-disclosed no-op -- see that file's header), so
         // remove() is always the right branch: without this, a fragment
-        // registered by the showNow() fix above would stay isAdded()==true
+        // added by show() would stay isAdded()==true
         // forever after being dismissed.
         final FragmentManager fm = getFragmentManager();
         if (fm != null) {
@@ -157,7 +217,7 @@ public class DialogFragment extends Fragment
 
     @Override public void onCancel(DialogInterface dialog) {}
     @Override public void onDismiss(DialogInterface dialog) {
-        if (!mViewDestroyed && !mDismissed) dismissInternal(true);
+        if (!mViewDestroyed) dismissInternal(true);
     }
 
     @Override public View onCreateView(LayoutInflater inflater, ViewGroup container, Bundle savedInstanceState) {

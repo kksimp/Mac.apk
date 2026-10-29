@@ -3106,6 +3106,9 @@ int main(int argc, char** argv) {
     AndroidRootResult android = SetupAndroidRootEx(cli.android_root, app);
     const std::string& android_root = android.root;
     const std::string& android_pkg  = android.pkg;
+    // The native per-app proxy panel and Java startup policy must read the
+    // same resolved root, including CLI defaults and tilde expansion.
+    if (!android_root.empty()) setenv("MACAPK_ANDROID_ROOT", android_root.c_str(), 1);
 
     // APK-shipped native EXECUTABLES. An app may ship a helper BINARY under
     // lib/<abi>/ and fork it (the lib*.so name is forced by PackageManager,

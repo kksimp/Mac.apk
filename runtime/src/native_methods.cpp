@@ -9,6 +9,7 @@
 
 #include "macapk/native_methods.h"
 #include "macapk/gms_signin.h"
+#include "macapk/native_host_proxy.h"
 #include "macapk/cocoa_bridge.h"
 #include "macapk/self_capture.h"   // SelfCaptureGlWanted
 #include "macapk/gles_bridge.h"
@@ -4442,6 +4443,7 @@ void RegisterAllNativeMethods(JNIEnv* env) {
          sizeof(kNativeLogMethods)   / sizeof(kNativeLogMethods[0]));
     Bind(env, "com/macapk/loader/NativeLog",   kNativeQos,
          sizeof(kNativeQos)          / sizeof(kNativeQos[0]));
+    RegisterHostProxyNativeMethods(env);
     Bind(env, "com/macapk/loader/NativeLog",   kNativeBootTime,
          sizeof(kNativeBootTime)     / sizeof(kNativeBootTime[0]));
     Bind(env, "com/macapk/loader/NativeLog",   kNativePairipGate,

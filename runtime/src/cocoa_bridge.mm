@@ -6,6 +6,7 @@
 // the JNI shims in native_methods.cpp.
 
 #import "macapk/cocoa_bridge.h"
+#include "macapk/proxy_settings.h"
 
 #import <AppKit/AppKit.h>
 #import <MetalKit/MetalKit.h>
@@ -9605,6 +9606,9 @@ static MacApkAppearanceObserver* g_appearance_observer = nil;
 @interface MacApkControlsTarget : NSObject <NSMenuDelegate>
 @end
 @implementation MacApkControlsTarget
+- (void)macapkProxySettings:(id)sender {
+    macapk::ShowProxySettings();
+}
 // The Controls menu is ONE radio group of input modes: None, Arrow Keys as
 // D-pad, Tilt Control, Space Bar Taps Center, then each key-binding profile
 // (owner, 2026-10-02: more than one checked "cannot be so"; order per owner,
@@ -9886,6 +9890,10 @@ static void install_menu_bar(NSString* appTitle) {
     // would reach exit(0) and re-open the __cxa_finalize deadlock. See
     // -[MacApkControlsTarget macapkQuit:] and macapk_terminate_now.
     if (!g_controls_target) g_controls_target = [[MacApkControlsTarget alloc] init];
+    NSMenuItem* proxyItem = [appMenu addItemWithTitle:@"网络代理…"
+        action:@selector(macapkProxySettings:) keyEquivalent:@","];
+    [proxyItem setTarget:g_controls_target];
+    [appMenu addItem:[NSMenuItem separatorItem]];
     NSMenuItem* quitItem =
         [appMenu addItemWithTitle:[NSString stringWithFormat:@"Quit %@", appTitle]
                            action:@selector(macapkQuit:) keyEquivalent:@"q"];

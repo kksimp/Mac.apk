@@ -179,6 +179,8 @@ set(MACAPK_RUNTIME_SOURCES
     src/video_caps_probe.mm
     thirdparty/stb_vorbis.c
     src/cocoa_bridge.mm
+    src/native_host_proxy.cpp
+    src/proxy_settings.mm
     src/gles_bridge.cpp
 )
 # Vendored Ogg Vorbis decoder (public domain). macOS AudioToolbox cannot
@@ -202,6 +204,8 @@ set_source_files_properties(src/applink_window.mm PROPERTIES
 # that outlive the JNI call (dispatch_async, then the panel's completion handler).
 set_source_files_properties(src/document_picker.mm PROPERTIES
     COMPILE_OPTIONS "-fobjc-arc")
+set_source_files_properties(src/proxy_settings.mm
+    PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 # photos_bridge.mm: PhotoKit completion handlers capture state across threads.
 set_source_files_properties(src/photos_bridge.mm PROPERTIES
     COMPILE_OPTIONS "-fobjc-arc")

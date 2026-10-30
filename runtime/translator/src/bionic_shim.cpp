@@ -3193,6 +3193,8 @@ static void macapk_fatal_reraise(int sig) {
     raise(sig);
 }
 
+#include "guest_rwx.h"
+
 static void macapk_segv_handler(int sig, siginfo_t* info, void* ucontext) {
 #if defined(__APPLE__) && defined(__aarch64__)
     // pairip resolver guard (FIRST -- cheapest, and a fault here is expected): a fault
@@ -3237,6 +3239,7 @@ static void macapk_segv_handler(int sig, siginfo_t* info, void* ucontext) {
     if (ucontext && macapk_syscall_guard_fault(static_cast<ucontext_t*>(ucontext),
             (uintptr_t)static_cast<ucontext_t*>(ucontext)->uc_mcontext->__ss.__pc)) return;
 
+    if (info && ucontext && macapk::rwx::fault(info, static_cast<ucontext_t*>(ucontext))) return;
     if (info && arena_wx_heal_fault(info->si_addr, ucontext)) return;
 
     // MACAPK_PAIRIP_PG page-guard (DIAGNOSTIC, default OFF). Distinct from the
@@ -57739,6 +57742,8 @@ extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot) {
             if (!guard_off) { errno = EACCES; return -1; }
         }
     }
+    int guest_rwx_result = 0;
+    if (macapk::rwx::protect(addr, len, prot, guest_rwx_result)) return guest_rwx_result;
     // Detect the JIT toggle edges. make_writable = the guest asks for R+W+X (V8's
     // "unprotect this code page to write it"). close_window = a reprotect that
     // drops WRITE while keeping EXEC (V8's "done writing, make it runnable" = RX).

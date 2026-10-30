@@ -4379,6 +4379,8 @@ namespace gamepad { void RegisterGamepadBridgeMethods(JNIEnv* env); }
 // com.macapk.loader.LocationBridge's JNI methods (macOS Location Services ->
 // android.location.LocationManager).
 namespace location { void RegisterLocationBridgeMethods(JNIEnv* env); }
+namespace bluetooth { void RegisterBluetoothBridgeMethods(JNIEnv* env); }
+namespace bluetoothperipheral { void RegisterBluetoothPeripheralBridgeMethods(JNIEnv* env); }
 // Forward-declared from nowplaying_bridge.mm; registers
 // android.media.session.MacApkNowPlaying (the active MediaSession <-> macOS
 // Now Playing and its remote commands). Soft-fails on a jar that lacks it.
@@ -4508,6 +4510,8 @@ void RegisterAllNativeMethods(JNIEnv* env) {
     camera::RegisterCameraBridgeMethods(env);
     gamepad::RegisterGamepadBridgeMethods(env);
     location::RegisterLocationBridgeMethods(env);
+    bluetooth::RegisterBluetoothBridgeMethods(env);
+    bluetoothperipheral::RegisterBluetoothPeripheralBridgeMethods(env);
     nowplaying::RegisterNowPlayingBridgeMethods(env);
     webview::RegisterWebViewBridgeMethods(env);
     clipboard::RegisterClipboardBridgeMethods(env);

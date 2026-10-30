@@ -144,6 +144,8 @@ set(MACAPK_RUNTIME_SOURCES
     # macOS Location Services -> android.location (CoreLocation, rung 1: the
     # Mac's own fused location stack; gate MACAPK_LOCATION_HOST).
     src/location_bridge.mm
+    src/bluetooth_bridge.mm
+    src/bluetooth_peripheral_bridge.mm
     # The active MediaSession -> macOS Now Playing + MPRemoteCommandCenter
     # (MediaPlayer.framework, rung 1: the Mac's own system media controls and
     # media keys; gate MACAPK_NOW_PLAYING).
@@ -217,6 +219,8 @@ set_source_files_properties(src/gamecontroller_bridge.mm PROPERTIES
 # location_bridge.mm: the CLLocationManager delegate and main-queue blocks.
 set_source_files_properties(src/location_bridge.mm PROPERTIES
     COMPILE_OPTIONS "-fobjc-arc")
+set_source_files_properties(src/bluetooth_bridge.mm src/bluetooth_peripheral_bridge.mm
+    PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 if(ANGLE_HAVE)
     list(APPEND MACAPK_RUNTIME_SOURCES src/angle_glue.cpp)
 endif()
@@ -415,6 +419,8 @@ target_link_libraries(macapk-runtime PRIVATE
     "-framework WebKit"
     "-framework GameController"
     "-framework CoreLocation"
+    "-framework CoreBluetooth"
+    "-framework IOBluetooth"
     "-framework MediaPlayer"
     "-framework IOKit"
 )

@@ -407,6 +407,10 @@ public final class MacApkPackageManager extends PackageManager {
                         String rp = requested.get(i);
                         Boolean storage = SpecialAccessStore.storagePermissionGranted(rp);
                         boolean held = storage != null ? storage : !macapkNeverGranted(rp);
+                        if (isBluetoothRuntimePermission(rp)
+                                && "1".equals(System.getenv("MACAPK_BLUETOOTH_HOST"))) {
+                            held = checkPermission(rp, this.packageName) == PackageManager.PERMISSION_GRANTED;
+                        }
                         grants[i] = held ? PackageInfo.REQUESTED_PERMISSION_GRANTED : 0;
                     }
                     info.requestedPermissionsFlags = grants;
@@ -4077,6 +4081,14 @@ public final class MacApkPackageManager extends PackageManager {
             return PackageManager.PERMISSION_DENIED;   // not installed here
         }
         if (permName == null) return PackageManager.PERMISSION_DENIED;
+        // The opt-in BLE bridge uses the macOS Bluetooth grant. A manifest
+        // declaration alone must not claim that TCC has authorized access.
+        if (isBluetoothRuntimePermission(permName)
+                && "1".equals(System.getenv("MACAPK_BLUETOOTH_HOST"))) {
+            return declaredPermissions().contains(permName)
+                    && BluetoothBridge.authorization() == 3
+                ? PackageManager.PERMISSION_GRANTED : PackageManager.PERMISSION_DENIED;
+        }
         // Stage S5 (MACAPK_MEDIA_PERMS_ASK, default ON): the storage runtime
         // permissions -- READ_MEDIA_IMAGES/VIDEO/AUDIO,
         // READ_MEDIA_VISUAL_USER_SELECTED, ACCESS_MEDIA_LOCATION and
@@ -4160,6 +4172,12 @@ public final class MacApkPackageManager extends PackageManager {
         if (!LocationBridge.servicesEnabled()) return Boolean.TRUE;
         if (!LocationBridge.authorized()) return Boolean.FALSE;
         return fine ? !LocationBridge.reducedAccuracy() : Boolean.TRUE;
+    }
+
+    static boolean isBluetoothRuntimePermission(String permission) {
+        return "android.permission.BLUETOOTH_SCAN".equals(permission)
+            || "android.permission.BLUETOOTH_CONNECT".equals(permission)
+            || "android.permission.BLUETOOTH_ADVERTISE".equals(permission);
     }
 
     /** The `<uses-permission>` set, as a lookup. Built once; the manifest does
@@ -4494,6 +4512,9 @@ public final class MacApkPackageManager extends PackageManager {
     @Override public boolean hasSystemFeature(String name, int version) {
         if (name == null) return false;
         boolean has = version <= 0 && SYSTEM_FEATURES.contains(name);
+        if (version <= 0 && "android.hardware.bluetooth_le".equals(name)) {
+            has = BluetoothBridge.available();
+        }
         // Guest Vulkan (Boot.noteGuestVulkan / bionic_shim_vulkan.cpp): an app
         // that gets libvulkan.so also sees the features that announce it, with
         // AOSP's version encodings -- vulkan.version is the VK_API_VERSION the
@@ -4532,6 +4553,11 @@ public final class MacApkPackageManager extends PackageManager {
             android.content.pm.FeatureInfo fi = new android.content.pm.FeatureInfo();
             fi.name = name;
             res.add(fi);
+        }
+        if (BluetoothBridge.available()) {
+            android.content.pm.FeatureInfo ble = new android.content.pm.FeatureInfo();
+            ble.name = "android.hardware.bluetooth_le";
+            res.add(ble);
         }
         android.content.pm.FeatureInfo gl = new android.content.pm.FeatureInfo();
         // Read the level off the SAME source ActivityManager reports through

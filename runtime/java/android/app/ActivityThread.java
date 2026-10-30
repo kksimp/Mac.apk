@@ -42,6 +42,7 @@ public final class ActivityThread {
      *  package name (mPackages); a Mac.apk process runs exactly one app, so one
      *  field is the whole map. */
     private LoadedApk mBoundLoadedApk;
+    private String mBoundProcessName;
     private Application mInitialApplication;
 
     /** AOSP peekPackageInfo(String, boolean). Instrumentation.getFactory calls
@@ -85,6 +86,7 @@ public final class ActivityThread {
      *  order com.macapk.loader.Boot already implements. */
     private void handleBindApplication(AppBindData data) {
         mBoundLoadedApk = data.info;
+        mBoundProcessName = data.processName;
         // Pass null for the Instrumentation, exactly as AOSP :6959 does. The
         // parameter's only job in LoadedApk's body is to gate
         // callApplicationOnCreate; null keeps that block dead, so onCreate can
@@ -132,11 +134,20 @@ public final class ActivityThread {
      *  Returned via a separate static method, NOT via getApplication
      *  (some SDKs call this without a Context). */
     public static String currentPackageName() {
+        LoadedApk bound = INSTANCE.mBoundLoadedApk;
+        if (bound != null) return bound.getPackageName();
+        // Boot's default constructor path has no LoadedApk bind, but publishes
+        // this manifest identity before loading any Application subclass.
+        String bootProcess = com.macapk.loader.Boot.processName();
+        if (bootProcess != null) return bootProcess;
         Application app = Application.macapk_get();
         return app != null ? app.getPackageName() : "";
     }
     public static String currentProcessName() {
-        return currentPackageName();
+        String bound = INSTANCE.mBoundProcessName;
+        if (bound != null) return bound;
+        String bootProcess = com.macapk.loader.Boot.processName();
+        return bootProcess != null ? bootProcess : currentPackageName();
     }
 
     /** Returns the per-process Application. Equivalent to

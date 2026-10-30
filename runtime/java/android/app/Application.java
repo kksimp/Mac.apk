@@ -369,8 +369,10 @@ public class Application extends ContextWrapper
      * isIsolated stub let it past the first wall (v1.0.42).
      */
     public static String getProcessName() {
-        Application app = sInstance;
-        return (app != null) ? app.packageName : "com.macapk.host";
+        // The process is bound BEFORE the Application constructor runs. Its
+        // Context/package fields are populated later and cannot name a process
+        // for subclass field initializers (AOSP delegates to ActivityThread).
+        return ActivityThread.currentProcessName();
     }
 
     /** Application-scope <meta-data android:name="..." android:value=

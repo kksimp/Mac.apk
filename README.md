@@ -81,6 +81,10 @@ stores are in the [Installation](https://github.com/kksimp/Mac.apk/wiki/Installa
 See [Known issues](https://github.com/kksimp/Mac.apk/wiki/Known-Issues) for this release, and the
 [compatibility list](COMPATIBILITY.md) for every app tested by hand.
 
+## Contributors
+
+Mac.apk has had a lot of help from people outside the project: @5566brs, @defia, @chuenlok, @Mistarille224, @m9rco, @wishbone305, @kushu7, @YuKongA, @hlwhl, @lxy2500798479 and @blueagler. Thank you. See [CONTRIBUTORS.md](CONTRIBUTORS.md) for who did what, and [CONTRIBUTING.md](CONTRIBUTING.md) if you would like to join in.
+
 ## Reporting problems
 
 Send the Mac.apk version, your macOS version, the app and where you got it, what

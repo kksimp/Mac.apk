@@ -1,6 +1,6 @@
 # Contributors
 
-Mac.apk is built with help from people outside the project. Thank you. This list names everyone whose code is in the project, with the pull requests and what they did. Their commits are kept under their own names wherever we could import them as they were sent.
+Mac.apk is built with help from people outside the project. Thank you. This list names everyone whose code is in the project, with the pull requests and what they did. Their commits are kept under their own names wherever we could import them as they were sent. Where a pull request reached this repo through a release sync, the author is credited as a co-author on a commit and listed here.
 
 ## v1.0.2377
 

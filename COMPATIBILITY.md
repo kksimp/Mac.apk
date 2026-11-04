@@ -1,8 +1,8 @@
 # Mac.apk App Compatibility
 
-Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-10-20.
+Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-11-04.
 
-**71 apps tested:** ✅ 58 work · ⚠️ 10 partly work · ❌ 3 don't work yet
+**72 apps tested:** ✅ 57 work · ⚠️ 9 partly work · ❌ 6 don't work yet
 
 **Legend:** ✅ yes · ⚠️ partly · ❌ not yet · ❔ not tested yet. **Works** means you can use the app or play the game; **Sound** means its audio plays. An app tested at more than one version has a row for each, newest first.
 
@@ -46,8 +46,10 @@ Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-10-20.
 | **Hill Climb Racing** | 1.68.1 | ✅ | ✅ |  |
 | **Hill Climb Racing** | 1.43.0 | ✅ | ✅ |  |
 | **Hill Climb Racing** | 1.8.1 | ✅ | ✅ |  |
+| **Hill Climb Racing 2** | 1.76.0 | ❌ | ❌ | Icon: ❌. Draws its screen: ❌. Does not start on v1.0.2366: boot ends in UnsatisfiedLinkError (wkdfd.F.a) because libfingersoft_hcr2 is import-protected and its init is skipped; with that skip off the library calls exit(101) after reading /proc/self/maps. Not a regression; not owner hand-tested, from a crash diagnosis. |
 | **iiSU** | 0.1.6.1 | ✅ | ❔ | Icon: ❔. Finds RetroArch and launches games in it. |
-| **Instagram** | 445.0.0.45.83 | ⚠️ | ❔ | Weird layout issues. Video choppy and sound inop |
+| **Instagram** | 452.1.0.53.64 | ❌ | ❔ | Draws its screen: ❌. Weird layout issues. Video choppy and sound inop 452.1.0.53.64 does not start (found by the update check); 445.0.0.45.83 worked. |
+| **Instagram** | 445.0.0.45.83 | ⚠️ | ❔ |  |
 | **Jetpack 2** | 0.1.60 | ❌ | ❔ | Stuck loading at 59% |
 | **Jetpack Joyride** | 1.3.5 | ✅ | ✅ |  |
 | **Lemuroid** | 1.17.0 | ✅ | ❔ | Icon: ❔. Retro game emulator (F-Droid). Super Mario Advance 2 (GBA) plays. Downloads each system's emulator core on first use. |
@@ -56,7 +58,8 @@ Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-10-20.
 | **mGrađani** | 1.0.18 | ✅ | ❔ | Icon: ❔. NIAS login page works since Mac.apk v1.0.1723 (it was blank before). |
 | **Mindustry** | 8-fdroid-160.5 | ✅ | ✅ | Online multiplayer currently inop |
 | **Mindustry** | 8-fdroid-158 | ✅ | ✅ |  |
-| **Minecraft** | 1.26.52.3 | ✅ | ❔ | Multiplayer works (joined a server). |
+| **Minecraft** | 1.26.60.4 | ❌ | ❔ | Draws its screen: ❌. Multiplayer works (joined a server). 1.26.60.4 crashes at startup (found by the update check); 1.26.52.3 worked. |
+| **Minecraft** | 1.26.52.3 | ✅ | ❔ |  |
 | **Minecraft** | 1.26.45.1 | ✅ | ✅ | Boots, renders and Xbox sign-in works. |
 | **NewPipe** | 0.29.0 | ⚠️ | ✅ | Some videos play with sound only and buffer constantly |
 | **Now in Android** | 0.1.2 | ✅ | ✅ |  |

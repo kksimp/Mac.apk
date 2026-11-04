@@ -537,8 +537,28 @@ public final class ArscReader {
                 a.vals[j] = r.mapData[i];
                 j++;
             }
+            // Rendering an int as its symbol is only safe when the symbol
+            // spells exactly one value, because consumers turn the text back
+            // into an int by NAME. Under resource-name obfuscation every
+            // symbol of an attr is "0_resource_name_obfuscated" (Play Store
+            // 53.7: ConstraintLayout's barrierDirection, 6 symbols, one name),
+            // and the name lookup returned whichever value it met last: an
+            // "end" Barrier (6) came back as "top" (2), so every OneGoogle
+            // account-menu label was laid out on top of its icon. Android's
+            // TypedArray hands the app the compiled int and never consults the
+            // names, so keeping the int for such an attr is the faithful answer.
+            if (!macapkSymbolsUnique(a.names)) continue;
             attrDefs.put(r.resId, a);
         }
+    }
+
+    /** True when no two symbols share a (non-empty) name. */
+    private static boolean macapkSymbolsUnique(String[] names) {
+        java.util.HashSet<String> seen = new java.util.HashSet<>();
+        for (String n : names) {
+            if (n == null || n.isEmpty() || !seen.add(n)) return false;
+        }
+        return true;
     }
 
     /** Res_INTERNALID: a "resource id" with a zero type byte is an internal

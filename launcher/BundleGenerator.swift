@@ -300,7 +300,10 @@ enum BundleGenerator {
            let v = sanitizedLabel(versionName) {
             desired = "\(clean) \(v)"
         }
-        if usableLabel != nil { desired = apkSafeDirName(desired) }
+        if usableLabel != nil {
+            desired = apkSafeDirName(desired)
+            if desired.isEmpty { desired = apkSafeDirName(package) }
+        }
         // The pre-rename executable name, read from Info.plist rather than by
         // listing Contents/MacOS: a `.DS_Store` (or any stray file) appearing
         // during the minutes-long extraction window sorted FIRST in the old
@@ -591,7 +594,27 @@ enum BundleGenerator {
                                           options: .caseInsensitive)
         s = s.replacingOccurrences(of: "[ ()]+", with: "-",
                                    options: .regularExpression)
-        while s.hasPrefix("-") { s.removeFirst() }
+        // Anything a file: URL percent-encodes breaks the same class of guest
+        // code a third way: code that looks a local page up by its RAW path
+        // while WebView.getUrl() hands back the percent-encoded spec (Chromium
+        // GURL encodes every non-ASCII byte, as on AOSP). Measured 2026-10-26
+        // on 三國志·戰略版（港澳版） (com.qookkagame.sgzzlb.hkmo): ejoysdk's
+        // BrowserInjection keys the login page's startup data by
+        // "/Applications/三國志·戰略版（港澳版）.app/.../index.html", the page's
+        // URL arrives as "/Applications/%E4%B8%89%E5%9C%8B...", the lookup
+        // misses, the page gets {} and its sign-in screen throws on
+        // pkg_info.country. Real Android data paths are plain ASCII
+        // (/data/user/0/<pkg>), so keep only RFC 3986 unreserved characters.
+        // A label with none left (all CJK, say) becomes "" and the callers
+        // fall back to the package name.
+        // Fold accents first so "Café" becomes "Cafe", not "Caf".
+        s = s.folding(options: .diacriticInsensitive, locale: nil)
+        s = s.replacingOccurrences(of: "[^A-Za-z0-9._~-]+", with: "-",
+                                   options: .regularExpression)
+        // "Tom & Jerry" would otherwise leave "Tom---Jerry" (space, ampersand, space).
+        s = s.replacingOccurrences(of: "-{2,}", with: "-", options: .regularExpression)
+        // A leading dot would make a hidden folder ("!.x" -> ".x").
+        while s.hasPrefix("-") || s.hasPrefix(".") { s.removeFirst() }
         while s.hasSuffix("-") { s.removeLast() }
         return s
     }
@@ -805,7 +828,8 @@ enum BundleGenerator {
         // Treat it as the package's bundle so it is adopted and upgraded in
         // place rather than orphaned beside a new one.
         guard let have = plist["MacapkDirName"] as? String else { return true }
-        return have == want
+        // Either spelling of the version's folder name is the same install (DirNaming).
+        return DirNaming.same(have, want, package: package)
     }
 
     /// A plist-less folder whose leftover android tree belongs to `package`
@@ -817,7 +841,7 @@ enum BundleGenerator {
         let codeRoot = android.appendingPathComponent(".macapk/code")
         if let codes = try? fm.contentsOfDirectory(atPath: codeRoot.path) {
             for c in codes {
-                if let want = dirName { if c == want { return true } }
+                if let want = dirName { if DirNaming.same(c, want, package: package) { return true } }
                 else if c == package || c.hasPrefix(package + "_") { return true }
             }
         }
@@ -829,7 +853,7 @@ enum BundleGenerator {
         let dataRoot = android.appendingPathComponent("data/data")
         if let dirs = try? fm.contentsOfDirectory(atPath: dataRoot.path) {
             for d in dirs {
-                if let want = dirName { if d == want { return true } }
+                if let want = dirName { if DirNaming.same(d, want, package: package) { return true } }
                 else if d == package || d.hasPrefix(package + "_") { return true }
             }
         }

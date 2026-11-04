@@ -51,9 +51,9 @@ import javax.security.auth.x500.X500Principal;
  * attestation chain, we do not fabricate one, and anything that demands a
  * Google-rooted attestation certificate will still fail -- as it should.
  *
- * <p>Like the symmetric side, the key is software-backed rather than
- * hardware-non-extractable (see MacApkKeyStoreBackend for why that is the right
- * Mac.apk analogue), so the stock JCE providers can sign with it.
+ * <p>Storage remains software-backed. Authentication-bound private keys use
+ * opaque API handles and the restricted cipher/signature routes, which require
+ * actual native OS authorization; this is not hardware KeyMint enforcement.
  */
 public abstract class AndroidKeyStoreKeyPairGeneratorSpi extends KeyPairGeneratorSpi {
 
@@ -82,6 +82,7 @@ public abstract class AndroidKeyStoreKeyPairGeneratorSpi extends KeyPairGenerato
 
     private KeyGenParameterSpec spec;
     private SecureRandom random;
+    private AndroidKeyStoreAuthPolicy policy = AndroidKeyStoreAuthPolicy.NONE;
 
     AndroidKeyStoreKeyPairGeneratorSpi(String algorithm, int defaultKeySizeBits,
                                        String signatureAlgorithm) {
@@ -105,6 +106,8 @@ public abstract class AndroidKeyStoreKeyPairGeneratorSpi extends KeyPairGenerato
     @Override
     public void initialize(AlgorithmParameterSpec params, SecureRandom random)
             throws InvalidAlgorithmParameterException {
+        this.spec = null;
+        this.policy = AndroidKeyStoreAuthPolicy.NONE;
         if (!(params instanceof KeyGenParameterSpec)) {
             throw new InvalidAlgorithmParameterException(
                 "Unsupported params class: "
@@ -115,6 +118,10 @@ public abstract class AndroidKeyStoreKeyPairGeneratorSpi extends KeyPairGenerato
         if (s.getKeystoreAlias() == null) {
             throw new InvalidAlgorithmParameterException("KeyStore entry alias not provided");
         }
+        if (s.isStrongBoxBacked()) throw new StrongBoxUnavailableException("This host has no StrongBox");
+        if (s.isUserAuthenticationRequired() && s.getAttestationChallenge() != null)
+            throw new InvalidAlgorithmParameterException("Host authentication keys cannot provide Android hardware attestation");
+        policy = AndroidKeyStoreAuthPolicy.from(s, algorithm, s.getKeySize() == -1 ? defaultKeySizeBits : s.getKeySize());
         this.spec = s;
         this.random = random;
     }
@@ -145,12 +152,12 @@ public abstract class AndroidKeyStoreKeyPairGeneratorSpi extends KeyPairGenerato
             byte[] cert = selfSign(pair, spec, signatureAlgorithm);
             MacApkKeyStoreBackend.get().putKeyPair(
                 spec.getKeystoreAlias(), algorithm,
-                pair.getPrivate().getEncoded(), cert);
+                pair.getPrivate().getEncoded(), cert, policy);
         } catch (Exception e) {
             throw new IllegalStateException(
                 "Failed to store key pair for alias " + spec.getKeystoreAlias(), e);
         }
-        return pair;
+        return policy.required ? new KeyPair(pair.getPublic(), MacApkKeyStoreBackend.get().getPrivateKey(spec.getKeystoreAlias())) : pair;
     }
 
     // ---------------------------------------------------------------------
@@ -198,10 +205,19 @@ public abstract class AndroidKeyStoreKeyPairGeneratorSpi extends KeyPairGenerato
         tbs.write(pair.getPublic().getEncoded());           // SubjectPublicKeyInfo
         byte[] tbsDer = der(0x30, tbs.toByteArray());
 
-        Signature sig = Signature.getInstance(sigAlg);
-        sig.initSign(pair.getPrivate());
-        sig.update(tbsDer);
-        byte[] sigBytes = sig.sign();
+        final byte[] sigBytes;
+        if (spec.isUserAuthenticationRequired()) {
+            // Android documents an invalid certificate signature when the new
+            // private key is not authorized to sign without authentication.
+            // Do not perform a pre-auth signing operation merely to mint its
+            // public-key container. This is not an attestation certificate.
+            sigBytes = pair.getPrivate() instanceof java.security.interfaces.RSAKey rsa
+                ? new byte[(rsa.getModulus().bitLength() + 7) / 8]
+                : new byte[]{0x30, 0x06, 0x02, 0x01, 0, 0x02, 0x01, 0};
+        } else {
+            Signature sig = Signature.getInstance(sigAlg);
+            sig.initSign(pair.getPrivate()); sig.update(tbsDer); sigBytes = sig.sign();
+        }
 
         ByteArrayOutputStream cert = new ByteArrayOutputStream();
         cert.write(tbsDer);

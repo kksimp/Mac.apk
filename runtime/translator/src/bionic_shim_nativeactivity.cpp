@@ -483,6 +483,17 @@ struct MacApkInputQueue {
 
 std::atomic<int64_t> g_next_event_id{1};
 
+// The getEvent / finishEvent trace logs the first 16 events of each; a hover
+// stream spends that before the first click. MACAPK_NA_INPUT_TRACE=1 logs
+// every event (and the fields an engine filters on: device, tool, buttons).
+bool input_trace_all() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_NA_INPUT_TRACE");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
 void enqueue(MacApkInputQueue* q, MacApkInputEvent* ev) {
     std::lock_guard<std::mutex> lk(q->mu);
     q->pending.push_back(ev);
@@ -835,10 +846,12 @@ extern "C" int32_t __macapk_arm64_AInputQueue_getEvent(void* queue, void** outEv
     if (outEvent) *outEvent = ev;
     if (ev) {
         static std::atomic<int> n{0};
-        if (n.fetch_add(1) < 16)
+        if (n.fetch_add(1) < 16 || input_trace_all())
             std::fprintf(stderr, "[nativeactivity] AInputQueue_getEvent -> type=%d action=0x%x "
-                         "source=0x%x pointers=%d x=%.1f y=%.1f\n", ev->type, ev->action,
-                         ev->source, ev->pointerCount,
+                         "source=0x%x device=%d tool=%d buttons=0x%x pointers=%d x=%.1f y=%.1f\n",
+                         ev->type, ev->action, ev->source, ev->deviceId,
+                         ev->pointerCount ? ev->toolType[0] : 0, ev->buttonState,
+                         ev->pointerCount,
                          ev->pointerCount ? ev->axes[0][kAxisX] : 0.0f,
                          ev->pointerCount ? ev->axes[0][kAxisY] : 0.0f);
     }
@@ -860,9 +873,9 @@ extern "C" void __macapk_arm64_AInputQueue_finishEvent(void* queue, void* event,
     const int64_t id = ev->id;
     {
         static std::atomic<int> n{0};
-        if (n.fetch_add(1) < 16)
-            std::fprintf(stderr, "[nativeactivity] AInputQueue_finishEvent type=%d handled=%d\n",
-                         ev->type, handled);
+        if (n.fetch_add(1) < 16 || input_trace_all())
+            std::fprintf(stderr, "[nativeactivity] AInputQueue_finishEvent type=%d action=0x%x "
+                         "source=0x%x handled=%d\n", ev->type, ev->action, ev->source, handled);
     }
     delete ev;
     finish_to_java(q, id, handled != 0);

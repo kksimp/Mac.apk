@@ -12,6 +12,7 @@
 //   syntheticPrefix  dex2jvm.syntheticPrefix    DEX2JVM_SYNTHETIC_PREFIX    SYNTHETIC_PREFIX
 //   unsafeRedirect   dex2jvm.redirectUnsafe     DEX2JVM_REDIRECT_UNSAFE     REDIRECT_UNSAFE
 //   exitRedirect     dex2jvm.redirectExit       DEX2JVM_REDIRECT_EXIT       REDIRECT_EXIT
+//   nativeLoadRedirect dex2jvm.redirectNativeLoad DEX2JVM_REDIRECT_NATIVE_LOAD REDIRECT_NATIVE_LOAD
 //   threads          dex2jvm.threads            DEX2JVM_THREADS             THREADS
 //   logTag           dex2jvm.logTag             DEX2JVM_LOG_TAG             LOG_TAG
 //   parsedMarker     dex2jvm.parsedMarker       DEX2JVM_PARSED_MARKER       PARSED_MARKER
@@ -64,7 +65,24 @@ public final class Options {
             "DEX2JVM_REDIRECT_EXIT", "REDIRECT_EXIT", null);
 
     /**
-     * Worker threads for a bulk conversion; 0 means min(cores, 8). Output is
+     * When non-null, the internal name of a class that receives the app's calls
+     * to {@code System.mapLibraryName(String)} as {@code mapLibraryName
+     * (Ljava/lang/String;)Ljava/lang/String;}, {@code System.load(String)} as
+     * {@code load(Ljava/lang/String;)V} and {@code Runtime.load(String)} as
+     * {@code runtimeLoad(Ljava/lang/Runtime;Ljava/lang/String;)V}. Null (the
+     * default) leaves them alone.
+     *
+     * <p>For hosts where the file name Android uses for a native library
+     * ({@code libfoo.so}) is not what the host's JVM would produce, so an app
+     * that builds the name itself and then loads the file it names (a custom
+     * SoLoader does exactly this) can be answered the way Bionic answers it.
+     */
+    public static volatile String nativeLoadRedirect = setting("dex2jvm.redirectNativeLoad",
+            "DEX2JVM_REDIRECT_NATIVE_LOAD", "REDIRECT_NATIVE_LOAD", null);
+
+    /**
+     * Worker threads for a bulk conversion; 0 means one per core, capped by heap
+     * (see DexConverter.Session.threadCount). Output is
      * byte-identical at every thread count.
      */
     public static volatile int threads = parseInt(setting("dex2jvm.threads",
@@ -99,6 +117,25 @@ public final class Options {
      * class loader. The CLI fills it in according to {@link #library}.
      */
     public static volatile ClassLoader hierarchyLoader = null;
+
+    /** Every field's current value, for {@link #restore}. */
+    static Object[] snapshot() {
+        return new Object[] { syntheticPrefix, unsafeRedirect, exitRedirect, threads,
+                              logTag, parsedMarker, library, hierarchyLoader };
+    }
+
+    /** Puts back what {@link #snapshot} saw: lets one process run several
+     *  command lines in turn without one's flags leaking into the next. */
+    static void restore(Object[] s) {
+        syntheticPrefix = (String) s[0];
+        unsafeRedirect = (String) s[1];
+        exitRedirect = (String) s[2];
+        threads = (Integer) s[3];
+        logTag = (String) s[4];
+        parsedMarker = (Boolean) s[5];
+        library = (String) s[6];
+        hierarchyLoader = (ClassLoader) s[7];
+    }
 
     private static String setting(String property, String env, String hostField, String dflt) {
         String v = System.getProperty(property);

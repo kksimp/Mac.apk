@@ -318,6 +318,28 @@ public final class PackageInstallerBackend {
         EXEC.execute(() -> performUninstall(pkg, vc, statusReceiver));
     }
 
+    /** Where an uninstall's result goes when the caller used the legacy
+     *  PackageManager.deletePackage observer instead of an IntentSender. Set
+     *  on the EXEC thread for the duration of one performUninstall. */
+    public interface DeleteSink { void onDeleted(String pkg, int returnCode, String message); }
+    private static final ThreadLocal<DeleteSink> DELETE_SINK = new ThreadLocal<>();
+
+    /** The host side of the hidden PackageManager.deletePackage(String,
+     *  IPackageDeleteObserver, int) family (what Google Play's UninstallerImpl
+     *  calls, by reflection): the same performUninstall, helper verb and
+     *  device-owner gate as the IntentSender surface, with the result handed to
+     *  `sink` after the PACKAGE_REMOVED broadcasts (AOSP order). */
+    public static void uninstallWithObserver(String packageName, long versionCode, DeleteSink sink) {
+        final String pkg = packageName;
+        NativeLog.i(TAG, "deletePackage requested for " + pkg
+                + (versionCode != -1 ? (" versionCode=" + versionCode) : "") + "; queued");
+        EXEC.execute(() -> {
+            DELETE_SINK.set(sink);
+            try { performUninstall(pkg, versionCode, null); }
+            finally { DELETE_SINK.remove(); }
+        });
+    }
+
     /** The INTENT half of the guest uninstall surface: ACTION_DELETE (and the
      *  deprecated ACTION_UNINSTALL_PACKAGE) carrying package:<pkg> data.
      *
@@ -816,6 +838,10 @@ public final class PackageInstallerBackend {
             switch (r.exit) {
                 case 0:
                     success = true;
+                    // The installer of record, BEFORE the broadcasts and the
+                    // status: Play's post-install step (setApplicationCategoryHint)
+                    // is allowed only for the installer of record.
+                    InstallerOfRecord.set(pkg, requestor);
                     // ORDER IS AOSP'S, AND IT MATTERS. handlePackagePostInstall
                     // sends the package broadcasts and only then calls
                     // notifyInstallObserver, which is what fires the caller's
@@ -993,6 +1019,7 @@ public final class PackageInstallerBackend {
                     catch (Throwable ignored) {}
                     // ORDER IS AOSP'S: broadcasts first, then the caller's
                     // IntentSender -- see the method header.
+                    InstallerOfRecord.set(pkg, null);
                     broadcastPackageRemoved(pkg, dataRemoved);
                     deliverUninstallStatus(sender, pkg,
                             PackageInstaller.STATUS_SUCCESS, DELETE_SUCCEEDED,
@@ -1046,6 +1073,12 @@ public final class PackageInstallerBackend {
         // must still leave a record.
         NativeLog.i(TAG, "uninstall status=" + status + " pkg=" + pkg
                 + " (" + message + ")");
+        DeleteSink sink = DELETE_SINK.get();
+        if (sink != null) {
+            try { sink.onDeleted(pkg, legacyStatus, message); }
+            catch (Throwable t) { NativeLog.e(TAG, "delete observer failed for " + pkg + ": " + t); }
+            return;
+        }
         if (sender == null) return;
         Intent fillIn = new Intent();
         fillIn.putExtra(PackageInstaller.EXTRA_PACKAGE_NAME, pkg);

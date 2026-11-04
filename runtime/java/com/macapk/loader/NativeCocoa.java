@@ -263,6 +263,10 @@ public final class NativeCocoa {
     public static native void releaseRenderer(long metalView);
 
     public static native void setDataSubdir(String subdir);
+    /** The bionic shim's synthesized host file for a /proc path, or null.
+     *  Installed into java.io.FileReader by Boot so Java /proc reads match
+     *  native ones. */
+    public static native String remapProcPath(String procPath);
 
     /** Tell the loader which directory guest libraries should be reported under in
      *  /proc/self/maps, so that file and ApplicationInfo.nativeLibraryDir name the

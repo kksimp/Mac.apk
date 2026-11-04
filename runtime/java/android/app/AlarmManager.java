@@ -75,6 +75,17 @@ public class AlarmManager {
     }
 
     public void set(int type, long triggerAtMillis, PendingIntent operation) { schedule(type, triggerAtMillis, operation); }
+    /** AOSP @hide/@SystemApi overload with a window, repeat interval and
+     *  WorkSource (AlarmManager.set(int,long,long,long,PendingIntent,WorkSource),
+     *  the one setImpl ultimately funnels to). Google Play services schedules
+     *  alarms through it (bqmv.g). We honor the type + trigger; the window /
+     *  interval / WorkSource are scheduler hints with no behavioural meaning in
+     *  our single-app model. A null operation is a no-op (AOSP throws NPE only
+     *  when both operation and listener are null; here operation is the path). */
+    public void set(int type, long triggerAtMillis, long windowMillis, long intervalMillis,
+                    PendingIntent operation, android.os.WorkSource workSource) {
+        if (operation != null) schedule(type, triggerAtMillis, operation);
+    }
     public void setExact(int type, long triggerAtMillis, PendingIntent operation) { schedule(type, triggerAtMillis, operation); }
     public void setAndAllowWhileIdle(int type, long triggerAtMillis, PendingIntent operation) { schedule(type, triggerAtMillis, operation); }
     public void setExactAndAllowWhileIdle(int type, long triggerAtMillis, PendingIntent operation) { schedule(type, triggerAtMillis, operation); }
@@ -137,6 +148,50 @@ public class AlarmManager {
     }
     public void setWindow(int type, long windowStartMillis, long windowLengthMillis, String tag, OnAlarmListener listener, android.os.Handler targetHandler) {
         set(type, windowStartMillis, tag, listener, targetHandler);
+    }
+
+    /** AOSP API-29 (Executor) and API-31+ (Executor + WorkSource) listener
+     *  variants. These were MISSING, so a caller using them hit
+     *  NoSuchMethodError -- most importantly Google Play services' NetworkScheduler
+     *  (nts), which arms its next-task wakeup through
+     *  setExact(type, trigger, tag, Executor, WorkSource, OnAlarmListener) /
+     *  setWindow(...). With the method absent the wakeup never armed, so scheduled
+     *  GmsTasks (device checkin's one-off, GCM registration, syncs) never fired.
+     *  AOSP: "executor -- the Executor on which to execute the listener's onAlarm()
+     *  callback"; the WorkSource is a battery-attribution hint with no behaviour in
+     *  our single-app model. Signatures match the runtime descriptors GMS invokes. */
+    private static void scheduleListener(int type, long triggerAtMillis, OnAlarmListener listener,
+                                         java.util.concurrent.Executor executor) {
+        if (listener == null) return;
+        cancelInternal(listener);
+        long delay = delayFor(type, triggerAtMillis);
+        ScheduledFuture<?> f = POOL.schedule(() -> {
+            PENDING.remove(listener);
+            Runnable r = () -> { try { listener.onAlarm(); } catch (Throwable ignored) {} };
+            if (executor != null) { try { executor.execute(r); } catch (Throwable t) { r.run(); } }
+            else r.run();
+        }, delay, TimeUnit.MILLISECONDS);
+        PENDING.put(listener, f);
+    }
+    public void set(int type, long triggerAtMillis, String tag,
+                    java.util.concurrent.Executor executor, OnAlarmListener listener) {
+        scheduleListener(type, triggerAtMillis, listener, executor);
+    }
+    public void set(int type, long triggerAtMillis, String tag,
+                    java.util.concurrent.Executor executor, android.os.WorkSource workSource, OnAlarmListener listener) {
+        scheduleListener(type, triggerAtMillis, listener, executor);
+    }
+    public void setExact(int type, long triggerAtMillis, String tag,
+                         java.util.concurrent.Executor executor, OnAlarmListener listener) {
+        scheduleListener(type, triggerAtMillis, listener, executor);
+    }
+    public void setExact(int type, long triggerAtMillis, String tag,
+                         java.util.concurrent.Executor executor, android.os.WorkSource workSource, OnAlarmListener listener) {
+        scheduleListener(type, triggerAtMillis, listener, executor);
+    }
+    public void setWindow(int type, long windowStartMillis, long windowLengthMillis, String tag,
+                          java.util.concurrent.Executor executor, android.os.WorkSource workSource, OnAlarmListener listener) {
+        scheduleListener(type, windowStartMillis, listener, executor);
     }
 
     public void setTime(long millis) {}

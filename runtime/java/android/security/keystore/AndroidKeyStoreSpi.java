@@ -149,6 +149,17 @@ public class AndroidKeyStoreSpi extends KeyStoreSpi {
                 throw new StrongBoxUnavailableException(
                     "StrongBox-backed import requested; this device has no StrongBox");
             }
+            if (kp.isUserAuthenticationRequired()) {
+                if (!(entry instanceof KeyStore.SecretKeyEntry secret) || !"AES".equalsIgnoreCase(secret.getSecretKey().getAlgorithm()))
+                    throw new KeyStoreException("Only AES authentication-bound key import is supported");
+                byte[] encoded = secret.getSecretKey().getEncoded();
+                if (encoded == null) throw new KeyStoreException("Cannot import an unexportable key");
+                try {
+                    AndroidKeyStoreAuthPolicy policy = AndroidKeyStoreAuthPolicy.from(kp, "AES", encoded.length * 8);
+                    backend.putKey(alias, "AES", encoded, policy);
+                } catch (java.security.InvalidAlgorithmParameterException invalid) { throw new KeyStoreException(invalid); }
+                return;
+            }
         } else if (protParam instanceof KeyStore.PasswordProtection) {
             password = ((KeyStore.PasswordProtection) protParam).getPassword();
         } else if (protParam != null) {

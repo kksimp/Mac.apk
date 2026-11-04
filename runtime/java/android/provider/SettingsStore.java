@@ -84,6 +84,17 @@ final class SettingsStore {
             p.setProperty(NS_GLOBAL + "transition_animation_scale", "1.0");
         if (!p.containsKey(NS_GLOBAL + "window_animation_scale"))
             p.setProperty(NS_GLOBAL + "window_animation_scale", "1.0");
+        // A set-up device reports provisioning complete. The Play Store gates
+        // app downloads on this ("IQ: Expedited install constraint provisioned
+        // check failed." -> the install sits pending forever), and other apps
+        // treat an unprovisioned device as mid-setup-wizard. Mac.apk is always a
+        // fully set-up device, so report it as such. global/device_provisioned
+        // and secure/user_setup_complete are the two flags the framework and GMS
+        // read; both are 1 on a provisioned device.
+        if (!p.containsKey(NS_GLOBAL + "device_provisioned"))
+            p.setProperty(NS_GLOBAL + "device_provisioned", "1");
+        if (!p.containsKey(NS_SECURE + "user_setup_complete"))
+            p.setProperty(NS_SECURE + "user_setup_complete", "1");
         boolean newId = false;
         if (!p.containsKey(NS_SECURE + "android_id")) {
             long id = new java.security.SecureRandom().nextLong();
@@ -260,7 +271,72 @@ final class SettingsStore {
             // cannot honour.
             if ("screen_brightness_mode".equals(name)) return "0";
         }
+        // Settings.Global.BOOT_COUNT: every device has it (the system bumps it
+        // once per boot; Google Play services' boot-count telemetry reads it
+        // and logs "Could not find system setting for BOOT_COUNT" without it).
+        // The true value here is this MAC's boot count, counted from the first
+        // time Mac.apk saw it (hostBootCount).
+        if (NS_GLOBAL.equals(ns) && "boot_count".equals(name)) return hostBootCount();
+        // Settings.Global.ADB_ENABLED: 1 only on a GMS host the owner opted into
+        // accepting debug-signed Google apps (the broker sets MACAPK_DEBUG_CERTS=1).
+        // GMS's GoogleCertificates gate (m5.cg.b) reads this as the first of two
+        // conditions before it will trust a debug-signed caller via its developer
+        // override. This is the honest "USB debugging is on" answer for a dev
+        // environment, scoped to that one process; an app that set its own value
+        // got it back above. Not set otherwise, so every other app sees it unset
+        // exactly as before.
+        if (NS_GLOBAL.equals(ns) && "adb_enabled".equals(name)
+                && "1".equals(System.getenv("MACAPK_DEBUG_CERTS"))) return "1";
         return null;
+    }
+
+    /** How many times this Mac has booted since Mac.apk first counted, as a
+     *  string, or null if it cannot be determined. The boot is identified by
+     *  launchd's (pid 1) start time, which is the kernel's boot; the count
+     *  lives in a small file shared by every app and is bumped under a file
+     *  lock when that boot time changes, so apps opening together count one
+     *  boot once. */
+    static String hostBootCount() {
+        try {
+            java.util.Optional<java.time.Instant> st = ProcessHandle.of(1)
+                .flatMap(h -> h.info().startInstant());
+            if (!st.isPresent()) return null;
+            long boot = st.get().getEpochSecond();
+            java.io.File f = new java.io.File(com.macapk.loader.SharedStorage.hostHome(),
+                    "Library/Application Support/Mac.apk/boot_count");
+            f.getParentFile().mkdirs();
+            try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "rw");
+                 java.nio.channels.FileLock lock = raf.getChannel().lock()) {
+                String line = raf.length() > 0 ? raf.readLine() : null;
+                long seenBoot = 0, count = 0;
+                if (line != null) {
+                    String[] p = line.trim().split(" ");
+                    if (p.length == 2) { seenBoot = Long.parseLong(p[0]); count = Long.parseLong(p[1]); }
+                }
+                // Allow a few seconds of jitter in the reported start time.
+                if (Math.abs(boot - seenBoot) > 5) {
+                    count++;
+                    raf.setLength(0);
+                    raf.write((boot + " " + count + "\n").getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                }
+                return Long.toString(count);
+            }
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** The names stored in one namespace (what a whole-table query lists). */
+    static java.util.List<String> names(String ns) {
+        ensureLoaded();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        synchronized (LOCK) {
+            for (String k : sProps.stringPropertyNames()) {
+                if (k.startsWith(ns)) out.add(k.substring(ns.length()));
+            }
+        }
+        java.util.Collections.sort(out);
+        return out;
     }
 
     static boolean putString(String ns, String name, String value) {

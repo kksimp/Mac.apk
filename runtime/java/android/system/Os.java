@@ -110,6 +110,57 @@ public class Os {
     public static int getuid() { return 1000; }
     public static int getgid() { return 1000; }
     public static int getpid() { return (int) ProcessHandle.current().pid(); }
+    /** AOSP Os.gettid (libcore Linux_gettid -> gettid(2)); android.os.Process.myTid()
+     *  is defined as this on Android, so both answer the same id here. Play Store's
+     *  signed-out screen called it from its main thread (NoSuchMethodError). */
+    public static int gettid() { return android.os.Process.myTid(); }
+
+    /** AOSP Os.prctl (libcore Linux_prctl -> prctl(2)). macOS has no prctl, and
+     *  the options apps reach it for are Linux process attributes with no host
+     *  equivalent -- PR_SET_DUMPABLE (toggles core-dump/ptrace eligibility, which
+     *  Google Play services' Application sets to 1 to "enable native stack dump
+     *  capture") and the like. Report success (0) the way the syscall would on a
+     *  device so the caller proceeds; we do not actually change the host
+     *  process's dumpability (and must not make ourselves non-debuggable).
+     *  PR_GET_DUMPABLE answers the Linux default (1 = dumpable). This is a
+     *  faithful no-op surface, not a bypass: no anti-debug is defeated, because
+     *  the caller here is ENABLING dumpability, not hardening. */
+    public static int prctl(int option, long arg2, long arg3, long arg4, long arg5)
+            throws ErrnoException {
+        if (option == OsConstants.PR_GET_DUMPABLE) return 1;
+        return 0;
+    }
+
+    /** AOSP Os.chmod (libcore Linux_chmod -> chmod(2)). macOS is POSIX, so set
+     *  the mode's owner/group/other rwx bits through java.nio. Only the low 9
+     *  permission bits map to PosixFilePermission (setuid/setgid/sticky have no
+     *  portable Files API and are irrelevant to the app-private dirs apps chmod);
+     *  Google Play services chmods its own data dirs during attachBaseContext. */
+    public static void chmod(String path, int mode) throws ErrnoException {
+        if (path == null) throw new ErrnoException("chmod", OsConstants.ENOENT);
+        java.util.Set<java.nio.file.attribute.PosixFilePermission> perms =
+                java.util.EnumSet.noneOf(java.nio.file.attribute.PosixFilePermission.class);
+        java.nio.file.attribute.PosixFilePermission[] bits = {
+            java.nio.file.attribute.PosixFilePermission.OTHERS_EXECUTE,
+            java.nio.file.attribute.PosixFilePermission.OTHERS_WRITE,
+            java.nio.file.attribute.PosixFilePermission.OTHERS_READ,
+            java.nio.file.attribute.PosixFilePermission.GROUP_EXECUTE,
+            java.nio.file.attribute.PosixFilePermission.GROUP_WRITE,
+            java.nio.file.attribute.PosixFilePermission.GROUP_READ,
+            java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE,
+            java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+            java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+        };
+        for (int i = 0; i < 9; i++) if ((mode & (1 << i)) != 0) perms.add(bits[i]);
+        try {
+            java.nio.file.Files.setPosixFilePermissions(
+                    new java.io.File(path).toPath(), perms);
+        } catch (java.nio.file.NoSuchFileException e) {
+            throw new ErrnoException("chmod", OsConstants.ENOENT);
+        } catch (java.io.IOException e) {
+            throw new ErrnoException("chmod", OsConstants.EIO);
+        }
+    }
 
     /** AOSP Os.readlink (API 21): the target path of a symlink. libcore's
      *  Linux.readlink is readlink(2) (libcore/luni/src/main/native/

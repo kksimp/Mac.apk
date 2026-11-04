@@ -60,6 +60,13 @@ public final class DexPathList {
         }
     }
 
+    /** AOSP DexPathList.addDexPath: append one element. */
+    synchronized void addDexPath(String p) {
+        Object[] n = java.util.Arrays.copyOf(dexElements, dexElements.length + 1);
+        n[dexElements.length] = new Element(new File(p));
+        dexElements = n;
+    }
+
     /** AOSP: search the native-library directories for a lib. Mac.apk resolves
      *  native libs in AppClassLoader.findLibrary, not here, so this returns null
      *  (callers fall back to the loader's findLibrary). */

@@ -21,6 +21,18 @@ public class Path {
     private final Path2D.Double path = new Path2D.Double();
     private FillType fillType = FillType.WINDING;
 
+    /**
+     * AOSP's {@code public final long mNativePath} (frameworks/base/graphics/java/android/graphics/Path.java,
+     * @UnsupportedAppUsage): the address of the native SkPath. Apps and their own JNI read it by name:
+     * AndroidX's libandroidx.graphics.path.so resolves it with GetFieldID("mNativePath", "J") in JNI_OnLoad
+     * on every API level, and a miss left a pending NoSuchFieldError that aborted System.loadLibrary (Play
+     * Store's lyk.<clinit>, killing the main thread). This Path is a Java Path2D with no SkPath behind
+     * it, so the handle is 0 (a null SkPath*). The only native reader of the field in that library is its
+     * pre-API-34 iterator, which androidx selects with Build.VERSION.SDK_INT; at the API level we
+     * present, Path.getPathIterator() (the platform iterator) is used instead.
+     */
+    public final long mNativePath = 0L;
+
     // --- AOSP's simple-path Region fast path: the STATE half -------------
     //
     // AOSP's BaseCanvas.drawPath does not always rasterize the path

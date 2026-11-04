@@ -9,9 +9,11 @@
 
 #include "macapk/native_methods.h"
 #include "macapk/gms_signin.h"
+#include "macapk/native_host_proxy.h"
 #include "macapk/cocoa_bridge.h"
 #include "macapk/self_capture.h"   // SelfCaptureGlWanted
 #include "macapk/gles_bridge.h"
+#include "macapk/user_verification_bridge.h"
 
 #include <atomic>
 #include <cstdint>
@@ -494,6 +496,23 @@ void Cocoa_setSystemProperty(JNIEnv* env, jclass, jstring key_j, jstring val_j) 
     if (key) env->ReleaseStringUTFChars(key_j, key);
 }
 
+// The shim's synthesized host file for a /proc path (bionic_shim.cpp
+// __macapk_remap_proc_path), so Java reads of /proc/self/* see what native
+// code sees. Null when the path is not one the shim answers.
+jstring Cocoa_remapProcPath(JNIEnv* env, jclass, jstring path_j) {
+    if (!path_j) return nullptr;
+    typedef int (*remap_fn_t)(const char*, char*, size_t);
+    static remap_fn_t fn = reinterpret_cast<remap_fn_t>(
+        dlsym(RTLD_DEFAULT, "__macapk_remap_proc_path"));
+    if (!fn) return nullptr;
+    const char* path = env->GetStringUTFChars(path_j, nullptr);
+    if (!path) return nullptr;
+    char out[PATH_MAX];
+    int n = fn(path, out, sizeof out);
+    env->ReleaseStringUTFChars(path_j, path);
+    return n > 0 ? env->NewStringUTF(out) : nullptr;
+}
+
 void Cocoa_setDataSubdir(JNIEnv* env, jclass, jstring subdir_j) {
     if (!subdir_j) return;
     const char* subdir = env->GetStringUTFChars(subdir_j, nullptr);
@@ -856,6 +875,9 @@ const JNINativeMethod kNativeCocoaMethods[] = {
     {const_cast<char*>("setDataSubdir"),
      const_cast<char*>("(Ljava/lang/String;)V"),
      reinterpret_cast<void*>(Cocoa_setDataSubdir)},
+    {const_cast<char*>("remapProcPath"),
+     const_cast<char*>("(Ljava/lang/String;)Ljava/lang/String;"),
+     reinterpret_cast<void*>(Cocoa_remapProcPath)},
     {const_cast<char*>("setNativeLibDir"),
      const_cast<char*>("(Ljava/lang/String;)V"),
      reinterpret_cast<void*>(Cocoa_setNativeLibDir)},
@@ -4379,6 +4401,8 @@ namespace gamepad { void RegisterGamepadBridgeMethods(JNIEnv* env); }
 // com.macapk.loader.LocationBridge's JNI methods (macOS Location Services ->
 // android.location.LocationManager).
 namespace location { void RegisterLocationBridgeMethods(JNIEnv* env); }
+namespace bluetooth { void RegisterBluetoothBridgeMethods(JNIEnv* env); }
+namespace bluetoothperipheral { void RegisterBluetoothPeripheralBridgeMethods(JNIEnv* env); }
 // Forward-declared from nowplaying_bridge.mm; registers
 // android.media.session.MacApkNowPlaying (the active MediaSession <-> macOS
 // Now Playing and its remote commands). Soft-fails on a jar that lacks it.
@@ -4442,6 +4466,7 @@ void RegisterAllNativeMethods(JNIEnv* env) {
          sizeof(kNativeLogMethods)   / sizeof(kNativeLogMethods[0]));
     Bind(env, "com/macapk/loader/NativeLog",   kNativeQos,
          sizeof(kNativeQos)          / sizeof(kNativeQos[0]));
+    RegisterHostProxyNativeMethods(env);
     Bind(env, "com/macapk/loader/NativeLog",   kNativeBootTime,
          sizeof(kNativeBootTime)     / sizeof(kNativeBootTime[0]));
     Bind(env, "com/macapk/loader/NativeLog",   kNativePairipGate,
@@ -4500,6 +4525,7 @@ void RegisterAllNativeMethods(JNIEnv* env) {
     sqlite::RegisterNativeSqliteMethods(env);
     osnative::RegisterNativeOsMethods(env);
     audio::RegisterNativeAudioMethods(env);
+    RegisterUserVerificationNativeMethods(env);
     audioin::RegisterAudioInputMethods(env);
     media::RegisterNativeMediaMethods(env);
     video::RegisterNativeVideoMethods(env);
@@ -4508,6 +4534,8 @@ void RegisterAllNativeMethods(JNIEnv* env) {
     camera::RegisterCameraBridgeMethods(env);
     gamepad::RegisterGamepadBridgeMethods(env);
     location::RegisterLocationBridgeMethods(env);
+    bluetooth::RegisterBluetoothBridgeMethods(env);
+    bluetoothperipheral::RegisterBluetoothPeripheralBridgeMethods(env);
     nowplaying::RegisterNowPlayingBridgeMethods(env);
     webview::RegisterWebViewBridgeMethods(env);
     clipboard::RegisterClipboardBridgeMethods(env);

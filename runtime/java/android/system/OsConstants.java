@@ -56,6 +56,25 @@ public final class OsConstants {
     public static final int S_IFIFO  = 0010000;
     public static final int S_IFLNK  = 0120000;
     public static final int S_IFSOCK = 0140000;
+    // File-mode PERMISSION bits (Linux sys/stat.h; AOSP OsConstants exposes
+    // them). The S_IF* type bits above were present but these were not, so an
+    // app reading e.g. OsConstants.S_IXUSR for an Os.chmod mode threw
+    // NoSuchFieldError (Google Play services does this during attachBaseContext).
+    public static final int S_ISUID = 0004000;
+    public static final int S_ISGID = 0002000;
+    public static final int S_ISVTX = 0001000;
+    public static final int S_IRWXU = 0000700;
+    public static final int S_IRUSR = 0000400;
+    public static final int S_IWUSR = 0000200;
+    public static final int S_IXUSR = 0000100;
+    public static final int S_IRWXG = 0000070;
+    public static final int S_IRGRP = 0000040;
+    public static final int S_IWGRP = 0000020;
+    public static final int S_IXGRP = 0000010;
+    public static final int S_IRWXO = 0000007;
+    public static final int S_IROTH = 0000004;
+    public static final int S_IWOTH = 0000002;
+    public static final int S_IXOTH = 0000001;
 
     // mode helpers used by F-Droid's StorageUtils
     public static boolean S_ISDIR (int mode) { return (mode & S_IFMT) == S_IFDIR;  }
@@ -69,6 +88,15 @@ public final class OsConstants {
     public static final int SEEK_SET = 0;
     public static final int SEEK_CUR = 1;
     public static final int SEEK_END = 2;
+
+    // prctl(2) options (Linux asm-generic/prctl.h). AOSP's OsConstants exposes
+    // these and Os.prctl wraps the syscall. Google Play services' Application
+    // reads PR_SET_DUMPABLE in its constructor (Os.prctl(PR_SET_DUMPABLE, 1,...)
+    // to enable native stack-dump capture); the value must exist or the field
+    // access throws NoSuchFieldError (an Error, so its catch(Exception) does not
+    // save it). Values are the stable Linux constants.
+    public static final int PR_SET_DUMPABLE = 4;
+    public static final int PR_GET_DUMPABLE = 3;
 
     public static final int _SC_CLK_TCK = 6;
     public static final int _SC_PAGE_SIZE = 40;

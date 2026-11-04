@@ -8,7 +8,7 @@ import java.util.List;
 public final class SdkSandboxController {
     public SdkSandboxController() { }
     public String getClientPackageName() {
-        String pkg = com.macapk.loader.Boot.processName();
+        String pkg = com.macapk.loader.Boot.packageName();
         return pkg != null ? pkg : "";
     }
     public List<android.app.sdksandbox.SandboxedSdk> getSandboxedSdks() {

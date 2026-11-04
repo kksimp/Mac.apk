@@ -18,6 +18,7 @@ public abstract class NumberFormatterSettings<T extends NumberFormatterSettings<
     NumberFormatter.SignDisplay mSignDisplay;
     NumberFormatter.GroupingStrategy mGrouping;
     Integer mMinIntegerDigits;
+    java.math.RoundingMode mRoundingMode;
 
     NumberFormatterSettings() { }
 
@@ -48,6 +49,16 @@ public abstract class NumberFormatterSettings<T extends NumberFormatterSettings<
         T c = copy(); ((NumberFormatterSettings<?>) c).mGrouping = strategy; return c;
     }
 
+    /** ICU NumberFormatterSettings.roundingMode(RoundingMode): the rounding
+     *  direction applied when the precision truncates digits. Immutable-builder
+     *  like every sibling. Honored by LocalizedNumberFormatter.format via
+     *  java.text.DecimalFormat.setRoundingMode. Play Services' price/size
+     *  formatters chain this and hit NoSuchMethodError without it. */
+    @SuppressWarnings("unchecked")
+    public T roundingMode(java.math.RoundingMode roundingMode) {
+        T c = copy(); ((NumberFormatterSettings<?>) c).mRoundingMode = roundingMode; return c;
+    }
+
     @SuppressWarnings("unchecked")
     public T integerWidth(IntegerWidth style) {
         T c = copy();
@@ -63,6 +74,7 @@ public abstract class NumberFormatterSettings<T extends NumberFormatterSettings<
         other.mSignDisplay = mSignDisplay;
         other.mGrouping = mGrouping;
         other.mMinIntegerDigits = mMinIntegerDigits;
+        other.mRoundingMode = mRoundingMode;
     }
 
     @SuppressWarnings("unchecked")

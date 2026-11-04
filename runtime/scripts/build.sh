@@ -86,7 +86,15 @@ mkdir -p "$TMP"
 JAVA_LIST="$BUILD/.java.list"
 find "$RT_DIR/java" -name '*.java' ! -path '* [2-9].java' \
     | sort > "$JAVA_LIST"
-"$JAVAC" -d "$TMP" --release 21 -Xlint:-options @"$JAVA_LIST"
+# Android's org.apache.http.legacy (thirdparty/apache-http-legacy/README.md):
+# the REAL Apache HttpClient Android ships, pulled from an Android 14 system
+# image and converted with our DEX converter. On the javac classpath so the
+# framework's own boot-classpath slice of org.apache.http compiles against it,
+# then unpacked into the framework jar (never over a class we compiled).
+APACHE_LEGACY="$RT_DIR/../thirdparty/apache-http-legacy/org.apache.http.legacy.jvm.jar"
+APACHE_CP=(); [ -f "$APACHE_LEGACY" ] && APACHE_CP=(-cp "$APACHE_LEGACY")
+"$JAVAC" -d "$TMP" --release 21 -Xlint:-options "${APACHE_CP[@]}" @"$JAVA_LIST"
+[ -f "$APACHE_LEGACY" ] && ( cd "$TMP" && unzip -qn "$APACHE_LEGACY" -x 'META-INF/*' )
 
 echo "[build] Packaging android-framework.jar..."
 # iCloud sync occasionally creates conflict siblings (e.g.
@@ -376,6 +384,11 @@ echo "[build] Building Skia Metal bridge..."
 cmake --build . --target macapk-skia-metal -- -j
 ditto libmacapk-skia-metal.dylib "$BIN/libmacapk-skia-metal.dylib"
 codesign --force --sign - "$BIN/libmacapk-skia-metal.dylib"
+
+echo "[build] Building cross-process Binder transport..."
+cmake --build . --target macapk-binder -- -j
+ditto libmacapk-binder.dylib "$BIN/libmacapk-binder.dylib"
+codesign --force --sign - "$BIN/libmacapk-binder.dylib"
 
 # Stage with ditto, NEVER cp (v1.0.943 staleness lane). cp overwrites the
 # destination IN PLACE (same inode). macOS caches code-signature info by inode

@@ -102,10 +102,22 @@ public final class ResourceIndex {
     public static final class StyleDef {
         public final String name;
         public final String parent;  // may be null if no parent
+        // Parent style RESOURCE ID (0 if none/unknown). The id-keyed parent
+        // link that survives R8 resource-name obfuscation: there, every
+        // style's NAME collapses to one shared placeholder, so the `parent`
+        // name string (ArscReader.formatRef) jumps to an arbitrary wrong
+        // node. The id resolves through idToTypeName to the unique settled
+        // name the parent was actually stored under. 0 for the text/framework
+        // paths, which keep the historical name-string walk.
+        public final int parentRef;
         public final Map<String, String> items;
         public StyleDef(String n, String p, Map<String, String> i) {
+            this(n, p, 0, i);
+        }
+        public StyleDef(String n, String p, int pRef, Map<String, String> i) {
             this.name = n;
             this.parent = p;
+            this.parentRef = pRef;
             this.items = i;
         }
     }
@@ -260,8 +272,7 @@ public final class ResourceIndex {
     // with (whose own field initializer is Locale.getDefault(), i.e. the
     // host's language on macOS), so rebuilding the index after an in-app
     // language switch re-resolves against the new locale.
-    private String cfgLanguage = "";    // lowercase ISO-639, "" when unknown
-    private String cfgRegion   = "";    // uppercase ISO-3166, "" when unknown
+    private final android.os.LocaleList cfgLocales;
 
     /** `apkPath` is the installed base.apk (v1.0.1585; the split_*.apk
      *  siblings are the rest of the app, see InstalledSplits). Every member's
@@ -270,6 +281,7 @@ public final class ResourceIndex {
      *  v1.0.1590 step 9b: the `File apktoolDir` parameter the constructors
      *  carried for the text tree is gone with it. */
     public ResourceIndex(android.content.res.Configuration cfg, String apkPath) {
+        cfgLocales = cfg != null ? cfg.getLocales() : android.os.LocaleList.getDefault();
         if (cfg != null) {
             cfgScreenWidthDp         = cfg.screenWidthDp;
             cfgScreenHeightDp        = cfg.screenHeightDp;
@@ -283,17 +295,6 @@ public final class ResourceIndex {
         }
         cfgScreenLayout = (cfg != null) ? cfg.screenLayout
                                         : macapkDerivedScreenLayout(cfgScreenWidthDp, cfgScreenHeightDp);
-        java.util.Locale loc = (cfg != null && cfg.locale != null)
-            ? cfg.locale : java.util.Locale.getDefault();
-        if (loc != null) {
-            // Locale.getLanguage() returns the same legacy ISO-639 codes
-            // Android's resource table stores ("iw"/"in"/"ji"), so the two
-            // spellings already agree and need no remapping.
-            String lang = loc.getLanguage();
-            if (lang != null) cfgLanguage = lang.toLowerCase(java.util.Locale.ROOT);
-            String ctry = loc.getCountry();
-            if (ctry != null) cfgRegion = ctry.toUpperCase(java.util.Locale.ROOT);
-        }
         // ---- the data source: resources.arsc, of every member of the installed set ----
         // Ingested directly (ArscReader, byte-verified vs apktool at
         // v1.0.756-757 and on the whole corpus 2026-09-20: 189,595 ids /
@@ -895,7 +896,10 @@ public final class ResourceIndex {
     // bypasses it; MACAPK_FWVIEW_DISK_CACHE_VERIFY=1 builds AND replays and
     // logs any field mismatch (the positive control).
     private static final int MACAPK_FWVIEW_CACHE_MAGIC = 0x4657_5631;   // "FWV1"
-    private static final int MACAPK_FWVIEW_CACHE_FORMAT_VER = 1;
+    // 2: macapkStyleItemKey / macapkFwItemText keep ^attr-private items and hops.
+    private static final int MACAPK_FWVIEW_CACHE_FORMAT_VER = 2;
+    /** ArscReader's type/name spelling of a private platform attribute. */
+    static final String ATTR_PRIVATE_PREFIX = "^attr-private/";
 
     /** The framework's own -w/-h/-sw dp thresholds, set by the last live build
      *  (macapkBuildFwViewUncached) so the wrapper can canonicalize the config
@@ -944,7 +948,7 @@ public final class ResourceIndex {
         final int sl = cfgScreenLayout & macapkLayoutBitsSelectedBy(thr);
         return cfgDensityDpi + "|" + cfgNight + "|" + cfgOrientation + "|"
             + w + "x" + h + "|" + sw
-            + "|" + cfgLanguage + "-" + cfgRegion + "|" + cfgResSdk
+            + "|" + cfgLocales.toLanguageTags() + "|" + cfgResSdk
             + (MACAPK_RES_SIZECLASS ? "|sl" + Integer.toHexString(sl) : "");
     }
 
@@ -1004,6 +1008,43 @@ public final class ResourceIndex {
      *  core/jni/android_util_AssetManager.cpp:1038-1041). Lazily built once per
      *  index; the tables never change after ingest. */
     private volatile int[][] macapkAppSizeBuckets;
+
+    /** BCP-47 tags of the locales this app ships resources for, read from the
+     *  config qualifier of every table row (values-fr, values-fr-rCA,
+     *  values-b+sr+Latn+RS). Feeds the Language menu when the manifest declares
+     *  no android:localeConfig (Settings > App languages lists only declared
+     *  locales; a Mac menu has no such gate, and setApplicationLocales accepts
+     *  any tag). Sorted, deduplicated, never contains the default (empty) config. */
+    public java.util.List<String> macapkResourceLocaleTags() {
+        java.util.TreeSet<String> out = new java.util.TreeSet<>();
+        java.util.HashSet<String> cfgs = new java.util.HashSet<>();
+        for (ArscReader t : macapkTables) {
+            for (ArscReader.Row r : t.rows()) {
+                if (r.config != null && !r.config.isEmpty()) cfgs.add(r.config);
+            }
+        }
+        for (String cfg : cfgs) {
+            String[] parts = cfg.split("-");
+            for (int i = 0; i < parts.length; i++) {
+                String q = parts[i];
+                if (q.startsWith("b+") && q.length() > 2) {
+                    out.add(q.substring(2).replace('+', '-'));
+                    break;
+                }
+                // "car" is also the uiMode qualifier; no ISO-639 language is shadowed
+                // by it in a way an app ships, and a false "car" row is harmless.
+                if (isLangCode(q) && !q.equals("car")) {
+                    String tag = q;
+                    if (i + 1 < parts.length && isRegionCode(parts[i + 1])) {
+                        tag += "-" + parts[i + 1].substring(1);
+                    }
+                    out.add(tag);
+                    break;
+                }
+            }
+        }
+        return new java.util.ArrayList<>(out);
+    }
 
     public int[][] macapkAppSizeBuckets() {
         int[][] b = macapkAppSizeBuckets;
@@ -1090,6 +1131,7 @@ public final class ResourceIndex {
      *  the sidecar exists) answers "any dp change", which only costs a rebuild. */
     public boolean macapkSelectionChangesFor(android.content.res.Configuration next) {
         if (next == null) return false;
+        if (!cfgLocales.equals(next.getLocales())) return true;
         int o = next.orientation != 0 ? next.orientation : 1;
         if (o != cfgOrientation) return true;
         if (next.densityDpi > 0 && next.densityDpi != cfgDensityDpi) return true;
@@ -1691,6 +1733,11 @@ public final class ResourceIndex {
                 if (tn != null && tn.startsWith("attr/")) {
                     return "?android:" + tn.substring(5);
                 }
+                // A private platform attr hop (see macapkStyleItemKey).
+                if (tn != null && tn.startsWith(ATTR_PRIVATE_PREFIX)
+                        && tn.length() > ATTR_PRIVATE_PREFIX.length()) {
+                    return "?android:" + tn.substring(ATTR_PRIVATE_PREFIX.length());
+                }
                 return String.format("?0x%08x", data);
             }
             case ArscReader.TYPE_REFERENCE:
@@ -2183,6 +2230,40 @@ public final class ResourceIndex {
         return false;   // needs at least offset|length|
     }
 
+    /** A token-shaped value ("X|hex|hex|hex") of a file-backed resource type whose
+     *  blob letter we do not know. Not served (we cannot say which blob it
+     *  addresses), but logged ONCE with the APK's candidate blob assets so a
+     *  run log names the format instead of showing a bare "no XML found".
+     *  Always returns false: the row is not kept. */
+    private boolean macapkUnknownTokenLogged;
+    private boolean macapkNoteUnknownPackedToken(int mi, ArscReader.Row row) {
+        String v = row.value;
+        if (macapkUnknownTokenLogged || v == null || v.length() < 8 || v.charAt(1) != '|'
+                || !Character.isLetter(v.charAt(0)) || !FILE_ALIAS_TYPES.contains(row.type)) return false;
+        int bars = 0;
+        for (int i = 2; i < v.length(); i++) {
+            char c = v.charAt(i);
+            if (c == '|') { bars++; continue; }
+            if (Character.digit(c, 16) < 0) return false;
+        }
+        if (bars < 2) return false;
+        macapkUnknownTokenLogged = true;
+        StringBuilder blobs = new StringBuilder();
+        try {
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> en = macapkMemberZip(mi).entries();
+            while (en.hasMoreElements() && blobs.length() < 400) {
+                java.util.zip.ZipEntry e = en.nextElement();
+                String n = e.getName();
+                if (n.startsWith("assets/") && (n.contains(".bin") || n.endsWith(".xz")))
+                    blobs.append(' ').append(n).append('(').append(e.getSize()).append(')');
+            }
+        } catch (Throwable ignored) { }
+        NativeLog.w(TAG, "packed resource token with unknown blob letter '" + v.charAt(0)
+                + "' (" + row.type + " 0x" + Integer.toHexString(row.resId) + " = " + v
+                + "); candidate blob assets:" + (blobs.length() == 0 ? " none" : blobs));
+        return false;
+    }
+
     private int macapkIngestFileRows(List<ArscReader> tables) {
         fileRowById.clear();
         final Map<String, Integer> cfgScore = new HashMap<>();
@@ -2210,15 +2291,23 @@ public final class ResourceIndex {
                 // this does the same. Types whose STRING value is real content
                 // (string/plurals/array/...) are NOT in the set, so a plain
                 // <string> can never be mistaken for a file.
-                // NARROW ON PURPOSE: accept a non-res/ value ONLY when it is
-                // literally a packed token we know how to serve
-                // ("<L>|<hexOff>|<hexLen>|..."). Keying on the token's shape means
-                // an app without packed resources sees byte-identical ingest --
-                // an earlier, looser rule ("any file-backed TYPE") would have
-                // added rows for ordinary apps too and changed getValue's branch
-                // for them, which is fleet risk this fix does not need.
+                // Resource optimizers also shorten real ZIP paths (for example
+                // r/mht.xml). Accept those only for file-backed resource types
+                // and only when the owning APK contains the exact file. A plain
+                // string whose text happens to match a ZIP entry stays a value.
                 if (!row.value.startsWith("res/")
-                        && !macapkLooksLikePackedToken(row.value)) continue;
+                        && !macapkLooksLikePackedToken(row.value)
+                        && !macapkNoteUnknownPackedToken(mi, row)) {
+                    if (!FILE_ALIAS_TYPES.contains(row.type)
+                            && !"color".equals(row.type)
+                            && !"navigation".equals(row.type)) continue;
+                    try {
+                        java.util.zip.ZipEntry file = macapkMemberZip(mi).getEntry(row.value);
+                        if (file == null || file.isDirectory()) continue;
+                    } catch (java.io.IOException unreadableMember) {
+                        continue;
+                    }
+                }
                 Integer sc = cfgScore.get(row.config);
                 if (sc == null) {
                     sc = macapkFileCfgScore(row.config);
@@ -2410,16 +2499,34 @@ public final class ResourceIndex {
         byte[] out = null;
         try {
             byte[] xz = null;
-            for (int mi = 0; mi < macapkMembers.size() && xz == null; mi++) {
-                java.util.zip.ZipFile zf = macapkMemberZip(mi);
-                if (zf == null) continue;
-                java.util.zip.ZipEntry e = zf.getEntry(blobName);
-                if (e == null) continue;
-                try (InputStream in = zf.getInputStream(e)) { xz = in.readAllBytes(); }
+            // The blob ships under several names: layouts.bin.xz (Instagram 445),
+            // layouts.bin.spo (452: a small container header, then a standard xz
+            // stream) or the bare layouts.bin. Try each in order.
+            String stem = blobName.endsWith(".xz")
+                    ? blobName.substring(0, blobName.length() - 3) : blobName;
+            String[] names = { blobName, stem + ".spo", stem };
+            for (int ni = 0; ni < names.length && xz == null; ni++) {
+                for (int mi = 0; mi < macapkMembers.size() && xz == null; mi++) {
+                    java.util.zip.ZipFile zf = macapkMemberZip(mi);
+                    java.util.zip.ZipEntry e = zf == null ? null : zf.getEntry(names[ni]);
+                    if (e == null) continue;
+                    try (InputStream in = zf.getInputStream(e)) { xz = in.readAllBytes(); }
+                }
             }
             if (xz != null) {
+                // Find the xz magic (FD 37 7A 58 5A 00): at 0 for a bare stream,
+                // after the container header for .spo (offset 0x83 in 452).
+                // Anything with no magic in the first 4 KB is taken as the blob's
+                // stored bytes.
+                int at = -1;
+                for (int i = 0; i + 6 <= xz.length && i < 4096; i++) {
+                    if ((xz[i] & 0xff) == 0xFD && xz[i + 1] == 0x37 && xz[i + 2] == 0x7A
+                            && xz[i + 3] == 0x58 && xz[i + 4] == 0x5A && xz[i + 5] == 0x00) { at = i; break; }
+                }
+                if (at > 0) xz = java.util.Arrays.copyOfRange(xz, at, xz.length);
+                boolean isXz = at >= 0;
                 // macOS's Compression framework; Java SE has no XZ decoder.
-                out = NativeOs.xzDecompress(xz);
+                out = isXz ? NativeOs.xzDecompress(xz) : xz;
                 if (out != null) {
                     NativeLog.i(TAG, "packed resource blob " + blobName + ": "
                             + xz.length + " bytes xz -> " + out.length
@@ -2639,6 +2746,20 @@ public final class ResourceIndex {
     private static final int MACAPK_ATTR_TYPE_ENUM  = 1 << 16;
     private static final int MACAPK_ATTR_TYPE_FLAGS = 1 << 17;
 
+    /** Keep references tied to their resource ID after collapsed names have
+     *  been assigned distinct names by macapkIngestRows. The reader's original
+     *  formatted name may be shared by thousands of otherwise different IDs. */
+    private String macapkIngestReference(int type, int id, String fallback) {
+        boolean attr = type == ArscReader.TYPE_ATTRIBUTE
+                || type == ArscReader.TYPE_DYNAMIC_ATTRIBUTE;
+        boolean ref = type == ArscReader.TYPE_REFERENCE
+                || type == ArscReader.TYPE_DYNAMIC_REFERENCE;
+        if (!attr && !ref) return fallback;
+        String[] target = idToTypeName.get(id);
+        if (target == null) return fallback;
+        return (attr ? "?" : "@") + target[0] + "/" + target[1];
+    }
+
     /** One row into the map the matching text loader would have filled.
      *  Each branch's contract is the corresponding load*Values method. */
     private void macapkIngestRow(ArscReader.Row row, int[] n) {
@@ -2658,6 +2779,7 @@ public final class ResourceIndex {
             rawTypedById.put(row.resId,
                 new Object[] { row.dataType, row.data, row.value });
         }
+        String value = macapkIngestReference(row.dataType, row.data, row.value);
         switch (row.type) {
             case "string":
                 if (!row.complex) {
@@ -2667,7 +2789,7 @@ public final class ResourceIndex {
                     // References ("@string/x") arrive formatted and are
                     // chased at read time by macapkResolveStringChain,
                     // same as the text path.
-                    stringValues.put(name, row.value);
+                    stringValues.put(name, value);
                     ++n[0];
                 }
                 return;
@@ -2679,7 +2801,7 @@ public final class ResourceIndex {
                         // keywords (other/zero/one/two/few/many) for a
                         // plurals bag; anything else is unresolvable.
                         if (it.name != null && !it.name.isEmpty()) {
-                            forms.put(it.name, it.value);
+                            forms.put(it.name, macapkIngestReference(it.dataType, it.data, it.value));
                         }
                     }
                     if (!forms.isEmpty()) { pluralValues.put(name, forms); ++n[1]; }
@@ -2703,7 +2825,8 @@ public final class ResourceIndex {
                     boolean allInt = count > 0;
                     for (int i = 0; i < count; ++i) {
                         ArscReader.MapItem it = row.items.get(i);
-                        arr[i] = it.value != null ? it.value : "";
+                        String itemValue = macapkIngestReference(it.dataType, it.data, it.value);
+                        arr[i] = itemValue != null ? itemValue : "";
                         allInt &= (it.dataType == ArscReader.TYPE_INT_DEC
                                 || it.dataType == ArscReader.TYPE_INT_HEX);
                     }
@@ -2755,7 +2878,7 @@ public final class ResourceIndex {
                             // is a small widening over the text loader
                             // (which only stored "@"), and resolveColorRef
                             // already handles it.
-                            colorRefs.put(name, row.value);
+                            colorRefs.put(name, value);
                             colorValues.remove(name);
                             ++n[6];
                             return;
@@ -2773,35 +2896,53 @@ public final class ResourceIndex {
                     // parent="" semantic for free, and the
                     // MACAPK_STYLE_PARENT_EMPTY escape hatch (a text-decode
                     // repair knob) intentionally does not apply.
-                    String parent = row.parentRef != 0 ? row.parent : null;
+                    String parent = row.parentRef != 0
+                            ? macapkIngestReference(ArscReader.TYPE_REFERENCE, row.parentRef, row.parent)
+                            : null;
                     Map<String, String> items = new HashMap<>();
                     for (ArscReader.MapItem it : row.items) {
-                        String k = macapkStyleItemKey(it.name);
-                        if (k != null) items.put(k, it.value);
+                        // Key each bag item by the attr's SETTLED name (the one
+                        // idToTypeName assigned to it.nameRef), not by the
+                        // formatRef string. Under R8 resource-name obfuscation
+                        // every app attr's name is the same placeholder, so the
+                        // string key collides and all-but-one item in the style
+                        // is lost (last-put-wins); the id-derived name is unique
+                        // per attr and matches exactly what macapkTypeNameOf
+                        // hands the obtainStyledAttributes request side. Falls
+                        // back to the string key for framework (android:) and
+                        // unmapped/pseudo-id (^index) attrs.
+                        String k = null;
+                        String[] itn = it.nameRef != 0 ? idToTypeName.get(it.nameRef) : null;
+                        if (itn != null && "attr".equals(itn[0]) && itn[1] != null) {
+                            k = itn[1];
+                        } else {
+                            k = macapkStyleItemKey(it.name);
+                        }
+                        if (k != null) items.put(k, macapkIngestReference(it.dataType, it.data, it.value));
                     }
-                    styleByName.put(name, new StyleDef(name, parent, items));
+                    styleByName.put(name, new StyleDef(name, parent, row.parentRef, items));
                     ++n[7];
                 }
                 return;
             case "dimen":
-                if (!row.complex && !row.value.isEmpty()) {
+                if (!row.complex && !value.isEmpty()) {
                     // Covers plain <dimen> (formatted "16.0dp"), references
                     // ("@dimen/x", chased at read time), AND the float
                     // <item type="dimen"> form the text loader missed (it
                     // only read <dimen> tags).
-                    dimenValues.put(name, row.value);
+                    dimenValues.put(name, value);
                     ++n[9];
                 }
                 return;
             case "fraction":
-                if (!row.complex && !row.value.isEmpty()) {
-                    fractionValues.put(name, row.value);
+                if (!row.complex && !value.isEmpty()) {
+                    fractionValues.put(name, value);
                     ++n[9];
                 }
                 return;
             case "bool":
-                if (!row.complex && !row.value.isEmpty()) {
-                    boolValues.put(name, row.value);   // "true"/"false"/"@bool/x"
+                if (!row.complex && !value.isEmpty()) {
+                    boolValues.put(name, value);   // "true"/"false"/"@bool/x"
                     ++n[10];
                 }
                 return;
@@ -2843,8 +2984,8 @@ public final class ResourceIndex {
                 if (!row.complex && FILE_ALIAS_TYPES.contains(row.type)
                         && (row.dataType == ArscReader.TYPE_REFERENCE
                             || row.dataType == ArscReader.TYPE_DYNAMIC_REFERENCE)
-                        && row.value.startsWith("@") && row.value.indexOf('/') > 0) {
-                    fileAliases.put(row.type + "/" + name, row.value);
+                        && value.startsWith("@") && value.indexOf('/') > 0) {
+                    fileAliases.put(row.type + "/" + name, value);
                     ++n[8];
                 }
         }
@@ -2859,6 +3000,19 @@ public final class ResourceIndex {
      *  keyed cannot be looked up either way). */
     private static String macapkStyleItemKey(String bagItemName) {
         if (bagItemName == null || bagItemName.isEmpty()) return null;
+        // A PRIVATE platform attr (table type ^attr-private, ids 0x0112....) is
+        // still an attribute, and the platform themes bind them: Theme binds
+        // `colorPopupBackground` (to ?attr/colorBackgroundFloating), which
+        // @android:drawable/popup_background_material paints as its <solid>.
+        // Dropping these items left every such ?attr unresolved -- the solid
+        // came out transparent and every AppCompat overflow / popup menu drew
+        // its items straight over the screen behind it. Keyed by NAME like the
+        // public attrs (a name is unique across attr and ^attr-private in one
+        // package; LayoutInflater's dimension walk relies on the same).
+        if (bagItemName.startsWith(ATTR_PRIVATE_PREFIX)) {
+            String n = bagItemName.substring(ATTR_PRIVATE_PREFIX.length());
+            return n.isEmpty() ? null : n;
+        }
         if (bagItemName.charAt(0) == '^') return null;
         int a = bagItemName.indexOf("attr/");
         if (a == 0) return bagItemName.substring(5);
@@ -3063,8 +3217,9 @@ public final class ResourceIndex {
      *  screen size > aspect > orientation > night > version) so the most
      *  specific compatible dir wins on ascending-sort apply. */
     private int qualifierScore(String quals) {
-        if (quals.isEmpty()) return macapkSizeClassBand(0);
+        if (quals.isEmpty()) return macapkDefaultLocaleScore() + macapkSizeClassBand(0);
         int score = 0;
+        int localeScore = macapkDefaultLocaleScore();
         int sizeClass = 0;   // the SCREENLAYOUT_SIZE_* this config names; 0 = none
         String[] parts = quals.split("-");
         for (int qi = 0; qi < parts.length; ++qi) {
@@ -3223,23 +3378,18 @@ public final class ResourceIndex {
             //   values-b+sr+Latn+RS               (BCP-47, API 21+; the
             //                                      subtags are '+'-joined
             //                                      so the token stays whole)
-            // AOSP's ResTable_config::match() requires the language to be
-            // equal and, when the directory declares a region, the region to
-            // be equal as well; anything else is not a match. So a
-            // non-matching locale dir falls through to the conservative drop
-            // below exactly as before -- this branch only ever ADDS the dirs
-            // the device locale actually selects. That also makes the
-            // 3-letter uiMode qualifier "car" a non-issue: it would have to
-            // BE the device language to be accepted.
-            String lang = null, region = null;
+            // Match language and script against the ordered configuration
+            // locales; exact-region resources outrank same-script regional
+            // fallbacks. Unmatched locale configurations are excluded.
+            String lang = null, region = null, script = null;
             boolean regionFromNextToken = false;
             if (q.length() > 2 && q.startsWith("b+")) {
                 String[] sub = q.substring(2).split("\\+");
                 lang = sub[0];
                 for (int k = 1; k < sub.length; ++k) {
-                    // A 2-letter or 3-digit subtag is the region; a 4-letter
-                    // subtag is the script, which we have no preference to
-                    // match against and therefore neither require nor reject.
+                    // BCP 47 carries an optional four-letter script and a
+                    // two-letter or three-digit region.
+                    if (sub[k].length() == 4) script = sub[k];
                     if (sub[k].length() == 2
                         || (sub[k].length() == 3 && allDigits(sub[k]))) {
                         region = sub[k];
@@ -3252,16 +3402,14 @@ public final class ResourceIndex {
                     regionFromNextToken = true;
                 }
             }
-            if (lang != null && !cfgLanguage.isEmpty()
-                && lang.equalsIgnoreCase(cfgLanguage)
-                && (region == null || region.equalsIgnoreCase(cfgRegion))) {
-                if (regionFromNextToken) ++qi;   // consume the -r<REGION> token
-                // Bands chosen so ANY locale match outranks every qualifier
-                // scored above (max ~28000 combined), and an exact-region
-                // match outranks a language-only match no matter what lower-
-                // precedence qualifiers the language-only dir also carries.
-                score += 100000;
-                if (region != null) score += 50000;
+            if (lang != null) {
+                String tag = lang + (script == null ? "" : "-" + script)
+                    + (region == null ? "" : "-" + region);
+                java.util.Locale candidate = java.util.Locale.forLanguageTag(tag);
+                int match = macapkLocaleScore(candidate);
+                if (match < 0) return -1;
+                if (regionFromNextToken) ++qi;
+                localeScore = match;
                 continue;
             }
             // foreign locale, foreign density, uiMode, mcc/mnc, screen-size
@@ -3269,7 +3417,59 @@ public final class ResourceIndex {
             // conservatively.
             return -1;
         }
-        return score + macapkSizeClassBand(sizeClass);
+        return score + localeScore + macapkSizeClassBand(sizeClass);
+    }
+
+    private int macapkDefaultLocaleScore() {
+        // AOSP ResourcesManager negotiates with English supported, and
+        // ResTable_config::isLocaleBetterThan gives no-language resources
+        // preference for US English. This prevents a secondary system
+        // language from replacing the default strings after selecting en-US.
+        // https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android13-release/libs/androidfw/ResourceTypes.cpp
+        for (int i = 0; i < cfgLocales.size(); i++) {
+            java.util.Locale desired = cfgLocales.get(i);
+            if ("en".equals(desired.getLanguage()) && !"XA".equals(desired.getCountry())) {
+                int preference = "US".equals(desired.getCountry()) ? 40000 : 10000;
+                return 1_000_000_000 - Math.min(i, 999) * 1_000_000 + preference;
+            }
+        }
+        return 0;
+    }
+
+    private static String resourceScript(java.util.Locale locale) {
+        if (!locale.getScript().isEmpty()) return locale.getScript();
+        // Chinese resource tables commonly use regions while macOS supplies
+        // an explicit script with an unrelated formatting region (zh-Hans-JP).
+        if ("zh".equals(locale.getLanguage())) {
+            String region = locale.getCountry();
+            return ("TW".equals(region) || "HK".equals(region) || "MO".equals(region))
+                ? "Hant" : "Hans";
+        }
+        return "";
+    }
+
+    private int macapkLocaleScore(java.util.Locale candidate) {
+        for (int i = 0; i < cfgLocales.size(); i++) {
+            java.util.Locale desired = cfgLocales.get(i);
+            if (!candidate.getLanguage().equals(desired.getLanguage())) continue;
+            boolean pseudo = "en-XA".equals(candidate.toLanguageTag())
+                || "ar-XB".equals(candidate.toLanguageTag())
+                || "en-XA".equals(desired.toLanguageTag()) || "ar-XB".equals(desired.toLanguageTag());
+            if (pseudo && !candidate.equals(desired)) continue;
+            String script = resourceScript(candidate);
+            String desiredScript = resourceScript(desired);
+            if (!script.isEmpty() && !desiredScript.isEmpty() && !script.equals(desiredScript)) continue;
+            // Rank preferred languages before all other qualifiers. Within a
+            // language, exact region wins, then explicit script, then generic.
+            // Region-only Chinese resources infer their script (CN -> Hans,
+            // TW -> Hant), so zh-Hans-JP can use zh-CN without selecting zh-TW.
+            int specificity = candidate.getCountry().isEmpty() ? 30000
+                : candidate.getCountry().equals(desired.getCountry()) ? 60000 : 20000;
+            if (candidate.getCountry().isEmpty() && "en".equals(candidate.getLanguage())) specificity = 50000;
+            if (!candidate.getScript().isEmpty()) specificity += 30000;
+            return 1_000_000_000 - Math.min(i, 999) * 1_000_000 + specificity;
+        }
+        return -1;
     }
 
     /** MACAPK_RES_SIZECLASS (2026-09-25), default ON: match the screen-size
@@ -4479,10 +4679,26 @@ public final class ResourceIndex {
         // resolveAttrInTheme above.
         String v = s.items.get(attrName);
         if (v != null) return v;
-        // Walk up the parent chain. Parent may be "@style/X" or "X".
-        String p = s.parent;
-        if (p == null) return null;
-        if (p.startsWith("@style/")) p = p.substring(7);
+        // Walk up the parent chain. Prefer the parent's SETTLED name resolved
+        // from its id (parentRef): under R8 resource-name obfuscation the
+        // parent NAME string (s.parent, from ArscReader.formatRef) collapses to
+        // one shared placeholder for every style, so the name walk jumps to an
+        // arbitrary wrong node and the AppCompat/Material chain (and its
+        // windowActionBar) is never reached -- and the by-name cycle guard even
+        // short-circuits on the second hop. idToTypeName gives a unique name per
+        // id, matching the key styleByName stored the parent under. Falls back
+        // to the name string for framework parents (android: ids aren't in the
+        // app id map) and for styles with no parentRef (text/framework paths).
+        String p = null;
+        if (s.parentRef != 0) {
+            String[] ptn = idToTypeName.get(s.parentRef);
+            if (ptn != null && ptn[1] != null) p = ptn[1];
+        }
+        if (p == null) {
+            p = s.parent;
+            if (p == null) return null;
+            if (p.startsWith("@style/")) p = p.substring(7);
+        }
         return resolveAttrInThemeImpl(p, attrName, visited,
                                       allowFrameworkTheme, rootTheme);
     }
@@ -5750,6 +5966,18 @@ public final class ResourceIndex {
      *  fall back to default-options-not-found behavior. */
     public int idOfName(String name, String type, String pkg) {
         if (name == null || name.isEmpty()) return 0;
+        // AOSP androidfw ResourceUtils.cpp ExtractResourceName (android14-release,
+        // :29-31): `if (start[0] == '@') { start++; }` before it splits on ':'
+        // and '/'. So a reference-shaped name ("@mipmap/ic_launcher") reaches
+        // the lookup as "mipmap/ic_launcher", and its type overrides defType.
+        // flutter_local_notifications calls
+        // getIdentifier("@mipmap/ic_launcher", "drawable", pkg) and expects the
+        // mipmap id; with the '@' left on, the type read "@mipmap" and the
+        // answer was 0 (GitHub #118).
+        if (name.charAt(0) == '@') {
+            name = name.substring(1);
+            if (name.isEmpty()) return 0;
+        }
         // AOSP getIdentifier: "name" may be fully qualified
         // ("package:type/entry" or "type/entry"), in which case its
         // components override defType/defPackage. Both forms returned 0
@@ -5968,6 +6196,14 @@ public final class ResourceIndex {
     }
     /** Look up integer-resource value by ID. Resources.getInteger(id). */
     public Integer integerForId(int id) {
+        if ((id >>> 24) == 0x01) {
+            Object[] value = macapkFwValueOf(id);
+            if (value == null) return null;
+            int type = (Integer) value[0];
+            // Match Resources.getInteger's integer-typed value contract,
+            // including framework references resolved by macapkFwValueOf.
+            return type >= 0x10 && type <= 0x1f ? (Integer) value[1] : null;
+        }
         String[] tn = idToTypeName.get(id);
         if (tn == null) return null;
         if (!"integer".equals(tn[0])) return null;

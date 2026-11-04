@@ -255,14 +255,21 @@ public class TelephonyManager {
 
     public TelephonyManager() {}
 
-    public String  getDeviceId()        { return ""; }
-    public String  getDeviceId(int slot) { return ""; }
-    public String  getImei()            { return ""; }
-    public String  getImei(int slot)    { return ""; }
-    public String  getMeid()            { return ""; }
-    public String  getSubscriberId()    { return ""; }
-    public String  getSimSerialNumber() { return ""; }
-    public String  getLine1Number()     { return ""; }
+    // No radio, so no IMEI / MEID / device id, and no SIM, so no subscriber id,
+    // ICCID or number: AOSP documents null for each when unavailable (and
+    // since API 29 an ordinary app gets null or a SecurityException, never a
+    // value). These returned "" until 2026-10-30, which no device ever does,
+    // and it broke a real caller: Google Play services' checkin wraps
+    // getImei() in an Optional, sent the empty string as the IMEI, and
+    // Google's checkin server refused the device ("" is not a valid IMEI).
+    public String  getDeviceId()        { return null; }
+    public String  getDeviceId(int slot) { return null; }
+    public String  getImei()            { return null; }
+    public String  getImei(int slot)    { return null; }
+    public String  getMeid()            { return null; }
+    public String  getSubscriberId()    { return null; }
+    public String  getSimSerialNumber() { return null; }
+    public String  getLine1Number()     { return null; }
     public String  getNetworkOperator() { return ""; }
     public String  getNetworkOperatorName() { return "Mac.apk"; }
     public String  getNetworkCountryIso()   { return macapkHostCountryIso(); }
@@ -487,10 +494,9 @@ public class TelephonyManager {
     public String getDeviceSoftwareVersion() { return null; }
 
     /**
-     * AOSP is @NonNull here. Consistent with getImei()/getDeviceId() above --
-     * which prior sessions settled on "" rather than null so analytics SDKs
-     * that concatenate the value do not print "null" -- this returns the empty
-     * string. It does NOT invent an IMEI.
+     * AOSP is @NonNull here (it throws when the device has no IMEI), so it
+     * keeps the empty string rather than the null getImei() returns. It does
+     * NOT invent an IMEI.
      */
     public String getPrimaryImei() { return ""; }
 

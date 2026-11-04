@@ -94,10 +94,52 @@ public class ImageView extends View {
             }
             ta.recycle();
         } catch (Throwable ignored) {}
+        if (MACAPK_IMAGEVIEW_THEME_TINT) macapkApplyStyledTint(c, a, defStyleAttr, defStyleRes);
+    }
+
+    /** AOSP ImageView.<init> (android14 ImageView.java:213-230):
+     *      if (a.hasValue(R.styleable.ImageView_tint)) {
+     *          mDrawableTintList = a.getColorStateList(R.styleable.ImageView_tint);
+     *          mHasDrawableTint = true;
+     *          // Prior to L, this attribute would always set a color filter with
+     *          // blending mode SRC_ATOP. Preserve that default behavior.
+     *          mDrawableBlendMode = BlendMode.SRC_ATOP; mHasDrawableBlendMode = true;
+     *      }
+     *  obtainStyledAttributes answers from the view's XML, its style, the
+     *  default style AND, last, the THEME -- so a theme item
+     *  `<item name="android:tint">?iconTint</item>` tints every ImageView that
+     *  does not say otherwise. NoNonsense Notes' ThemeNnnLight does exactly
+     *  that (iconTint = black_alpha85) over white-filled vector icons; we read
+     *  android:tint only from the XML attribute (LayoutInflater's "tint" case),
+     *  so its settings icons drew white on the light grey list -- previously
+     *  hidden by VectorDrawable's white-to-#333 stand-in. Read here, only when
+     *  the attribute resolves, so an untinted ImageView is untouched; the
+     *  inflater's direct XML case still runs afterwards and wins.
+     *  MACAPK_IMAGEVIEW_THEME_TINT=0 restores the XML-only read. */
+    static final boolean MACAPK_IMAGEVIEW_THEME_TINT =
+        !"0".equals(System.getenv("MACAPK_IMAGEVIEW_THEME_TINT"));
+    private void macapkApplyStyledTint(Context c, android.util.AttributeSet a,
+                                       int defStyleAttr, int defStyleRes) {
+        try {
+            android.content.res.TypedArray ta = c.obtainStyledAttributes(
+                a, new int[]{0x01010121 /* android.R.attr.tint */}, defStyleAttr, defStyleRes);
+            try {
+                if (ta.hasValue(0)) {
+                    android.content.res.ColorStateList csl = ta.getColorStateList(0);
+                    if (csl != null) {
+                        setImageTintList(csl);
+                        setImageTintMode(android.graphics.PorterDuff.Mode.SRC_ATOP);
+                    }
+                }
+            } finally {
+                ta.recycle();
+            }
+        } catch (Throwable ignored) {}
     }
 
     public void setImageBitmap(android.graphics.Bitmap b) {
         this.bitmap = b;
+        mMacapkBitmapTintable = true;   // AOSP wraps it in a BitmapDrawable
         // A BITMAP MUST ALSO BECOME A DRAWABLE (v1.0.868). AOSP's
         // ImageView.setImageBitmap does not store a bare bitmap at all -- it
         // wraps it and routes through setImageDrawable:
@@ -205,6 +247,7 @@ public class ImageView extends View {
             }
         }
         android.graphics.Bitmap extracted = null;
+        boolean tintable = false;
         if (d != null) {
             // v1.0.110: BitmapDrawable + RoundedBitmapDrawable both
             // expose getBitmap(); Glide's transition (DrawableCrossFade)
@@ -216,6 +259,7 @@ public class ImageView extends View {
                 Object got = null;
                 java.lang.reflect.Method m = findGetBitmap(d.getClass());
                 if (m != null) got = m.invoke(d);
+                tintable = d instanceof android.graphics.drawable.BitmapDrawable;
                 if (!(got instanceof android.graphics.Bitmap)) {
                     // Unwrap any LayerDrawable (TransitionDrawable,
                     // RippleDrawable wrapping a BitmapDrawable, etc.)
@@ -227,6 +271,7 @@ public class ImageView extends View {
                             if (layer == null) continue;
                             java.lang.reflect.Method gm = findGetBitmap(layer.getClass());
                             if (gm != null) got = gm.invoke(layer);
+                            tintable = layer instanceof android.graphics.drawable.BitmapDrawable;
                         }
                     }
                 }
@@ -234,6 +279,7 @@ public class ImageView extends View {
             } catch (Throwable ignored) {}
         }
         this.bitmap = extracted;
+        mMacapkBitmapTintable = extracted != null && tintable;
         if ("1".equals(ENV_MACAPK_TRACE_IMAGEVIEW_SET)) {
             try {
                 com.macapk.loader.NativeLog.i("ImageView",
@@ -282,6 +328,7 @@ public class ImageView extends View {
         // app:tint survives across setImageResource/setImageDrawable calls,
         // e.g. Material's icon-swap-but-keep-theme-color pattern).
         applyImageTint();
+        applyColorMod();
 
         // v1.0.110: invalidate so the next frame paints the new image.
         // v1.0.398: AOSP setImageDrawable also requestLayout()s -- the view's
@@ -446,16 +493,96 @@ public class ImageView extends View {
             requestLayout();
         }
     }
-    public int getImageAlpha() { return 255; }
-    public void setImageAlpha(int alpha) {}
+    // AOSP ImageView colour mod (setColorFilter / setImageAlpha -> applyColorMod,
+    // ImageView.java ~:1560-1610): the filter and alpha are pushed into the
+    // (mutated) drawable, and survive a drawable swap. These were stored and
+    // never applied -- or were no-ops outright -- so every icon an app colours
+    // with ImageView.setColorFilter stayed its raw colour: WhatsApp's white
+    // video/voice call buttons in the conversation header were invisible on
+    // the white toolbar.
+    private boolean mHasColorFilter;
+    private boolean mHasImageAlpha;
+    private int mImageAlphaValue = 255;
+    public int getImageAlpha() { return mImageAlphaValue; }
+    public void setImageAlpha(int alpha) {
+        alpha &= 0xFF;
+        // AOSP setImageAlpha: only a real change marks the alpha as set, so a
+        // default 255 never forces the drawable to be mutate()d.
+        if (mImageAlphaValue != alpha) {
+            mImageAlphaValue = alpha;
+            mHasImageAlpha = true;
+            applyColorMod();
+            invalidate();
+        }
+    }
     public void setImageLevel(int level) {}
-    public void setColorFilter(android.graphics.ColorFilter cf) { this.colorFilter = cf; }
-    public void setColorFilter(int color) { /* tint not wired through Canvas yet */ }
-    public void clearColorFilter() { this.colorFilter = null; }
+    public void setColorFilter(android.graphics.ColorFilter cf) {
+        // AOSP setColorFilter: only a real change marks the filter as set, so
+        // clearColorFilter() on a fresh view (RecyclerView binds) does not mutate().
+        if (this.colorFilter != cf) {
+            this.colorFilter = cf;
+            mHasColorFilter = true;
+            applyColorMod();
+            invalidate();
+        }
+    }
+    /** AOSP: setColorFilter(color, PorterDuff.Mode.SRC_ATOP). */
+    public void setColorFilter(int color) {
+        setColorFilter(color, android.graphics.PorterDuff.Mode.SRC_ATOP);
+    }
+    public void clearColorFilter() { setColorFilter((android.graphics.ColorFilter) null); }
+
+    private void applyColorMod() {
+        if (drawable == null || !(mHasColorFilter || mHasImageAlpha)) return;
+        try {
+            drawable = drawable.mutate();
+            if (mHasColorFilter) drawable.setColorFilter(colorFilter);
+            if (mHasImageAlpha) drawable.setAlpha(mImageAlphaValue);
+        } catch (Throwable ignored) {}
+    }
+
+    /** The paint for the bitmap fast path in onDraw, which draws the bitmap
+     *  itself rather than through its BitmapDrawable: the colour filter, else
+     *  the image tint, and the image alpha. Null when there is none. */
+    private android.graphics.Paint mMacapkBitmapPaint;
+    /** Whether the bitmap the fast path draws came from a real BitmapDrawable,
+     *  whose AOSP draw() honours a tint and a colour filter. A bitmap pulled out
+     *  of an app's own Drawable class by its getBitmap() must not be tinted:
+     *  AOSP's base Drawable.setTintList does nothing, so on a device such an
+     *  icon keeps its colours (WhatsApp's Meta AI button is tinted near-black
+     *  through a drawable that ignores it, and came out as a black blot). */
+    private boolean mMacapkBitmapTintable;
+    private android.graphics.Paint macapkBitmapPaint() {
+        android.graphics.ColorFilter cf = null;
+        if (!mMacapkBitmapTintable) {
+            // Alpha only; see mMacapkBitmapTintable.
+        } else if (mHasColorFilter) {
+            cf = colorFilter;
+        } else if (mHasImageTint && mImageTintList != null) {
+            int c = mImageTintList.getColorForState(getDrawableState(), mImageTintList.getDefaultColor());
+            cf = new android.graphics.PorterDuffColorFilter(c,
+                    mHasImageTintMode && mImageTintMode != null ? mImageTintMode
+                            : android.graphics.PorterDuff.Mode.SRC_IN);
+        }
+        if (cf == null && (!mHasImageAlpha || mImageAlphaValue == 255)) return null;
+        if (mMacapkBitmapPaint == null) {
+            mMacapkBitmapPaint = new android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG);
+        }
+        mMacapkBitmapPaint.setColorFilter(cf);
+        mMacapkBitmapPaint.setAlpha(mHasImageAlpha ? mImageAlphaValue : 255);
+        return mMacapkBitmapPaint;
+    }
 
     @Override
     protected void onDraw(android.graphics.Canvas canvas) {
         if (canvas == null) return;
+        // AOSP hands the drawable the view's resolved direction (updateDrawable,
+        // onRtlPropertiesChanged), which is what flips an autoMirrored icon
+        // under RTL. Done per draw here, so a direction that resolves after the
+        // drawable was set reaches it too.
+        if (drawable != null) {
+            try { drawable.setLayoutDirection(getLayoutDirection()); } catch (Throwable ignored) {}
+        }
         // v1.0.100 diagnostic: skip drawing of named ImageView subclasses.
         if ("1".equals(ENV_MACAPK_SKIP_ALL_IMAGE_DRAW)) return;
         String skip = ENV_MACAPK_SKIP_IMAGEVIEW_DRAW;
@@ -660,7 +787,7 @@ public class ImageView extends View {
         int viewW = (getRight() - getLeft()) - padL - getPaddingRight();
         int viewH = (getBottom() - getTop()) - padT - getPaddingBottom();
         if (viewW <= 0 || viewH <= 0) {
-            canvas.drawBitmap(b, padL, padT, null);
+            canvas.drawBitmap(b, padL, padT, macapkBitmapPaint());
             return;
         }
         int imgW = b.getWidth();
@@ -687,13 +814,13 @@ public class ImageView extends View {
                 canvas.drawBitmap(b,
                     new android.graphics.Rect(0, 0, imgW, imgH),
                     new android.graphics.Rect(0, 0, viewW, viewH),
-                    null);
+                    macapkBitmapPaint());
                 break;
             case CENTER:
                 canvas.drawBitmap(b,
                     (viewW - imgW) / 2f,
                     (viewH - imgH) / 2f,
-                    null);
+                    macapkBitmapPaint());
                 break;
             case FIT_CENTER:
             case FIT_START:
@@ -713,7 +840,7 @@ public class ImageView extends View {
                 canvas.drawBitmap(b,
                     new android.graphics.Rect(0, 0, imgW, imgH),
                     new android.graphics.Rect(dx, dy, dx + outW, dy + outH),
-                    null);
+                    macapkBitmapPaint());
                 break;
             }
             case CENTER_CROP: {
@@ -726,7 +853,7 @@ public class ImageView extends View {
                 canvas.drawBitmap(b,
                     new android.graphics.Rect(0, 0, imgW, imgH),
                     new android.graphics.Rect(dx, dy, dx + outW, dy + outH),
-                    null);
+                    macapkBitmapPaint());
                 break;
             }
             case MATRIX: {
@@ -751,12 +878,12 @@ public class ImageView extends View {
                 canvas.drawBitmap(b,
                     new android.graphics.Rect(0, 0, imgW, imgH),
                     new android.graphics.Rect(0, 0, dw, dh),
-                    null);
+                    macapkBitmapPaint());
                 canvas.restoreToCount(msave);
                 break;
             }
             default:
-                canvas.drawBitmap(b, 0, 0, null);
+                canvas.drawBitmap(b, 0, 0, macapkBitmapPaint());
                 break;
         }
         } finally {

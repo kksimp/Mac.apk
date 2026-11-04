@@ -309,4 +309,10 @@ public class SubscriptionManager {
      * an error code we did not receive.
      */
     public void switchToSubscription(int subId, PendingIntent callbackIntent) { }
+
+    /** AOSP @hide / @SystemApi: the ids of the active subscriptions. A Mac has
+     *  no SIM, so none (the same answer getActiveSubscriptionInfoList gives).
+     *  Google Play services' checkin SIM helper calls it. */
+    public int[] getActiveSubscriptionIdList() { return new int[0]; }
+    public int[] getActiveSubscriptionIdList(boolean visibleOnly) { return new int[0]; }
 }

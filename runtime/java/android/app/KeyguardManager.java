@@ -24,9 +24,9 @@ public class KeyguardManager {
     // low-minSdk apps still call it unguarded, and a NoSuchMethodError is an
     // Error, which catch(Exception) blocks do not stop.
     @Deprecated public boolean inKeyguardRestrictedInputMode() { return isKeyguardLocked(); }
-    public boolean isKeyguardSecure() { return false; }
+    public boolean isKeyguardSecure() { return isDeviceSecure(); }
     public boolean isDeviceLocked() { return false; }
-    public boolean isDeviceSecure() { return false; }
+    public boolean isDeviceSecure() { return com.macapk.loader.UserVerificationBridge.canAuthenticate(com.macapk.loader.UserVerificationBridge.DEVICE_CREDENTIAL)==0; }
 
     // AOSP KeyguardManager.createConfirmDeviceCredentialIntent(CharSequence,
     // CharSequence) (same file/branch as the constants above):

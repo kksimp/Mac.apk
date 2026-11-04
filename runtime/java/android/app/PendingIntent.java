@@ -13,6 +13,9 @@
 // taps, alarm callbacks, and widget actions actually fire the wrapped
 // Intent instead of silently dropping it.
 package android.app;
+
+import android.os.Binder;
+import android.os.IBinder;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
@@ -43,6 +46,69 @@ public final class PendingIntent implements Parcelable {
     private Intent intent;          // single-intent forms
     private Intent[] intents;       // getActivities form
     private boolean canceled;
+
+    // ---- cross-process (2026-10-30) ---------------------------------------
+    // AOSP's PendingIntent is a handle to an IIntentSender binder that lives in
+    // the CREATOR's side; send() transacts to it and the operation runs there,
+    // in the creator's context. Mac.apk now runs each app in its own process
+    // (android.os.MacApkBinderTransport), so a token that crossed must do the
+    // same: `mSender` is the binder this process serves for a token it created,
+    // `mRemote` is the proxy a token received from another process carries.
+    // Within one process nothing changes: the binder read back is our own
+    // Sender, and the reader returns the ORIGINAL token.
+    private Sender mSender;
+    private IBinder mRemote;
+    private String mCreatorPackage;   // carried for a token from another process
+
+    private static final int TX_SEND = IBinder.FIRST_CALL_TRANSACTION;
+    private static final int TX_CANCEL = IBinder.FIRST_CALL_TRANSACTION + 1;
+    private static final String SENDER_DESCRIPTOR = "android.content.IIntentSender";
+
+    /** This process's side of a token it created: runs the operation here. */
+    private static final class Sender extends Binder {
+        final PendingIntent owner;
+        Sender(PendingIntent owner) { super(SENDER_DESCRIPTOR); this.owner = owner; }
+        @Override protected boolean onTransact(int code, Parcel data, Parcel reply, int flags)
+                throws android.os.RemoteException {
+            if (code == TX_SEND) {
+                data.enforceInterface(SENDER_DESCRIPTOR);
+                Intent fillIn = data.readTypedObject(Intent.CREATOR);
+                int res = owner.dispatch(null, fillIn);
+                if (reply != null) { reply.writeNoException(); reply.writeInt(res); }
+                return true;
+            }
+            if (code == TX_CANCEL) {
+                data.enforceInterface(SENDER_DESCRIPTOR);
+                owner.canceled = true;
+                if (reply != null) reply.writeNoException();
+                return true;
+            }
+            return super.onTransact(code, data, reply, flags);
+        }
+    }
+
+    private synchronized Sender sender() {
+        if (mSender == null) mSender = new Sender(this);
+        return mSender;
+    }
+
+    /** Send through the creator's process; returns its dispatch result. */
+    private int sendRemote(Intent fillIn) {
+        Parcel d = Parcel.obtain(), r = Parcel.obtain();
+        try {
+            d.writeInterfaceToken(SENDER_DESCRIPTOR);
+            d.writeTypedObject(fillIn, 0);
+            mRemote.transact(TX_SEND, d, r, 0);
+            r.readException();
+            return r.readInt();
+        } catch (android.os.RemoteException e) {
+            // The creator's process is gone: AOSP's send() throws
+            // CanceledException for a dead target.
+            return -1;
+        } finally {
+            d.recycle(); r.recycle();
+        }
+    }
 
     private PendingIntent() {}
 
@@ -126,8 +192,18 @@ public final class PendingIntent implements Parcelable {
      *  copy of the base per AOSP, never substituted -- see fillInto().
      *  Returns sendInner's result: negative only for an activity start that
      *  resolved to nothing (see UNRESOLVED_CANCELED). */
+    /** The token whose state this one stands for: the creator's original when
+     *  this is an in-process copy read back from a Parcel, else itself. */
+    private PendingIntent origin() {
+        Sender sd = mSender;
+        return (sd != null && sd.owner != this) ? sd.owner : this;
+    }
+
     private int dispatch(Context dispatchContext, Intent overrideIntent) {
+        PendingIntent o = origin();
+        if (o != this) return o.dispatch(dispatchContext, overrideIntent);
         if (canceled) return RES_OK;
+        if (mRemote != null) return sendRemote(overrideIntent);
         Context ctx = dispatchContext != null ? dispatchContext
                     : (creatorContext != null ? creatorContext : Application.getInstance());
         if (ctx == null) return RES_OK;
@@ -262,7 +338,19 @@ public final class PendingIntent implements Parcelable {
         if (handler != null) handler.post(r); else r.run();
     }
 
-    public void cancel() { canceled = true; }
+    public void cancel() {
+        canceled = true;
+        PendingIntent o = origin();
+        if (o != this) o.canceled = true;
+        if (mRemote != null) {
+            Parcel d = Parcel.obtain(), r = Parcel.obtain();
+            try {
+                d.writeInterfaceToken(SENDER_DESCRIPTOR);
+                mRemote.transact(TX_CANCEL, d, r, 0);
+            } catch (android.os.RemoteException ignored) {
+            } finally { d.recycle(); r.recycle(); }
+        }
+    }
 
     /** AOSP API-31+ -- returns an IntentSender that wraps this token.
      *  IntentSender simply re-dispatches through this PendingIntent. */
@@ -271,6 +359,7 @@ public final class PendingIntent implements Parcelable {
     }
 
     public String getCreatorPackage() {
+        if (mCreatorPackage != null) return mCreatorPackage;
         return creatorContext != null ? creatorContext.getPackageName() : null;
     }
     public String getTargetPackage() { return getCreatorPackage(); }
@@ -340,13 +429,18 @@ public final class PendingIntent implements Parcelable {
         // Mac.apk hosts exactly one app, so Application.getInstance() IS the
         // creator's context; on AOSP the creator may be another process, which
         // is why AOSP carries a binder instead.
-        // REMOVAL CONDITION: if Mac.apk ever hosts more than one package in a
-        // process, this has to carry the creator's identity (package + uid) and
-        // resolve it on read, not assume the single Application.
+        // That condition held until apps got their own processes (2026-10-30):
+        // a token read in ANOTHER process now drops this context and sends
+        // through the creator's binder instead (see the tail of this method).
         dest.writeInt(creatorContext != null ? 1 : 0);
         dest.writeTypedObject(intent, parcelableFlags);
         dest.writeTypedArray(intents, parcelableFlags);
         dest.writeInt(canceled ? 1 : 0);
+        // The AOSP part: the creator package and the IIntentSender binder. A
+        // token that already came from elsewhere forwards ITS remote, so a
+        // token passed on through a third process still reaches the creator.
+        dest.writeString(getCreatorPackage());
+        dest.writeStrongBinder(mRemote != null ? mRemote : origin().sender());
     }
 
     public static final Creator<PendingIntent> CREATOR = new Creator<PendingIntent>() {
@@ -359,6 +453,23 @@ public final class PendingIntent implements Parcelable {
             p.intent = s.readTypedObject(Intent.CREATOR);
             p.intents = s.createTypedArray(Intent.CREATOR);
             p.canceled = s.readInt() != 0;
+            p.mCreatorPackage = s.readString();
+            IBinder b = s.readStrongBinder();
+            // Our own token came back (same process). AOSP hands back a NEW
+            // PendingIntent around the SAME IIntentSender, so it is equal to,
+            // not identical with, the original -- and sends / cancels act on
+            // the original's state. Share its Sender to get exactly that.
+            if (b instanceof Sender) {
+                p.mSender = (Sender) b;
+                return p;
+            }
+            // From another process: send() runs over the binder in the
+            // creator's process, never here with our context. A binder-less
+            // read (marshalled bytes) keeps the flattened copy, as before.
+            if (b != null) {
+                p.mRemote = b;
+                p.creatorContext = null;
+            }
             return p;
         }
         @Override public PendingIntent[] newArray(int size) { return new PendingIntent[size]; }
@@ -378,8 +489,16 @@ public final class PendingIntent implements Parcelable {
 
     /** AOSP static helpers exposing the IntentSender's creator info
      *  without an instance (used by some readback code). */
-    public static PendingIntent readPendingIntentOrNullFromParcel(Parcel in) { return null; }
-    public static void writePendingIntentOrNullToParcel(PendingIntent sender, Parcel out) {}
+    /** AOSP static helpers (a nullable token). These answered null / wrote
+     *  nothing, so any PendingIntent that travelled this way vanished. */
+    public static PendingIntent readPendingIntentOrNullFromParcel(Parcel in) {
+        return in.readInt() != 0 ? CREATOR.createFromParcel(in) : null;
+    }
+    public static void writePendingIntentOrNullToParcel(PendingIntent sender, Parcel out) {
+        if (sender == null) { out.writeInt(0); return; }
+        out.writeInt(1);
+        sender.writeToParcel(out, 0);
+    }
 
     public void send(android.os.Bundle options) throws CanceledException { send(); }
 

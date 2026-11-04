@@ -22,7 +22,15 @@ public class Build {
     public static final String UNKNOWN     = "unknown";
     public static final String BOARD       = "macapk";
     public static final String BOOTLOADER  = "unknown";
-    public static final String BRAND       = "Mac.apk";
+    // BRAND / MANUFACTURER / MODEL: what an app (and the account-security
+    // alerts of the services it signs in to, "New login from <model>") is
+    // told the device is. Owner decision 2026-11-04: a Mac, made by Apple. The
+    // model is the REAL host hardware model (sysctl hw.model, e.g. "Mac14,7"),
+    // exported once per process by the runtime as MACAPK_HOST_MODEL; "Mac"
+    // when that is missing. Method-call initializers (not JLS constants), like
+    // TAGS/TYPE, so no reader constant-folds them. FINGERPRINT below derives
+    // from BRAND/PRODUCT/DEVICE, so it follows BRAND automatically.
+    public static final String BRAND       = macapkBrand();
     public static final String CPU_ABI     = "arm64-v8a";
     public static final String CPU_ABI2    = "";
     public static final String[] SUPPORTED_ABIS    = { "arm64-v8a" };
@@ -33,24 +41,60 @@ public class Build {
     public static final String HARDWARE    = "apple_silicon";
     public static final String HOST        = "macapk-mac";
     public static final String ID          = "PR1";
-    // The project is Voltare's. Every other field here is already
-    // Mac.apk/macapk-branded; this one named the vendor of the assistant
-    // used to write some of this code, which is neither who ships it nor
-    // who an app should be told it is running on. Corrected
-    // 2026-08-20 at the owner's direction. Not part of FINGERPRINT, which
-    // derives from BRAND/PRODUCT/DEVICE, so nothing else moves.
-    public static final String MANUFACTURER = "Voltare";
-    public static final String MODEL       = "Mac.apk";
+    // The host is a Mac, so the manufacturer is Apple (was "Voltare", the
+    // project's name, which is not who made the hardware an app runs on).
+    public static final String MANUFACTURER = macapkBrand();
+    public static final String MODEL       = macapkHostModel();
     public static final String PRODUCT     = "macapk";
     public static final String RADIO       = "unknown";
-    public static final String TAGS        = "release-keys";
-    public static final String TYPE        = "user";
+    // TAGS/TYPE: normally a release device ("release-keys"/"user"). When the
+    // owner opts a hosted Google Play services process into accepting the
+    // debug-signed Google apps they installed (the broker sets
+    // MACAPK_DEBUG_CERTS=1 only on the GMS host, only while "Use Google GMS"
+    // is on), we present the TRUE identity of that process: a developer build
+    // (userdebug/test-keys). This is what GMS's OWN GoogleCertificates gate
+    // reads (m5.cg.b/mo.a: Build.TYPE in {eng,userdebug} && Build.TAGS has
+    // {dev-keys,test-keys}) before it will consult its developer flag-override
+    // file -- the documented hermetic-override mechanism. It is NOT an emulator
+    // persona (our SystemProperties still answers no qemu/characteristics) and
+    // NOT a certificate forgery; it is an honest "this is a dev build" answer,
+    // scoped to the one process that asked and gated on the owner's opt-in.
+    // Method-call initializers (not JLS constants), so no reader constant-folds
+    // them -- same rule the version fields above rely on.
+    public static final String TAGS        = macapkDebugCertsPersona() ? "test-keys"  : "release-keys";
+    public static final String TYPE        = macapkDebugCertsPersona() ? "userdebug"  : "user";
+    /** True only when this process was launched with MACAPK_DEBUG_CERTS=1 (the
+     *  broker sets it on a GMS host under the "Use Google GMS" opt-in). */
+    private static boolean macapkDebugCertsPersona() {
+        return "1".equals(System.getenv("MACAPK_DEBUG_CERTS"));
+    }
     public static final String USER        = "macapk";
+    private static String macapkBrand() { return "Apple"; }
+    /** The host hardware model the runtime exported (MACAPK_HOST_MODEL), or
+     *  "Mac". Accepts only a short, printable, non-empty value: a model string
+     *  ends up in HTTP headers, account alerts and logs. */
+    private static String macapkHostModel() {
+        try {
+            String m = System.getenv("MACAPK_HOST_MODEL");
+            if (m != null) {
+                m = m.trim();
+                if (!m.isEmpty() && m.length() <= 40) {
+                    boolean ok = true;
+                    for (int i = 0; i < m.length(); i++) {
+                        char c = m.charAt(i);
+                        if (c < 0x20 || c > 0x7e) { ok = false; break; }
+                    }
+                    if (ok) return m;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return "Mac";
+    }
 
     // ⚠ v1.0.938: DERIVED from the fields below, not spelled independently.
     // It used to read "macapk/v2/arm64-v8a:.../PR1/0:user/release-keys", which
     // disagreed with our OWN Build fields in four of its eight components --
-    // brand macapk vs BRAND "Mac.apk", product v2 vs PRODUCT "macapk", device
+    // brand macapk vs the old BRAND "Mac.apk", product v2 vs PRODUCT "macapk", device
     // arm64-v8a vs DEVICE "macapk", incremental 0 vs VERSION.INCREMENTAL "1".
     // AOSP's deriveFingerprint() BUILDS the string from those same properties
     // (Build.java, `$(BRAND)/$(PRODUCT)/$(DEVICE):$(RELEASE)/$(ID)/$(INCREMENTAL):$(TYPE)/$(TAGS)`),

@@ -55,12 +55,40 @@ public final class ContentProviderRegistry {
         }
     }
 
-    /** Look up the provider that serves `authority`, or null if none is
-     *  registered. Authorities are matched case-insensitively, matching
-     *  AOSP's PackageManagerService provider resolution. */
-    public static ContentProvider get(String authority) {
+    /** Platform stand-ins (e.g. com.macapk.gms.GservicesProvider for Google
+     *  Services Framework's authority): answered only when neither this app nor
+     *  another app's process serves the authority. */
+    private static final Map<String, ContentProvider> sFallback = new ConcurrentHashMap<>();
+
+    public static void registerFallback(String authority, ContentProvider provider) {
+        if (authority == null || provider == null) return;
+        sFallback.put(authority.toLowerCase(java.util.Locale.ROOT), provider);
+    }
+
+    /** Only the providers THIS process hosts (the app's own). What another
+     *  process may be handed for this authority, never a remote proxy or a
+     *  stand-in. */
+    public static ContentProvider getLocal(String authority) {
         if (authority == null) return null;
         return sByAuthority.get(authority.toLowerCase(java.util.Locale.ROOT));
+    }
+
+    /** Look up the provider that serves `authority`, or null if none is
+     *  registered. Authorities are matched case-insensitively, matching
+     *  AOSP's PackageManagerService provider resolution. Order: this app's own
+     *  providers; then one ANOTHER app's process serves through the Mac.apk
+     *  system broker (AMS getContentProvider; com.macapk.loader.SystemClient,
+     *  only when it is enabled); then a platform stand-in. */
+    public static ContentProvider get(String authority) {
+        if (authority == null) return null;
+        String key = authority.toLowerCase(java.util.Locale.ROOT);
+        ContentProvider p = sByAuthority.get(key);
+        if (p != null) return p;
+        // The platform's own SettingsProvider, which no app declares.
+        if (key.equals("settings")) return android.provider.MacApkSettingsProvider.get();
+        p = com.macapk.loader.SystemClient.remoteProvider(authority);
+        if (p != null) return p;
+        return sFallback.get(key);
     }
 
     /** Convenience: resolve the provider for a content:// URI by its

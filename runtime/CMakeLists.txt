@@ -144,6 +144,8 @@ set(MACAPK_RUNTIME_SOURCES
     # macOS Location Services -> android.location (CoreLocation, rung 1: the
     # Mac's own fused location stack; gate MACAPK_LOCATION_HOST).
     src/location_bridge.mm
+    src/bluetooth_bridge.mm
+    src/bluetooth_peripheral_bridge.mm
     # The active MediaSession -> macOS Now Playing + MPRemoteCommandCenter
     # (MediaPlayer.framework, rung 1: the Mac's own system media controls and
     # media keys; gate MACAPK_NOW_PLAYING).
@@ -165,6 +167,7 @@ set(MACAPK_RUNTIME_SOURCES
     src/photos_bridge.mm
     src/document_picker.mm
     src/gms_signin.mm
+    src/user_verification_bridge.mm
     src/media_decode.mm
     # Ogg Vorbis decode for MediaCodec ("audio/vorbis"), reusing the
     # stb_vorbis.c already vendored below via a small synthetic-Ogg-page
@@ -179,6 +182,8 @@ set(MACAPK_RUNTIME_SOURCES
     src/video_caps_probe.mm
     thirdparty/stb_vorbis.c
     src/cocoa_bridge.mm
+    src/native_host_proxy.cpp
+    src/proxy_settings.mm
     src/gles_bridge.cpp
 )
 # Vendored Ogg Vorbis decoder (public domain). macOS AudioToolbox cannot
@@ -202,9 +207,13 @@ set_source_files_properties(src/applink_window.mm PROPERTIES
 # that outlive the JNI call (dispatch_async, then the panel's completion handler).
 set_source_files_properties(src/document_picker.mm PROPERTIES
     COMPILE_OPTIONS "-fobjc-arc")
+set_source_files_properties(src/proxy_settings.mm
+    PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 # photos_bridge.mm: PhotoKit completion handlers capture state across threads.
 set_source_files_properties(src/photos_bridge.mm PROPERTIES
     COMPILE_OPTIONS "-fobjc-arc")
+set_source_files_properties(src/user_verification_bridge.mm
+    PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 # video_caps_probe.mm: the host-probed MediaCodecInfo profile/level table;
 # ARC because the offline gate debug/vtcaps_gate.sh builds it standalone the
 # same way.
@@ -217,6 +226,8 @@ set_source_files_properties(src/gamecontroller_bridge.mm PROPERTIES
 # location_bridge.mm: the CLLocationManager delegate and main-queue blocks.
 set_source_files_properties(src/location_bridge.mm PROPERTIES
     COMPILE_OPTIONS "-fobjc-arc")
+set_source_files_properties(src/bluetooth_bridge.mm src/bluetooth_peripheral_bridge.mm
+    PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 if(ANGLE_HAVE)
     list(APPEND MACAPK_RUNTIME_SOURCES src/angle_glue.cpp)
 endif()
@@ -398,6 +409,8 @@ target_link_libraries(macapk-runtime PRIVATE
     "-framework CoreText"
     "-framework AVFAudio"
     "-framework AudioToolbox"
+    "-framework LocalAuthentication"
+    "-framework Security"
     # AudioConvertHostTimeToNanos (AudioTrack.getTimestamp()'s clock source,
     # audio_backend.mm) is exported by CoreAudio.framework specifically --
     # verified via the SDK's .tbd export lists, it is NOT re-exported by
@@ -415,6 +428,8 @@ target_link_libraries(macapk-runtime PRIVATE
     "-framework WebKit"
     "-framework GameController"
     "-framework CoreLocation"
+    "-framework CoreBluetooth"
+    "-framework IOBluetooth"
     "-framework MediaPlayer"
     "-framework IOKit"
 )
@@ -471,3 +486,14 @@ add_library(macapk-skia-metal SHARED src/skia_metal_bridge.mm)
 target_include_directories(macapk-skia-metal PRIVATE "${JAVA_HOME}/include" "${JAVA_HOME}/include/darwin")
 target_link_libraries(macapk-skia-metal PRIVATE "-framework Foundation" "-framework Metal")
 set_target_properties(macapk-skia-metal PROPERTIES INSTALL_NAME_DIR "@rpath")
+
+# macapk-binder -- cross-process android.os.Binder over Mach ports (JNI for
+# android.os.MacApkBinderTransport). A standalone dylib the framework loads
+# itself, like the Skia bridge above, so the same transport runs inside the
+# runtime and in a bare-JVM gate (debug/binder_gate.sh). libbsm provides
+# audit_token_to_pid for the caller's pid. Design:
+# docs/cross-process-binder-over-mach_2026-10-30.md.
+add_library(macapk-binder SHARED src/binder_mach.cpp)
+target_include_directories(macapk-binder PRIVATE "${JAVA_HOME}/include" "${JAVA_HOME}/include/darwin")
+target_link_libraries(macapk-binder PRIVATE bsm)
+set_target_properties(macapk-binder PROPERTIES INSTALL_NAME_DIR "@rpath")

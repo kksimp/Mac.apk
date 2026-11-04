@@ -81,6 +81,9 @@ public final class Manifest {
     static final int DEFAULT_TARGET_SDK_VERSION = 0;
 
     public final String packageName;
+    /** <manifest android:sharedUserId>, or null. Packages that share one share
+     *  a uid (AppUids), as Google Play services and Services Framework do. */
+    public String sharedUserId;
     public final String applicationClass;
 
     /** <application android:appComponentFactory="...">. androidx.core
@@ -322,6 +325,45 @@ public final class Manifest {
             this.flags = flags;
             this.uriPermissionPatterns = uriPatterns;
             this.pathPermissions = pathPerms;
+        }
+        private volatile String resolvedAuthorities;
+        /** android:authorities as a device's package parser hands it on. AOSP
+         *  reads it with TypedArray.getNonConfigurationString
+         *  (ParsedProviderUtils.parseProvider), which RESOLVES a string
+         *  reference, so `android:authorities="@string/x"` reaches the provider
+         *  map, ProviderInfo.authority and every ContentResolver lookup as the
+         *  string's text. The binary manifest keeps the reference ("@0x7f100000"
+         *  from BinaryXmlParser, "@string/x" from a text decode), and using that
+         *  token as is registered the provider under "@0x7f100000": every
+         *  content:// query an app made of its OWN provider then came back null
+         *  (NoNonsense Notes: no lists and no notes, and an NPE from each drawer
+         *  count loader). Resolved once against `res` (the app's Resources);
+         *  the raw value is the answer when it is no reference or cannot be
+         *  resolved. */
+        public String resolvedAuthorities(android.content.res.Resources res) {
+            String done = resolvedAuthorities;
+            if (done != null) return done;
+            String raw = authorities;
+            if (raw == null || !raw.startsWith("@")) return raw;
+            if (res == null) {
+                android.app.Application app = android.app.Application.getInstance();
+                res = app != null ? app.getResources() : null;
+                if (res == null) return raw;
+            }
+            String out = raw;
+            try {
+                int id = MacApkPackageManager.resolveResRef(raw, "string");
+                if (id != 0) {
+                    String s = res.getString(id);
+                    if (s != null && !s.isEmpty()) out = s;
+                }
+            } catch (Throwable t) {
+                NativeLog.w(TAG, "provider " + name + ": android:authorities " + raw
+                    + " did not resolve: " + t);
+                return raw;
+            }
+            resolvedAuthorities = out;
+            return out;
         }
         /** This entry with a different `exported` (the targetSdk-dependent
          *  default is only known once <uses-sdk> has been read). */
@@ -701,6 +743,50 @@ public final class Manifest {
      *  Pattern H. */
     public final java.util.Map<String, String> componentProcesses;
 
+    /** `<application android:process>` after resource-reference resolution, or
+     *  null when absent/empty. AOSP's default process for every component that
+     *  declares none (ParsingPackageUtils: the application's processName falls
+     *  back to the package name; a component's falls back to the application's). */
+    public String applicationProcess;
+
+    /** AOSP ParsingUtils.buildProcessName for one raw `android:process`: a
+     *  leading ':' names a process PRIVATE to the app (`<pkg><value>`); anything
+     *  else is a literal, global process name. Null/empty -> null (inherit). */
+    public String resolveProcessName(String raw) {
+        if (raw == null || raw.isEmpty()) return null;
+        return raw.charAt(0) == ':' ? packageName + raw : raw;
+    }
+
+    /** The process a component with NO `android:process` runs in: the
+     *  application's, which defaults to the package name. */
+    public String defaultProcessName() {
+        String app = resolveProcessName(applicationProcess);
+        return app != null ? app : packageName;
+    }
+
+    /** ComponentInfo.processName for the component class `cls`: its own
+     *  `android:process` if declared, else the application's. The ONE function
+     *  every process-routing decision (broker spawn, bind/start/job/receiver
+     *  routing, provider install, the process-exit containment table) asks, so
+     *  the ':' prefix rule is never recomputed at a second site. */
+    public String processNameOf(String cls) {
+        String raw = cls == null ? null : componentProcesses.get(cls);
+        String own = resolveProcessName(raw);
+        return own != null ? own : defaultProcessName();
+    }
+
+    /** Every process this package's manifest can run something in: the default
+     *  one plus each component's. Order is stable (default first). */
+    public java.util.Set<String> processNames() {
+        java.util.Set<String> out = new java.util.LinkedHashSet<>();
+        out.add(defaultProcessName());
+        for (String raw : componentProcesses.values()) {
+            String r = resolveProcessName(raw);
+            if (r != null) out.add(r);
+        }
+        return out;
+    }
+
     private Manifest(String pkg, String appClass, String appComponentFactory,
                      String launch, int target,
                      java.util.Map<String, String> meta, String version,
@@ -739,6 +825,24 @@ public final class Manifest {
         this.packageName = pkg;
         this.applicationClass = appClass;
         this.appComponentFactory = appComponentFactory;
+        // A service/provider-host package (Google Play services, GSF, ...) has
+        // NO MAIN/LAUNCHER activity, so `launch` is null and Boot has nothing
+        // to start. For diagnostics, MACAPK_LAUNCH_ACTIVITY names an explicit
+        // entry activity to boot such a package through (it forces the app's
+        // Application.onCreate + the named activity to run so we can observe how
+        // far its init gets). App-agnostic (uses the manifest's own package),
+        // env-gated (nothing when unset), and only honoured when the named
+        // activity is actually DECLARED here -- so it can never invent a
+        // component. Mirrors the existing MACAPK_LAUNCH_ACTIVITY override in
+        // Boot.run, which otherwise never runs for a launcher-less app because
+        // the "no launchable activity" check returns first.
+        if (launch == null) {
+            String ov = System.getenv("MACAPK_LAUNCH_ACTIVITY");
+            if (ov != null && !ov.isEmpty()) {
+                String cls = ov.startsWith(".") ? pkg + ov : ov;
+                if (this.activities.containsKey(cls)) launch = cls;
+            }
+        }
         this.launchableActivity = launch;
         this.targetSdk = target;
         this.minSdk = minSdk;
@@ -880,6 +984,163 @@ public final class Manifest {
      *  APK is unavailable or the binary parse fails. The DOM walk
      *  below is shared by both paths; only the binary path populates
      *  the macapk type annotations. */
+    /** A manifest attribute that is a STRING RESOURCE reference ("@0x7f15085d"
+     *  in the binary manifest), resolved to its default-configuration value the
+     *  way the package parser does at install time. Google Play services
+     *  declares its gservices provider as
+     *  android:authorities="@string/checkin_gservices_authority"; registered
+     *  under the literal "@0x7f15085d", nothing could reach it by its real
+     *  authority, including GMS's own Gservices lookups ("Failed to obtain
+     *  device id"). Anything that is not such a reference is returned as is,
+     *  and the resource table is read only when one appears. */
+    static String resolveStringRef(String apkPath, String raw) {
+        if (raw == null || !raw.startsWith("@0x") || apkPath == null || apkPath.isEmpty()) return raw;
+        try {
+            int id = (int) Long.parseLong(raw.substring(3), 16);
+            StringTables t = tables(apkPath);
+            String v = t.byId.get(id);
+            // A string resource can be an ALIAS of another ("@string/common_default_process"):
+            // follow it by name, as AssetManager does, instead of handing back the
+            // reference text as if it were the value (GMS declares a handful of its
+            // services' android:process this way).
+            for (int hops = 0; v != null && v.startsWith("@string/") && hops < 8; hops++) {
+                String next = t.byName.get(v.substring("@string/".length()));
+                if (next == null) break;
+                v = next;
+            }
+            return v != null ? v : raw;
+        } catch (Throwable t) {
+            return raw;
+        }
+    }
+
+    /** The FILE behind a resource id (an @xml/... reference in a manifest meta-data
+     *  value, "@0x7f170003") that a device would load, e.g.
+     *  "res/xml-v5/authenticator.xml", or null. Only version qualifiers are
+     *  considered (an authenticator / sync-adapter XML is not density- or
+     *  locale-specific): the highest "-vN" up to API 34 whose file is in the APK,
+     *  else the default configuration. aapt2 versions an XML whose attributes
+     *  need a newer API and may ship only the versioned file. */
+    static String resolveFileRef(String apkPath, String raw) {
+        if (raw == null || !raw.startsWith("@0x") || apkPath == null || apkPath.isEmpty()) return null;
+        try {
+            int id = (int) Long.parseLong(raw.substring(3), 16);
+            try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(apkPath)) {
+                java.util.zip.ZipEntry e = zf.getEntry("resources.arsc");
+                if (e == null) return null;
+                byte[] arsc;
+                try (java.io.InputStream in = zf.getInputStream(e)) { arsc = in.readAllBytes(); }
+                String best = null;
+                int bestV = -1;
+                for (ArscReader.Row r : ArscReader.parse(arsc).rows()) {
+                    if (r.resId != id || r.complex || r.value == null || !r.value.startsWith("res/")) continue;
+                    int v;
+                    if (r.defaultConfig) v = 0;
+                    else if (r.config.matches("-v\\d+")) v = Integer.parseInt(r.config.substring(2));
+                    else continue;
+                    if (v > 34 || v <= bestV || zf.getEntry(r.value) == null) continue;
+                    best = r.value; bestV = v;
+                }
+                return best;
+            }
+        } catch (Throwable t) {
+            NativeLog.w(TAG, "file resource " + raw + " of " + apkPath + " unreadable: " + t);
+        }
+        return null;
+    }
+
+    /** One `<account-authenticator>` an installed package declares (AOSP
+     *  AccountAuthenticatorCache.parseServiceAttributes). */
+    public static final class AuthenticatorDecl {
+        public final String service, accountType;
+        public final boolean customTokens;
+        public final int labelId, iconId, smallIconId, prefsId;
+        AuthenticatorDecl(String service, String accountType, boolean customTokens,
+                          int labelId, int iconId, int smallIconId, int prefsId) {
+            this.service = service; this.accountType = accountType; this.customTokens = customTokens;
+            this.labelId = labelId; this.iconId = iconId; this.smallIconId = smallIconId; this.prefsId = prefsId;
+        }
+    }
+
+    private static int refId(String raw) {
+        if (raw == null || !raw.startsWith("@0x")) return 0;
+        try { return (int) Long.parseLong(raw.substring(3), 16); } catch (NumberFormatException e) { return 0; }
+    }
+
+    /** Every account authenticator `m` declares, read from the APK without running
+     *  the app: services answering "android.accounts.AccountAuthenticator" whose
+     *  meta-data of that name points at an XML with an `account-authenticator`
+     *  root; an empty accountType or another root tag registers nothing
+     *  (RegisteredServicesCache.parseServiceInfo). */
+    public static java.util.List<AuthenticatorDecl> authenticators(Manifest m, String apkPath) {
+        java.util.List<AuthenticatorDecl> out = new java.util.ArrayList<>();
+        if (m == null || apkPath == null) return out;
+        for (ServiceEntry se : m.services.values()) {
+            if (!se.enabled) continue;
+            boolean answers = false;
+            for (IntentFilterEntry f : se.filters) {
+                if (f.actions.contains("android.accounts.AccountAuthenticator")) { answers = true; break; }
+            }
+            if (!answers) continue;
+            String file = resolveFileRef(apkPath, se.metaData.get("android.accounts.AccountAuthenticator"));
+            if (file == null) continue;
+            try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(apkPath)) {
+                java.util.zip.ZipEntry e = zf.getEntry(file);
+                if (e == null) continue;
+                byte[] x;
+                try (java.io.InputStream in = zf.getInputStream(e)) { x = in.readAllBytes(); }
+                org.w3c.dom.Element root = BinaryXmlParser.parse(x).getDocumentElement();
+                if (root == null || !"account-authenticator".equals(root.getTagName())) continue;
+                String type = resolveStringRef(apkPath, root.getAttributeNS(ANDROID_NS, "accountType"));
+                if (type == null || type.isEmpty() || type.startsWith("@")) continue;
+                out.add(new AuthenticatorDecl(se.name, type,
+                        "true".equals(root.getAttributeNS(ANDROID_NS, "customTokens")),
+                        refId(root.getAttributeNS(ANDROID_NS, "label")),
+                        refId(root.getAttributeNS(ANDROID_NS, "icon")),
+                        refId(root.getAttributeNS(ANDROID_NS, "smallIcon")),
+                        refId(root.getAttributeNS(ANDROID_NS, "accountPreferences"))));
+            } catch (Throwable t) {
+                NativeLog.w(TAG, "authenticator " + se.name + " of " + apkPath + " unreadable: " + t);
+            }
+        }
+        return out;
+    }
+
+    /** Default-config string resources of an APK, by id and by name. */
+    private static final class StringTables {
+        final java.util.Map<Integer, String> byId = new java.util.HashMap<>();
+        final java.util.Map<String, String> byName = new java.util.HashMap<>();
+    }
+
+    private static final java.util.Map<String, StringTables> STRING_TABLES =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static StringTables tables(String apkPath) {
+        return STRING_TABLES.computeIfAbsent(apkPath, k -> {
+            StringTables t = new StringTables();
+            try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(k)) {
+                java.util.zip.ZipEntry e = zf.getEntry("resources.arsc");
+                if (e == null) return t;
+                byte[] arsc;
+                try (java.io.InputStream in = zf.getInputStream(e)) { arsc = in.readAllBytes(); }
+                for (ArscReader.Row r : ArscReader.parse(arsc).rows()) {
+                    if (!r.complex && r.defaultConfig && "string".equals(r.type)) {
+                        t.byId.put(r.resId, r.value);
+                        if (r.name != null) t.byName.put(r.name, r.value);
+                    }
+                }
+            } catch (Throwable ex) {
+                NativeLog.w(TAG, "string table of " + k + " unreadable: " + ex);
+            }
+            return t;
+        });
+    }
+
+    /** Default-config string resources of an APK (id -> value), read once. */
+    private static java.util.Map<Integer, String> stringTable(String apkPath) {
+        return tables(apkPath).byId;
+    }
+
     public static Manifest parse(File xml, String apkPath) throws Exception {
         Document doc = null;
         if (apkPath != null && !apkPath.isEmpty()) {
@@ -1044,6 +1305,7 @@ public final class Manifest {
         // `<application android:enabled>` default. AOSP's default is TRUE,
         // and it stays TRUE when there is no <application> element at all.
         boolean applicationEnabled = true;
+        String applicationProcessRaw = null;
         Float maxAspectRatio = null;
         NodeList apps = root.getElementsByTagName("application");
         if (apps.getLength() > 0) {
@@ -1110,6 +1372,10 @@ public final class Manifest {
             // absent-means-true shape as every component's android:enabled.
             applicationEnabled = !"false".equalsIgnoreCase(
                 app.getAttributeNS(ANDROID_NS, "enabled"));
+            // `<application android:process>`: the default process of every
+            // component that declares none (may be a string reference).
+            String appProc = resolveStringRef(apkPath, app.getAttributeNS(ANDROID_NS, "process"));
+            if (appProc != null && !appProc.isEmpty()) applicationProcessRaw = appProc;
             // Walk direct children of <application>. We need both
             // <meta-data> entries AND <provider> declarations, so do
             // them in a single pass.
@@ -1131,7 +1397,11 @@ public final class Manifest {
                         || "receiver".equals(childTag) || "service".equals(childTag)
                         || "provider".equals(childTag)) {
                     String cn = child.getAttributeNS(ANDROID_NS, "name");
-                    String cp = child.getAttributeNS(ANDROID_NS, "process");
+                    // GMS (and any app that localises its process names) writes
+                    // android:process as a STRING RESOURCE reference ("@0x7f150a08"):
+                    // resolved here like android:authorities, because a literal
+                    // "@0x..." is a process name no PackageManager would ever report.
+                    String cp = resolveStringRef(apkPath, child.getAttributeNS(ANDROID_NS, "process"));
                     if (cn != null && !cn.isEmpty() && cp != null && !cp.isEmpty()) {
                         if (cn.startsWith(".")) cn = pkg + cn;
                         componentProcesses.put(cn, cp);
@@ -1242,8 +1512,8 @@ public final class Manifest {
                     String name = child.getAttributeNS(ANDROID_NS, "name");
                     if (name == null || name.isEmpty()) continue;
                     if (name.startsWith(".")) name = pkg + name;
-                    String authorities = child.getAttributeNS(
-                        ANDROID_NS, "authorities");
+                    String authorities = resolveStringRef(apkPath,
+                        child.getAttributeNS(ANDROID_NS, "authorities"));
                     String orderStr = child.getAttributeNS(
                         ANDROID_NS, "initOrder");
                     int order = 0;
@@ -1758,10 +2028,41 @@ public final class Manifest {
         built.launchableCategory = launchCategory;
         built.queriesProviders = queriesProviders;
         built.applicationIconRaw = appIconRaw;
+        built.applicationProcess = applicationProcessRaw;
         built.requestLegacyExternalStorageRaw = requestLegacyRaw;
         built.preserveLegacyExternalStorageRaw = preserveLegacyRaw;
+        String suid = root.getAttributeNS(ANDROID_NS, "sharedUserId");
+        built.sharedUserId = (suid == null || suid.isEmpty()) ? null : suid;
+        // Google's core system packages share the uid "com.google.uid.shared" on
+        // every Android device, established by the pre-installed SYSTEM-IMAGE
+        // stub's manifest. The standalone, sideloadable Play Store APK does NOT
+        // re-declare sharedUserId (Google ships it only in the system stub), so a
+        // fresh install lands in its own uid. GMS then sees the Play Store as a
+        // foreign caller and runs the first-party CERTIFICATE check on it -- which
+        // a same-uid (shared) caller skips entirely on a device -- and rejects the
+        // Play Store's own (non-allowlisted) signing cert, breaking every
+        // content/sync/install call. Reproduce the device's genuine uid topology
+        // for these KNOWN PLATFORM packages so GMS trusts the Play Store the way it
+        // does on a device. This is a stable Android platform fact (membership of
+        // com.google.uid.shared is fixed across builds/devices), not per-APK
+        // behaviour, and it forges nothing: the Play Store keeps its real cert; we
+        // only place it in its real uid group.
+        if (built.sharedUserId == null && built.packageName != null
+                && GOOGLE_SHARED_UID_PACKAGES.contains(built.packageName)) {
+            built.sharedUserId = "com.google.uid.shared";
+        }
         return built;
     }
+
+    /** Packages that belong to the "com.google.uid.shared" uid on a stock device
+     *  but whose standalone/sideloadable APK omits the sharedUserId declaration
+     *  (it lives only in the system-image stub). Kept small and explicit; these
+     *  are platform packages, not apps we special-case for behaviour. */
+    private static final java.util.Set<String> GOOGLE_SHARED_UID_PACKAGES =
+            new java.util.HashSet<>(java.util.Arrays.asList(
+                    "com.android.vending",
+                    "com.google.android.gms",
+                    "com.google.android.gsf"));
 
     /** One `<queries><intent>` as ParsingPackageUtils.parseQueries builds it, or
      *  null where AOSP rejects it (no action and no data; more than one action,

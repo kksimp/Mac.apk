@@ -92,138 +92,226 @@ public final class Main {
         "  --parsed-marker           create <out.jar>.parsed once the input is parsed",
         "                            (removed on exit), for callers that run the",
         "                            conversion in the background",
-        "  --threads <n>             worker threads (default: min(cores, 8)); output is",
-        "                            byte-identical at every thread count",
+        "  --threads <n>             worker threads (default: one per core, at most 8 or",
+        "                            one per 256 MB of heap, whichever is more); output",
+        "                            is byte-identical at every thread count",
+        "  --server <dir>            convert in a shared converter process kept warm in",
+        "                            <dir> (started on demand, exits when idle), so a batch",
+        "                            of conversions pays JVM warm-up once; same output,",
+        "                            exit code and files as converting here",
         "  --synthetic-prefix <s>    prefix for synthetic members (default: dex2jvm)",
         "  --redirect-unsafe <cls>   route sun.misc.Unsafe calls to static methods on",
         "                            <cls> (internal name, e.g. com/example/MyUnsafe)",
         "  --redirect-exit <cls>     route System.exit / Runtime.exit / Runtime.halt to",
         "                            static methods on <cls>",
+        "  --redirect-native-load <cls>  route System.mapLibraryName / System.load /",
+        "                            Runtime.load to static methods on <cls>",
         "  -h, --help                show this help",
         "",
         "exit: 0 ok, 1 bad input, 2 usage, 3 no dex in input, 4 conversion failed");
 
     public static void main(String[] args) {
-        List<String> pos = new ArrayList<>();
-        boolean libraryGiven = false;
-        boolean noLibrary = false;
+        Job job;
         try {
-            for (int i = 0; i < args.length; i++) {
-                String a = args[i];
-                switch (a) {
-                    case "-h": case "--help":
-                        System.out.println(USAGE);
-                        System.exit(0);
-                        return;
-                    case "--classpath":
-                        Options.hierarchyLoader = loaderFor(value(args, ++i, a));
-                        libraryGiven = true;
-                        break;
-                    case "--no-library":
-                        noLibrary = true;
-                        break;
-                    case "--parsed-marker":
-                        Options.parsedMarker = true;
-                        break;
-                    case "--threads":
-                        Options.threads = Integer.parseInt(value(args, ++i, a));
-                        break;
-                    case "--synthetic-prefix":
-                        Options.syntheticPrefix = value(args, ++i, a);
-                        break;
-                    case "--redirect-unsafe":
-                        Options.unsafeRedirect = value(args, ++i, a);
-                        break;
-                    case "--redirect-exit":
-                        Options.exitRedirect = value(args, ++i, a);
-                        break;
-                    default:
-                        if (a.startsWith("-") && a.length() > 1) {
-                            throw new IllegalArgumentException("unknown option " + a);
-                        }
-                        pos.add(a);
-                }
-            }
-            if (pos.size() != 2) throw new IllegalArgumentException("expected <input> <out.jar>");
+            job = parseArgs(args);
         } catch (IllegalArgumentException e) {
             System.err.println("dex2jvm: " + e.getMessage());
             System.err.println(USAGE);
             System.exit(2);
             return;
         }
-        Path in = Paths.get(pos.get(0));
-        Path out = Paths.get(pos.get(1));
-        long t0 = System.currentTimeMillis();
-        if (noLibrary || "none".equals(Options.library)) {
+        if (job == null) {
+            System.out.println(USAGE);
+            System.exit(0);
+            return;
+        }
+        if (job.serve != null) {
+            System.exit(ConvertServer.serve(Paths.get(job.serve)));
+            return;
+        }
+        if (job.server != null) {
+            System.exit(ConvertServer.submit(job, args));
+            return;
+        }
+        System.exit(runJob(job));
+    }
+
+    /** One conversion as the command line describes it. */
+    static final class Job {
+        Path in, out;
+        boolean libraryGiven, noLibrary;
+        /** --server: hand the conversion to the shared converter in this dir. */
+        String server;
+        /** --serve: BE the shared converter for this dir (started by --server). */
+        String serve;
+    }
+
+    /**
+     * Parses the command line into a {@link Job}, setting {@link Options} from
+     * its flags as a side effect. Null means "print the help". Throws
+     * IllegalArgumentException on a usage error.
+     */
+    static Job parseArgs(String[] args) {
+        Job job = new Job();
+        List<String> pos = new ArrayList<>();
+        for (int i = 0; i < args.length; i++) {
+            String a = args[i];
+            switch (a) {
+                case "-h": case "--help":
+                    return null;
+                case "--classpath":
+                    Options.hierarchyLoader = loaderFor(value(args, ++i, a));
+                    job.libraryGiven = true;
+                    break;
+                case "--no-library":
+                    job.noLibrary = true;
+                    break;
+                case "--parsed-marker":
+                    Options.parsedMarker = true;
+                    break;
+                case "--threads":
+                    Options.threads = Integer.parseInt(value(args, ++i, a));
+                    break;
+                case "--synthetic-prefix":
+                    Options.syntheticPrefix = value(args, ++i, a);
+                    break;
+                case "--redirect-unsafe":
+                    Options.unsafeRedirect = value(args, ++i, a);
+                    break;
+                case "--redirect-native-load":
+                    Options.nativeLoadRedirect = value(args, ++i, a);
+                    break;
+                case "--redirect-exit":
+                    Options.exitRedirect = value(args, ++i, a);
+                    break;
+                case "--server":
+                    job.server = value(args, ++i, a);
+                    break;
+                case "--serve":
+                    job.serve = value(args, ++i, a);
+                    break;
+                default:
+                    if (a.startsWith("-") && a.length() > 1) {
+                        throw new IllegalArgumentException("unknown option " + a);
+                    }
+                    pos.add(a);
+            }
+        }
+        if (job.serve != null) {
+            if (!pos.isEmpty() || job.server != null) {
+                throw new IllegalArgumentException("--serve takes no other arguments");
+            }
+            return job;
+        }
+        if (pos.size() != 2) throw new IllegalArgumentException("expected <input> <out.jar>");
+        job.in = Paths.get(pos.get(0));
+        job.out = Paths.get(pos.get(1));
+        return job;
+    }
+
+    /**
+     * Picks the library for {@code job} (see {@link #chooseLibrary}) unless the
+     * command line already did.
+     */
+    static void applyLibrary(Job job) {
+        if (job.noLibrary || "none".equals(Options.library)) {
             Options.hierarchyLoader = ClassLoader.getPlatformClassLoader();
             System.err.println("[" + Options.logTag + "] library: none (--no-library); framework types merge to java/lang/Object");
-        } else if (!libraryGiven && !"classloader".equals(Options.library)) {
-            chooseLibrary(in);
+        } else if (!job.libraryGiven && !"classloader".equals(Options.library)) {
+            chooseLibrary(job.in);
         }
+    }
 
-        // ---- phase 1: PARSE. Container layout + every DEX's header and class
-        // table (DexConverter.open parses each image eagerly). Anything that
-        // escapes here means the INPUT cannot be read as a dex set.
-        DexConverter.Session session;
+    /**
+     * Phase 1 of a job: PARSE. Container layout + every DEX's header and class
+     * table (DexConverter.open parses each image eagerly). Anything that
+     * escapes here means the INPUT cannot be read as a dex set.
+     *
+     * @param exit receives the exit code when the parse fails
+     * @return the open session, or null with {@code exit[0]} set
+     */
+    static DexConverter.Session parse(Job job, int[] exit) {
         try {
-            List<byte[]> dexes = readDexesChecked(in);
-            session = DexConverter.open(dexes.toArray(new byte[0][]));
+            List<byte[]> dexes = readDexesChecked(job.in);
+            return DexConverter.open(dexes.toArray(new byte[0][]));
         } catch (NoDexException e) {
             System.err.println("[" + Options.logTag + "] NO CODE: " + e.getMessage());
-            try { Files.deleteIfExists(out); } catch (IOException ignored) {}
-            System.exit(EXIT_NO_DEX);
-            return;
+            try { Files.deleteIfExists(job.out); } catch (IOException ignored) {}
+            exit[0] = EXIT_NO_DEX;
         } catch (OutOfMemoryError oom) {
             // Running out of heap while READING says nothing about whether the
             // dex is valid, so it is a converter-side failure, not bad input.
             System.err.println("[" + Options.logTag + "] CONVERT FAILED (out of memory"
                     + " while reading the dex set; the input is not known to"
                     + " be bad; try a larger -Xmx): " + oom);
-            try { Files.deleteIfExists(out); } catch (IOException ignored) {}
-            System.exit(EXIT_CONVERT_FAILED);
-            return;
+            try { Files.deleteIfExists(job.out); } catch (IOException ignored) {}
+            exit[0] = EXIT_CONVERT_FAILED;
         } catch (Throwable t) {
             System.err.println("[" + Options.logTag + "] INVALID INPUT (the container/DEX"
                     + " cannot be parsed): " + t);
             t.printStackTrace();
-            try { Files.deleteIfExists(out); } catch (IOException ignored) {}
-            System.exit(1);
-            return;
+            try { Files.deleteIfExists(job.out); } catch (IOException ignored) {}
+            exit[0] = 1;
         }
+        return null;
+    }
+
+    /** The whole of one conversion, start to exit code. Never calls System.exit. */
+    static int runJob(Job job) {
+        long t0 = System.currentTimeMillis();
+        applyLibrary(job);
+        int[] exit = { 0 };
+        DexConverter.Session session = parse(job, exit);
+        if (session == null) return exit[0];
 
         // The parse verdict is now known. A caller polling for the marker can
         // stop treating the input as possibly invalid while the conversion
         // itself is still running. Advisory: without it the caller just waits
         // for the exit code. Removed on every exit path below; a SIGKILL leaves
         // it behind for the caller to clean up.
-        Path parsedMarker = Paths.get(out + ".parsed");
+        Path parsedMarker = Paths.get(job.out + ".parsed");
         if (Options.parsedMarker) {
             try { Files.createFile(parsedMarker); } catch (IOException ignored) {}
         }
+        try {
+            return convertParsed(session, job.out, t0);
+        } finally {
+            try { Files.deleteIfExists(parsedMarker); } catch (IOException ignored) {}
+        }
+    }
 
-        // ---- phase 2: CONVERT + write the jar. The input is proven readable
-        // by now, so an escape here is the converter's, and gets its own code.
+    /**
+     * Phase 2 of a job: CONVERT + write the jar. The input is proven readable
+     * by now, so an escape here is the converter's, and gets its own code.
+     */
+    static int convertParsed(DexConverter.Session session, Path out, long t0) {
         try {
             int n = convert(session, out);
             System.err.printf("[" + Options.logTag + "] %d classes -> %s in %d ms%n",
                     n, out, System.currentTimeMillis() - t0);
-            try { Files.deleteIfExists(parsedMarker); } catch (IOException ignored) {}
-            if (n > 0) System.exit(0);
+            int uc = DexConverter.foreignWriteClasses.getAndSet(0);
+            int uf = DexConverter.foreignWriteFields.getAndSet(0);
+            if (uc > 0) {
+                System.err.printf("[" + Options.logTag + "] ACC_FINAL cleared on %d fields"
+                        + " in %d classes: written outside their initializer, which the JVM"
+                        + " refuses from class version 53 (DEX2JVM_UNFINAL_DEBUG=1 lists them)%n",
+                        uf, uc);
+            }
+            if (n > 0) return 0;
             // Parsed, but produced nothing: every class failed to translate
             // (or the dex declares zero classes).
             System.err.println("[" + Options.logTag + "] FAILED: the dex set parsed but 0"
                     + " classes could be converted (see the per-class errors"
                     + " above); no usable jar");
             try { Files.deleteIfExists(out); } catch (IOException ignored) {}
-            System.exit(1);
+            return 1;
         } catch (Throwable t) {
             System.err.println("[" + Options.logTag + "] CONVERT FAILED (the container"
                     + " parsed completely; this failure is the converter's,"
                     + " not the input's): " + t);
             t.printStackTrace();
             try { Files.deleteIfExists(out); } catch (IOException ignored) {}
-            try { Files.deleteIfExists(parsedMarker); } catch (IOException ignored) {}
-            System.exit(EXIT_CONVERT_FAILED);
+            return EXIT_CONVERT_FAILED;
         }
     }
 

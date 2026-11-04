@@ -94,6 +94,8 @@ public class VectorDrawable extends Drawable {
     private final List<PathSpec> paths = new ArrayList<>();
     private final Paint paint = new Paint();
     private int tint = 0;
+    /** The <vector> declared android:tint (see effectiveFillColor). */
+    private boolean macapkTintDeclared;
     private int alpha = 255;
 
     public VectorDrawable() {}
@@ -256,7 +258,10 @@ public class VectorDrawable extends Drawable {
         viewportHeight = parseFloat(root.getAttributeNS(NS, "viewportHeight"), viewportHeight);
         intrinsicWidthDp  = parseDpToPx(root.getAttributeNS(NS, "width"),  intrinsicWidthDp);
         intrinsicHeightDp = parseDpToPx(root.getAttributeNS(NS, "height"), intrinsicHeightDp);
+        final String tintAttr = root.getAttributeNS(NS, "tint");
+        macapkTintDeclared = tintAttr != null && !tintAttr.trim().isEmpty();
         tint = parseColor(root.getAttributeNS(NS, "tint"), 0);
+        if ("true".equalsIgnoreCase(root.getAttributeNS(NS, "autoMirrored"))) setAutoMirrored(true);
 
         // Walk children: <path>, <group>
         walkChildren(root, new ArrayList<GroupXform>());
@@ -571,8 +576,9 @@ public class VectorDrawable extends Drawable {
      *  WORSE, not better, when Theme threading made `?attr` tints actually
      *  resolve: a tint of 0 used to fall through to the 0xFF333333
      *  approximation. */
-    private static int effectiveFillColor(int fillColor, int tint, int alpha, boolean monochrome) {
-        return effectiveFillColor(fillColor, tint, alpha, monochrome, false);
+    private static int effectiveFillColor(int fillColor, int tint, int alpha, boolean monochrome,
+                                          boolean tintDeclared) {
+        return effectiveFillColor(fillColor, tint, alpha, monochrome, tintDeclared, false);
     }
 
     /** A path with a VISIBLE stroke and a transparent fill is a stroke-only
@@ -594,7 +600,7 @@ public class VectorDrawable extends Drawable {
     }
 
     private static int effectiveFillColor(int fillColor, int tint, int alpha, boolean monochrome,
-                                          boolean strokeOnly) {
+                                          boolean tintDeclared, boolean strokeOnly) {
         if (strokeOnly) return 0;
         int color = fillColor;
         if (tint != 0) {
@@ -605,7 +611,14 @@ public class VectorDrawable extends Drawable {
                 color = (outA << 24) | (tint & 0x00FFFFFF);
             }
         }
-        if (monochrome && color == 0xFFFFFFFF && tint == 0) color = 0xFF333333;
+        // The white -> grey stand-in is for a vector that DECLARES a theme tint
+        // (`android:tint="?colorControlNormal"`) we could not resolve: its white
+        // paths are a mask, not a colour. A vector that declares NO tint paints
+        // its fill as authored (AOSP VFullPath draws fillColor, nothing else), so
+        // a white icon made for a dark toolbar stays white. Substituting there
+        // painted Privacy Friendly Notes' white "sort A-Z" action #333333 on its
+        // dark-blue toolbar, i.e. nearly invisible.
+        if (monochrome && tintDeclared && color == 0xFFFFFFFF && tint == 0) color = 0xFF333333;
         // A TRANSPARENT fill under a tint takes the tint. This half has always
         // run and is unchanged.
         //
@@ -638,6 +651,20 @@ public class VectorDrawable extends Drawable {
 
     @Override
     public void draw(Canvas canvas) {
+        // AOSP VectorDrawable.draw: needMirroring() (android:autoMirrored and an
+        // RTL layout direction) flips the canvas about the bounds before the
+        // tree is drawn, so a back arrow points the RTL way.
+        if (canvas != null && isAutoMirrored() && getLayoutDirection() == 1 /* RTL */) {
+            final android.graphics.Rect b = getBounds();
+            final int save = canvas.save();
+            canvas.scale(-1f, 1f, (b.left + b.right) / 2f, (b.top + b.bottom) / 2f);
+            try { macapkDrawUnmirrored(canvas); } finally { canvas.restoreToCount(save); }
+            return;
+        }
+        macapkDrawUnmirrored(canvas);
+    }
+
+    private void macapkDrawUnmirrored(Canvas canvas) {
         if (canvas == null || paths.isEmpty()) return;
         // Honor a PROGRAMMATIC tint (Compose Icon(tint=), AppCompat
         // DrawableCompat.setTintList / ?attr/colorControlNormal) over the XML
@@ -762,10 +789,10 @@ public class VectorDrawable extends Drawable {
                           // loop paints with, so the trace cannot disagree with the
                           // code it is reporting on (it could, and did, before).
                           .append(" eff=0x").append(Integer.toHexString(
-                              effectiveFillColor(s.fillColor, tint, alpha, monochrome, macapkStrokeOnly(s))))
+                              effectiveFillColor(s.fillColor, tint, alpha, monochrome, macapkTintDeclared, macapkStrokeOnly(s))))
                           .append(" WILLDRAW=").append(
                               (s.fillShader != null && tint == 0)
-                              || (effectiveFillColor(s.fillColor, tint, alpha, monochrome, macapkStrokeOnly(s))
+                              || (effectiveFillColor(s.fillColor, tint, alpha, monochrome, macapkTintDeclared, macapkStrokeOnly(s))
                                   & 0xFF000000) != 0);
                         // The GEOMETRY. A pathData string our parser cannot read
                         // yields a Path with no segments, which draws with a
@@ -805,7 +832,7 @@ public class VectorDrawable extends Drawable {
             for (PathSpec spec : paths) {
                 int color = (cf != null)
                         ? macapkFilteredFill(spec.fillColor, alpha, cfExact ? cf : null)
-                        : effectiveFillColor(spec.fillColor, tint, alpha, monochrome, macapkStrokeOnly(spec));
+                        : effectiveFillColor(spec.fillColor, tint, alpha, monochrome, macapkTintDeclared, macapkStrokeOnly(spec));
                 // v1.0.501 (extended: graphics-drawable-11): apply the path's
                 // accumulated <group> transform chain, root-to-leaf. A canvas
                 // op composes with the CURRENT transform such that the

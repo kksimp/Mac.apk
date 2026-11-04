@@ -196,7 +196,22 @@ public class DevicePolicyManager {
 
     public boolean isAdminActive(ComponentName admin) { return false; }
     public boolean isDeviceOwnerApp(String packageName) { return false; }
+    /** @hide (used by Google Play services): the device owner's package; none here. */
+    public String getDeviceOwner() { return null; }
     public boolean isProfileOwnerApp(String packageName) { return false; }
+    // @hide/@SystemApi getProfileOwner(): the profile owner component of the
+    // calling user's profile, or null if none. Mac.apk models a single
+    // UNMANAGED user (isProfileOwnerApp/isDeviceOwnerApp both report false), so
+    // there is no profile owner -- null is the device-faithful answer. The real
+    // Play Store's device-state scan (wxm.r on a bg executor) calls this and
+    // NoSuchMethodError'd without it.
+    public ComponentName getProfileOwner() { return null; }
+    // @hide/@SystemApi getDeviceOwnerComponentOnAnyUser(): the device owner's
+    // admin component across all users, or null if the device has no device
+    // owner. Mac.apk models a single UNMANAGED device, so null is the
+    // device-faithful answer. The Play Store's device-state scan calls this on a
+    // background executor and NoSuchMethodError'd without it.
+    public ComponentName getDeviceOwnerComponentOnAnyUser() { return null; }
     public boolean isManagedProfile(ComponentName admin) { return false; }
     public boolean isDeviceManaged() { return false; }
     public java.util.List<ComponentName> getActiveAdmins() { return new java.util.ArrayList<>(); }
@@ -939,7 +954,13 @@ public class DevicePolicyManager {
     }
 
     public boolean isUninstallBlocked(android.content.ComponentName componentName0, String name1) {
-        throw notAdmin("isUninstallBlocked");
+        // AOSP DevicePolicyManagerService.isUninstallBlocked is a QUERY, not an
+        // admin-only operation: it reports whether any active admin has blocked
+        // uninstall of the package and, with no admin, returns false. Mac.apk has
+        // no device-admin activation, so nothing blocks uninstall. Returning false
+        // (not throwing) matters because the Play Store calls this during install
+        // and an exception aborts the flow.
+        return false;
     }
 
     /** AOSP: whether the device supports unique-device attestation from hardware 

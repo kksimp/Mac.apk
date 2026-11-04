@@ -545,6 +545,32 @@ public final class CodeWriter {
         add(in);
     }
 
+    /**
+     * Every putstatic / putfield this body holds, as pairs {opcode,
+     * constant-pool index of its Fieldref}, flattened. Read from the recorded
+     * instruction list, which is exactly what toCodeAttributeBody serializes
+     * (fieldOp is the only way to add one, and nothing is ever removed), so a
+     * caller sees the bytecode as it will be written.
+     */
+    int[] fieldPuts() {
+        int n = 0;
+        for (Insn in : insns) {
+            if (in instanceof Op && isPut(((Op) in).opcode)) n++;
+        }
+        int[] out = new int[2 * n];
+        int k = 0;
+        for (Insn in : insns) {
+            if (!(in instanceof Op)) continue;
+            Op o = (Op) in;
+            if (!isPut(o.opcode)) continue;
+            out[k++] = o.opcode;
+            out[k++] = o.operand;
+        }
+        return out;
+    }
+
+    private static boolean isPut(int opcode) { return opcode == PUTSTATIC || opcode == PUTFIELD; }
+
     /** getstatic / putstatic / getfield / putfield. */
     public void fieldOp(int opcode, String owner, String name, String desc) {
         int slots = slotsOf(desc);

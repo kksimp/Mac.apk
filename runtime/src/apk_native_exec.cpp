@@ -147,6 +147,11 @@ constexpr const char* kSidecarDir  = ".macapk-elfexec";
 constexpr const char* kShimDirFile = ".shimdir";
 constexpr const char* kHelperName  = "macapk-elfexec";
 
+fs::path sidecar_for(const fs::path& libdir) {
+    return libdir.parent_path() / kSidecarDir / libdir.filename();
+}
+
+
 constexpr uint16_t kET_EXEC = 2, kET_DYN = 3;
 constexpr uint32_t kPT_DYNAMIC = 2;
 // Dynamic-array tags. Kept in step with debug/elfexec_scan.py, which parses
@@ -331,7 +336,22 @@ bool install_helper(const fs::path& helper, const fs::path& dst) {
 size_t reconcile_dir(const fs::path& libdir, const fs::path& helper,
                      bool on, size_t* reverted) {
     std::error_code ec;
-    const fs::path sidecar = libdir / kSidecarDir;
+    const fs::path sidecar = sidecar_for(libdir);
+    const fs::path legacy = libdir / kSidecarDir;
+    bool migrated = false;
+    // Android's nativeLibraryDir contains the APK's libraries, not our backup
+    // directories. Keep per-ABI backups outside it. Migrate by rename so the
+    // original ELF and bookkeeping stay intact on existing installations.
+    if (fs::is_directory(legacy, ec)) {
+        if (!fs::exists(sidecar, ec)) {
+            fs::create_directories(sidecar.parent_path(), ec);
+            if (!ec) { fs::rename(legacy, sidecar, ec); migrated = !ec; }
+        } else ec = std::make_error_code(std::errc::file_exists);
+        if (ec) {
+            std::fprintf(stderr, "[macapk] elfexec: cannot migrate backup directory: %s\n", ec.message().c_str());
+            return 0;
+        }
+    }
     size_t installed = 0;
 
     // Pass 1: revert anything already installed whose gate is now off, and
@@ -370,7 +390,7 @@ size_t reconcile_dir(const fs::path& libdir, const fs::path& helper,
             }
             // Gate on: make sure the visible path is our stand-in and current.
             std::error_code sec;
-            bool need = !fs::exists(visible, sec) || !is_macho(visible)
+            bool need = migrated || !fs::exists(visible, sec) || !is_macho(visible)
                 || fs::file_size(visible, sec) != fs::file_size(helper, sec);
             if (need && !install_helper(helper, visible)) continue;
             ++installed;
@@ -471,7 +491,7 @@ size_t ReconcileApkNativeExecutables(const std::string& lib_root,
     for (fs::directory_iterator it(libroot, ec), end; it != end;
          it.increment(ec)) {
         if (ec) break;
-        if (it->is_directory(ec)) abidirs.push_back(it->path());
+        if (it->path().filename() != kSidecarDir && it->is_directory(ec)) abidirs.push_back(it->path());
     }
     size_t installed = 0, reverted = 0;
     for (const fs::path& abidir : abidirs) {
@@ -481,7 +501,7 @@ size_t ReconcileApkNativeExecutables(const std::string& lib_root,
             // Env-independent fallback for locating the shim from the child
             // (an app that clears its child's environment still works).
             // Per-directory, and only where the sidecar actually exists.
-            std::ofstream sf(abidir / kSidecarDir / kShimDirFile);
+            std::ofstream sf(sidecar_for(abidir) / kShimDirFile);
             if (sf) sf << shim_dir.string() << "\n";
         }
     }

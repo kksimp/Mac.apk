@@ -846,6 +846,9 @@ public class PackageInstaller {
         public void setInstallLocation(int location) { this.installLocation = location; }
         public void setReferrerUri(android.net.Uri referrer) {}
         public void setOriginatingUri(android.net.Uri originating) {}
+        // @hide on AOSP; the Play Store probes it reflectively. We never install
+        // instant apps, so record nothing -- a regular install is the only mode.
+        public void setInstallAsInstantApp(boolean isInstantApp) {}
         /** AOSP API-24+; Aurora calls it (setOriginatingUid(Process.myUid()))
          *  on every install at our presented SDK, so it must resolve. */
         public void setOriginatingUid(int originatingUid) { this.originatingUid = originatingUid; }

@@ -9,14 +9,13 @@ import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public final class LocaleList implements Parcelable {
     private final Locale[] locales;
     private static final LocaleList EMPTY = new LocaleList();
     private static LocaleList defaultList;
     private static Locale defaultLocale = Locale.getDefault();
+    private static LocaleList systemList;
 
     // Pseudo-locales used for RTL / accented pseudo-translation testing.
     // matchesLanguageAndScript() must never treat these as a script match
@@ -138,9 +137,15 @@ public final class LocaleList implements Parcelable {
 
     public static LocaleList getEmptyLocaleList() { return EMPTY; }
 
-    public static LocaleList getDefault() {
-        if (defaultList == null) defaultList = readAppleLanguagesOrdered();
+    public static synchronized LocaleList getDefault() {
+        if (defaultList == null) defaultList = macapkGetSystemLocales();
         return defaultList;
+    }
+
+    /** Host identity must survive process-default and application-locale changes. */
+    public static synchronized LocaleList macapkGetSystemLocales() {
+        if (systemList == null) systemList = readAppleLanguagesOrdered();
+        return systemList;
     }
 
     // macOS's per-user RANKED language preference (System Settings > General >
@@ -156,6 +161,8 @@ public final class LocaleList implements Parcelable {
     // JVM's own single-locale Locale.getDefault(), this class's pre-existing
     // (and still correct-if-narrower) behavior.
     private static LocaleList readAppleLanguagesOrdered() {
+        LocaleList override = readMacApkLanguageOverride();
+        if (override != null) return override;
         try {
             // java.lang.Process, not android.os.Process -- this file's own
             // package shadows the unqualified name.
@@ -168,14 +175,14 @@ public final class LocaleList implements Parcelable {
                 while ((line = r.readLine()) != null) out.append(line).append('\n');
             }
             p.waitFor();
-            // `defaults read` prints an NSPropertyList array as one quoted
-            // element per line, e.g. (\n    "fr-FR",\n    "en-US"\n)\n --
-            // BCP-47 tags never contain a quote or backslash, so extracting
-            // quoted substrings in order needs no real plist/JSON parser.
+            // OpenStep arrays can contain quoted or unquoted language tags.
             List<Locale> ordered = new ArrayList<>();
-            Matcher m = Pattern.compile("\"([^\"]+)\"").matcher(out);
-            while (m.find()) {
-                ordered.add(Locale.forLanguageTag(m.group(1)));
+            String array = out.toString().trim();
+            if (array.startsWith("(") && array.endsWith(")")) {
+                for (String entry : array.substring(1, array.length() - 1).split(",")) {
+                    String tag = entry.trim().replaceAll("^\"|\"$", "");
+                    if (!tag.isEmpty()) ordered.add(Locale.forLanguageTag(tag));
+                }
             }
             if (!ordered.isEmpty()) {
                 return new LocaleList(ordered.toArray(new Locale[0]));
@@ -186,9 +193,32 @@ public final class LocaleList implements Parcelable {
         return new LocaleList(Locale.getDefault());
     }
 
+    /** The Mac.apk Language menu's GLOBAL override: a ranked tag list in
+     *  ~/Library/Application Support/MacApk/language (written by the launcher's
+     *  Language menu), consulted ahead of macOS's AppleLanguages so "System" stays
+     *  the default and picking a language replaces it for every app. Per-app
+     *  choices still outrank it, through LocaleManager.setApplicationLocales,
+     *  which is how AOSP layers application locales over system locales. Absent,
+     *  empty or unreadable means "follow macOS". */
+    private static LocaleList readMacApkLanguageOverride() {
+        try {
+            java.io.File f = new java.io.File(System.getProperty("user.home"),
+                    "Library/Application Support/MacApk/language");
+            if (!f.isFile()) return null;
+            String tags = new String(java.nio.file.Files.readAllBytes(f.toPath()),
+                    java.nio.charset.StandardCharsets.UTF_8).trim();
+            if (tags.isEmpty()) return null;
+            LocaleList list = forLanguageTags(tags);
+            return list.size() == 0 ? null : list;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     public static LocaleList getAdjustedDefault() { return getDefault(); }
-    public static void setDefault(LocaleList list) { defaultList = list; }
-    public static void setDefault(LocaleList list, int index) {
+    public static void setDefault(LocaleList list) { setDefault(list, 0); }
+    public static synchronized void setDefault(LocaleList list, int index) {
+        macapkGetSystemLocales();
         defaultList = list;
         if (list != null && index >= 0 && index < list.size()) {
             defaultLocale = list.get(index);

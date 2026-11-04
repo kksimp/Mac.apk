@@ -19,6 +19,7 @@
 #include "macapk/jvm_loader.h"
 #include "macapk/native_methods.h"
 #include "macapk/config.h"
+#include "macapk/dir_naming.h"
 #include "macapk/window_policy.h"
 #include "macapk/window_traits.h"
 
@@ -2880,8 +2881,12 @@ int main(int argc, char** argv) {
         // COEXIST -- nothing here ever merges or renames another
         // version's dirs. Boot.java derives the data dir lexically from
         // basename(appDir), so handing it the code dir yields data_dir.
-        const std::string dir_name = ver.empty() ? mfst_pkg
-                                                 : mfst_pkg + "_" + ver;
+        // GitHub #82: the version's dots are folded out of the folder name so the
+        // path an app sees has only its package's dots. An install that already
+        // lives under the dotted name keeps it until the launcher migrates it
+        // (dir_naming.h), so its saves never end up beside an empty twin.
+        const std::string dir_name = macapk_dirname::ChooseDirName(
+            mfst_pkg, ver, code_root.string(), data_root.string());
         const fs::path code_dir = code_root / dir_name;
         const fs::path data_dir = data_root / dir_name;
 
@@ -3106,6 +3111,9 @@ int main(int argc, char** argv) {
     AndroidRootResult android = SetupAndroidRootEx(cli.android_root, app);
     const std::string& android_root = android.root;
     const std::string& android_pkg  = android.pkg;
+    // The native per-app proxy panel and Java startup policy must read the
+    // same resolved root, including CLI defaults and tilde expansion.
+    if (!android_root.empty()) setenv("MACAPK_ANDROID_ROOT", android_root.c_str(), 1);
 
     // APK-shipped native EXECUTABLES. An app may ship a helper BINARY under
     // lib/<abi>/ and fork it (the lib*.so name is forced by PackageManager,

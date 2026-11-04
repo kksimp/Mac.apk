@@ -93,9 +93,9 @@ public class BluetoothDevice implements Parcelable {
     public BluetoothDevice(String address) { mAddress = address; }
 
     public String getAddress() { return mAddress; }
-    public String getName() { return null; }
-    public String getAlias() { return null; }
-    public int getType() { return DEVICE_TYPE_UNKNOWN; }
+    public String getName() { return com.macapk.loader.BluetoothBridge.name(this); }
+    public String getAlias() { return getName(); }
+    public int getType() { return com.macapk.loader.BluetoothBridge.identifier(this)==null ? DEVICE_TYPE_UNKNOWN : DEVICE_TYPE_LE; }
     public int getBondState() { return BOND_NONE; }
     public boolean createBond() { return false; }
     public BluetoothClass getBluetoothClass() { return null; }
@@ -111,24 +111,26 @@ public class BluetoothDevice implements Parcelable {
         return null;
     }
 
-    /** AOSP connectGatt(): begins a GATT client connection. No radio, so the
-     *  returned client immediately reports a connection failure to the callback. */
+    /** CoreBluetooth GATT client. Classic BR/EDR transport has no backend. */
     public BluetoothGatt connectGatt(Context context, boolean autoConnect,
             BluetoothGattCallback callback) {
-        return BluetoothGatt.createFailed(this, callback);
+        return BluetoothGatt.create(this, callback, null);
     }
     public BluetoothGatt connectGatt(Context context, boolean autoConnect,
             BluetoothGattCallback callback, int transport) {
-        return BluetoothGatt.createFailed(this, callback);
+        if(transport==TRANSPORT_BREDR)return BluetoothGatt.createFailed(this,callback);
+        return BluetoothGatt.create(this, callback, null);
     }
     public BluetoothGatt connectGatt(Context context, boolean autoConnect,
             BluetoothGattCallback callback, int transport, int phy) {
-        return BluetoothGatt.createFailed(this, callback);
+        if(transport==TRANSPORT_BREDR)return BluetoothGatt.createFailed(this,callback);
+        return BluetoothGatt.create(this, callback, null);
     }
     public BluetoothGatt connectGatt(Context context, boolean autoConnect,
             BluetoothGattCallback callback, int transport, int phy,
             android.os.Handler handler) {
-        return BluetoothGatt.createFailed(this, callback);
+        if(transport==TRANSPORT_BREDR)return BluetoothGatt.createFailed(this,callback);
+        return BluetoothGatt.create(this, callback, handler);
     }
 
     /** No bond can exist, so there is no pairing to confirm; false is AOSP's

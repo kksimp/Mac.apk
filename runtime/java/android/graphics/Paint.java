@@ -735,14 +735,49 @@ public class Paint {
         return macapkMeasureRuns(s, primary);
     }
 
+    private static final ThreadLocal<java.text.BreakIterator> CLUSTER_ITER =
+        ThreadLocal.withInitial(() -> java.text.BreakIterator.getCharacterInstance(java.util.Locale.ROOT));
+
+    /** True when UAX #29 makes every char of `text` its own grapheme cluster:
+     *  no CR (CR LF is one cluster), surrogate, Hangul jamo, Prepend char,
+     *  combining mark, SpacingMark or format char (ZWJ, ZWNJ, bidi controls). */
+    private static boolean macapkTriviallyClustered(String text) {
+        for (int i = 0, n = text.length(); i < n; i++) {
+            char c = text.charAt(i);
+            if (c < 0x0300) {
+                if (c == 0x0D) return false;   // CR: CR LF is one cluster
+                continue;
+            }
+            if (Character.isSurrogate(c)) return false;
+            if ((c >= 0x1100 && c <= 0x11FF) || (c >= 0xA960 && c <= 0xA97F) || (c >= 0xD7B0 && c <= 0xD7FF)) return false;
+            if ((c >= 0x0600 && c <= 0x0605) || c == 0x06DD || c == 0x070F || c == 0x08E2 || c == 0x0D4E) return false;
+            // The two SpacingMarks whose general category is Lo, not Mc: Thai
+            // SARA AM and Lao AM join the preceding letter's cluster.
+            if (c == 0x0E33 || c == 0x0EB3) return false;
+            switch (Character.getType(c)) {
+                case Character.NON_SPACING_MARK:
+                case Character.ENCLOSING_MARK:
+                case Character.COMBINING_SPACING_MARK:
+                case Character.FORMAT:
+                    return false;
+                default:
+            }
+        }
+        return true;
+    }
+
     /** Grapheme-cluster count, the unit AOSP's letter-spacing is applied per.
      *  `BreakIterator.getCharacterInstance` is the JDK's UAX#29 implementation,
      *  which is the same standard minikin follows. */
     static int macapkClusterCount(String text) {
         if (text == null || text.isEmpty()) return 0;
+        // Fast path: with no combining mark, format char, surrogate, CR, Hangul
+        // jamo or prepend char, UAX #29 makes every char its own cluster. That is
+        // nearly every UI string (plain Latin, Hebrew without niqqud), and it
+        // skips building a BreakIterator, which showed in the UI-thread profile.
+        if (macapkTriviallyClustered(text)) return text.length();
         try {
-            java.text.BreakIterator it =
-                java.text.BreakIterator.getCharacterInstance(java.util.Locale.ROOT);
+            java.text.BreakIterator it = CLUSTER_ITER.get();
             it.setText(text);
             int n = 0;
             for (int e = it.first(); e != java.text.BreakIterator.DONE

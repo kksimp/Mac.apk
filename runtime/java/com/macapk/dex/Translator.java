@@ -307,6 +307,16 @@ public final class Translator {
         if (ladder.run(method, code, mw, hierarchy, repoints, superIfaces, done, false)) return;
         if (ladder.sawSlotWall && done.spillEligible()
                 && ladder.run(method, code, mw, hierarchy, repoints, superIfaces, done, true)) {
+            MethodSplitter.Plan p = ladder.committed;
+            if (p != null && p.instanceSpill()) {
+                // The one line a constructor rescue leaves (MethodSplitter,
+                // THE <init> SPILL), so a run that depends on it says so.
+                ctorSpills.incrementAndGet();
+                System.err.println("[" + Options.logTag + "] split oversize constructor "
+                    + method.declaringClass().name() + "." + method.name() + method.descriptor()
+                    + " into " + p.parts().size() + " parts, " + p.spillFields().size()
+                    + " values through instance fields (DEX2JVM_CTOR_RESCUE=0 turns this off)");
+            }
             return;
         }
         // Nothing worked: leave the method exactly as the unsplit path produced
@@ -316,6 +326,10 @@ public final class Translator {
             translateOnce(method, code, mw, hierarchy, repoints, superIfaces, null, null);
         }
     }
+
+    /** Constructors split through instance spill fields, process wide. */
+    static final java.util.concurrent.atomic.AtomicInteger ctorSpills =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     /** One MethodSplitter retry ladder over a method whose unsplit translation
      *  overflowed. {@link #run} tries successively smaller per-part budgets and
@@ -327,6 +341,9 @@ public final class Translator {
         /** Some attempt emitted code into the method, so a final failure must
          *  re-translate the unsplit body. */
         boolean placed;
+        /** The plan that translated and committed, once {@link #run} returned
+         *  true. */
+        MethodSplitter.Plan committed;
         /** Some attempt was refused because a part needed more than 255
          *  argument slots: the one refusal the &lt;clinit&gt; spill changes. */
         boolean sawSlotWall;
@@ -378,6 +395,7 @@ public final class Translator {
                     MethodTranslator chained = translateOnce(method, code, mw, hierarchy,
                             repoints, superIfaces, null, chain);
                     chained.commitSyntheticMethods();
+                    committed = chain;
                     return true;
                 } catch (CodeWriter.CodeLengthExceeded e) {
                     if (MethodSplitter.debug()) {
@@ -791,6 +809,12 @@ public final class Translator {
             final java.util.TreeMap<Integer, CodeWriter.Label> portals = new java.util.TreeMap<>();
             /** Try blocks whose range and handlers both live in this part. */
             List<TypeInference.TryBlock> tries = java.util.Collections.emptyList();
+            /** Handler DEX offset -> this part's COPY of a handler that lives in
+             *  another part (MethodSplitter.CLONE_HANDLERS). Kept apart from
+             *  {@link #labels} for the reason portals are: the offset is not
+             *  this part's, and a range end must never bind to it. */
+            final java.util.TreeMap<Integer, CodeWriter.Label> cloneLabels =
+                    new java.util.TreeMap<>();
 
             PartState(int index, CodeWriter writer, MethodSplitter.Part part) {
                 this.index = index;
@@ -840,6 +864,13 @@ public final class Translator {
                     if (incumbent == null || betterFrameSource(this, dexOffset, incumbent)) {
                         bytecodeToDex.put(l.offset, dexOffset);
                     }
+                }
+                // A handler copy's pc is that handler's program point: its frame
+                // is the handler's own (locals at the handler, the exception on
+                // the stack), whatever else happens to share the bytecode offset.
+                for (Map.Entry<Integer, CodeWriter.Label> e : cloneLabels.entrySet()) {
+                    CodeWriter.Label l = e.getValue();
+                    if (l.offset >= 0) bytecodeToDex.put(l.offset, e.getKey());
                 }
             }
         }
@@ -989,6 +1020,10 @@ public final class Translator {
             locals = Locals.allocate(types, norm, code.registersSize(), argSlotCount());
             lastNorm = norm;
             allTries = tries;
+            if (ConstReadingElision.armed()) {
+                deadConstReadings = ConstReadingElision.plan(norm, types, tries,
+                        branchTargets(tries), elisionBarriers(), decoded);
+            }
 
             if (split != null) { runSplit(norm, tries); return; }
 
@@ -1027,6 +1062,30 @@ public final class Translator {
             // uncovered by any handler, so it has no branch target and therefore
             // needs no StackMapTable at all (JVMS 4.10.1).
             mainWriter.setFrameProvider(cur);
+        }
+
+        /**
+         * DEX offset -> scalars of that const whose store is dead, or null when
+         * ConstReadingElision is not armed (every ordinary translation).
+         */
+        Map<Integer, Integer> deadConstReadings;
+
+        /** Offsets where an outline chunk or a split part begins or ends, and
+         *  MonitorCover stub sites: locals are read there in ways it.uses does
+         *  not describe, so an elision window must not cross one. */
+        java.util.Set<Integer> elisionBarriers() {
+            java.util.Set<Integer> b = new HashSet<>();
+            if (outline != null) {
+                for (MethodOutliner.Chunk c : outline.chunks()) {
+                    b.add(c.startOffset);
+                    b.add(c.endOffset);
+                }
+            }
+            if (split != null) {
+                for (MethodSplitter.Part p : split.parts()) b.add(p.startOffset);
+            }
+            if (coverPlan != null) b.addAll(coverPlan.stub.keySet());
+            return b;
         }
 
         /** The normalized stream the emitted body came from, for planOutlining. */
@@ -1667,6 +1726,17 @@ public final class Translator {
                     beginPart(next, tries);
                     last = null;
                 }
+                Integer copied = split.clonedHandlerContaining(insn.offset);
+                if (copied != null && !partUsesHandler(copied)) {
+                    // A cloned handler whose own part has no range using it:
+                    // every range that does has its copy, and nothing else can
+                    // enter the block, so the original would be dead code --
+                    // and dead code after a throw still needs a frame, which a
+                    // handler with no row in this part's table cannot supply.
+                    bindRangeEndsUpTo(insn.offset);
+                    last = insn;
+                    continue;
+                }
                 out.mark(labelFor(insn.offset));
                 bindRangeEndsUpTo(insn.offset);
                 last = insn;
@@ -1709,6 +1779,56 @@ public final class Translator {
         }
 
         /**
+         * Lay down this part's copy of every cloned handler its ranges use but
+         * another part holds (MethodSplitter.CLONE_HANDLERS). Runs after
+         * bindRangeEndsUpTo and the portals, so a copy sits outside every
+         * range of the part, as a handler body must not be covered by the
+         * range it serves. The planner guarantees the block is a straight line
+         * ending in throw or return that only an exception edge enters, so the
+         * copy needs no label but its first, and the frame there is the
+         * handler's own (frameFor via cloneLabels / handlerEntryTypes).
+         */
+        void emitHandlerClones() {
+            if (split == null) return;
+            java.util.TreeSet<Integer> need = new java.util.TreeSet<>();
+            for (TypeInference.TryBlock t : cur.tries) {
+                for (TypeInference.Catch c : t.catches) {
+                    int h = c.handlerOffset;
+                    if (split.cloneBlock(h) == null || !types.isReachable(h)) continue;
+                    if (split.partIndexOf(h) != cur.index) need.add(h);
+                }
+            }
+            if (need.isEmpty()) return;
+            Map<Integer, TypeInference.Insn> byOffset = new HashMap<>();
+            for (TypeInference.Insn in : lastNorm) byOffset.put(in.offset, in);
+            for (int h : need) {
+                CodeWriter.Label l = out.newLabel("handler-copy@0x" + Integer.toHexString(h));
+                labelOwner.put(l, out);
+                out.mark(l);
+                cur.cloneLabels.put(h, l);
+                cur.handlerEntryTypes.put(h, handlerTypes.get(h));
+                for (int o : split.cloneBlock(h)) {
+                    TypeInference.Insn insn = byOffset.get(o);
+                    if (insn == null) {
+                        throw new TranslationException("handler copy: no instruction at 0x"
+                                + Integer.toHexString(o));
+                    }
+                    emitOne(insn, types.typesFor(o));
+                }
+            }
+        }
+
+        /** True when a range of the CURRENT part names this handler. */
+        boolean partUsesHandler(int handlerOffset) {
+            for (TypeInference.TryBlock t : cur.tries) {
+                for (TypeInference.Catch c : t.catches) {
+                    if (c.handlerOffset == handlerOffset) return true;
+                }
+            }
+            return false;
+        }
+
+        /**
          * Close the part being emitted: bind what is still open, then lay down
          * the pieces that must sit OUTSIDE every try range -- the handler stubs
          * and the portals.
@@ -1732,6 +1852,7 @@ public final class Translator {
             markEndOfCode();
             emitHandlerStubs(partHandlerOffsets());
             emitPortals();
+            emitHandlerClones();
             emitTryCatch(cur.tries);
             emitLineNumbers(cur.labels);
             cur.writer.setFrameProvider(cur);
@@ -1773,11 +1894,17 @@ public final class Translator {
          */
         void emitPartPrologue(MethodSplitter.Part part) {
             int scratchBase = Math.max(part.argSlots, locals.slotCount());
-            out.varOp(CodeWriter.ILOAD, 0);
+            // A receiver-carrying part (MethodSplitter, THE <init> SPILL) keeps
+            // the object under construction in slot 0, which no register slot
+            // overlaps (they start at the constructor's own argument count),
+            // and its entry id follows it.
+            int idSlot = part.receiver ? 1 : 0;
+            out.varOp(CodeWriter.ILOAD, idSlot);
             out.varOp(CodeWriter.ISTORE, scratchBase);
-            int src = 1, dst = scratchBase + 1;
+            int src = idSlot + 1, dst = scratchBase + 1;
             // A spilled part's values are not arguments: each entry stub reads
-            // its own from the part's static fields (MethodSplitter.CLINIT_SPILL).
+            // its own from the part's static fields (MethodSplitter.CLINIT_SPILL),
+            // or from the receiver's instance fields (THE <init> SPILL).
             if (!part.spilled) {
                 for (MethodSplitter.Param p : part.params) {
                     out.varOp(loadOp(p.scalar), src);
@@ -1809,6 +1936,20 @@ public final class Translator {
                 // values and the arguments are still only in scratch.
                 out.putFrame(stubs[i], stubFrame);
                 for (MethodSplitter.Param p : e.params) {
+                    if (part.spilled && part.receiver) {
+                        // The instance-field twin of the getstatic below: the
+                        // fields of the object under construction, in slot 0.
+                        out.varOp(CodeWriter.ALOAD, 0);
+                        out.fieldOp(CodeWriter.GETFIELD, ownerName, p.spillField, p.descriptor);
+                        out.varOp(storeOp(p.scalar), p.slot);
+                        if (p.scalar == DexType.OBJ) {
+                            out.varOp(CodeWriter.ALOAD, 0);
+                            out.op(CodeWriter.ACONST_NULL);
+                            out.fieldOp(CodeWriter.PUTFIELD, ownerName, p.spillField,
+                                        p.descriptor);
+                        }
+                        continue;
+                    }
                     if (part.spilled) {
                         // getstatic of a field typed exactly p.descriptor: the
                         // value arrives with the type the target frame declares,
@@ -1858,6 +1999,7 @@ public final class Translator {
                 }
             }
             slots[scratchBase] = StackMapWriter.VType.INTEGER;
+            if (part.receiver) slots[0] = StackMapWriter.VType.object(ownerName);
             if (!part.spilled) {
                 for (MethodSplitter.Param p : part.params) {
                     slots[p.scratchSlot] = StackMapWriter.VType.forDescriptor(p.descriptor);
@@ -1902,7 +2044,20 @@ public final class Translator {
                 mine.addAll(en.params);
 
                 out.mark(pe.getValue());
-                if (tp.spilled) {
+                if (tp.spilled && tp.receiver) {
+                    // THE <init> SPILL: the same writes, into the object under
+                    // construction. Slot 0 holds it in every member of the
+                    // chain: the constructor's own `this`, initialized wherever
+                    // a portal is (every cut sits after super()), or a part's
+                    // receiver argument.
+                    for (MethodSplitter.Param p : en.params) {
+                        out.varOp(CodeWriter.ALOAD, 0);
+                        out.varOp(loadOp(p.scalar), p.slot);
+                        out.fieldOp(CodeWriter.PUTFIELD, ownerName, p.spillField, p.descriptor);
+                    }
+                    out.varOp(CodeWriter.ALOAD, 0);
+                    out.pushInt(en.id);
+                } else if (tp.spilled) {
                     // Only the values THIS entry restores are written; the entry
                     // stub reads exactly those, so the part's other fields are
                     // never read on this path.
@@ -1912,6 +2067,7 @@ public final class Translator {
                     }
                     out.pushInt(en.id);
                 } else {
+                    if (tp.receiver) out.varOp(CodeWriter.ALOAD, 0);
                     out.pushInt(en.id);
                     for (MethodSplitter.Param p : tp.params) {
                         if (mine.contains(p)) out.varOp(loadOp(p.scalar), p.slot);
@@ -1969,16 +2125,31 @@ public final class Translator {
                     thisUninit,
                     off -> { Integer b = bytecodeOf.get(off); return b == null ? -1 : b; },
                     length, targetBytes, allowWiden, method.proto().returnType(), taken,
-                    methodTag(), spillAllowed, takenFields);
+                    methodTag(), spillAllowed, takenFields,
+                    ctorSpillEligible() ? "L" + ownerName + ";" : null);
         }
 
-        /** May this method's split parts take their values through static
-         *  fields? Sound only for a class initializer (one execution, one
-         *  thread, under the init lock, JVMS 5.5) and only where the class may
-         *  declare a private non-final static: not an interface (JVMS 4.5).
-         *  See MethodSplitter.CLINIT_SPILL. */
+        /** May this method's split parts take their values through fields?
+         *  Static fields are sound only for a class initializer (one
+         *  execution, one thread, under the init lock, JVMS 5.5) and only where
+         *  the class may declare a private non-final static: not an interface
+         *  (JVMS 4.5). See MethodSplitter.CLINIT_SPILL. A constructor uses
+         *  instance fields of the object it constructs instead; see
+         *  {@link #ctorSpillEligible}. */
         boolean spillEligible() {
-            return MethodSplitter.CLINIT_SPILL && "<clinit>".equals(method.name())
+            return (MethodSplitter.CLINIT_SPILL && "<clinit>".equals(method.name())
+                    && !method.declaringClass().isInterface())
+                || ctorSpillEligible();
+        }
+
+        /** May this method's split parts take their values through INSTANCE
+         *  fields of the object under construction? Only an instance
+         *  constructor of a class: it runs once per object, after super() --
+         *  where every cut sits -- the object is initialized, and no other
+         *  thread or nested construction can share its fields. See
+         *  MethodSplitter's THE &lt;init&gt; SPILL. */
+        boolean ctorSpillEligible() {
+            return MethodSplitter.CTOR_SPILL && !isStatic && "<init>".equals(method.name())
                     && !method.declaringClass().isInterface();
         }
 
@@ -2007,16 +2178,29 @@ public final class Translator {
             if (split != null) {
                 // Declared only now, once the whole chain has translated and
                 // measured, so a failed attempt leaves no field behind either.
+                // A constructor's spill lives in the object it constructs, and
+                // is transient so serialization never sees it (MethodSplitter,
+                // THE <init> SPILL).
+                int access = split.instanceSpill()
+                        ? ClassFileWriter.ACC_PRIVATE | ClassFileWriter.ACC_TRANSIENT
+                          | ClassFileWriter.ACC_SYNTHETIC
+                        : ClassFileWriter.ACC_PRIVATE | ClassFileWriter.ACC_STATIC
+                          | ClassFileWriter.ACC_SYNTHETIC;
                 for (String[] f : split.spillFields()) {
-                    mw.owner.addField(ClassFileWriter.ACC_PRIVATE | ClassFileWriter.ACC_STATIC
-                                        | ClassFileWriter.ACC_SYNTHETIC, f[0], f[1]);
+                    mw.owner.addField(access, f[0], f[1]);
                 }
             }
+            // A part of an initializer is marked as one, so the foreign-write
+            // rule leaves its writes to initializerHelperPuts above. See
+            // ClassFileWriter.unfinalFieldsWrittenOutsideInitializers.
+            String initializer = ("<clinit>".equals(method.name()) || "<init>".equals(method.name()))
+                    ? method.name() : null;
             for (Object[] s : pendingSynthetics) {
                 mw.owner.addMethod(ClassFileWriter.ACC_PRIVATE | ClassFileWriter.ACC_STATIC
                                      | ClassFileWriter.ACC_SYNTHETIC,
                                      (String) s[0], (String) s[1])
-                          .setCode((CodeWriter) s[2]);
+                          .setCode((CodeWriter) s[2])
+                          .markInitializerHelper(initializer);
             }
         }
 
@@ -2497,10 +2681,18 @@ public final class Translator {
 
         void emitConst(TypeInference.Insn insn, TypeInference.InsnTypes it, boolean wide) {
             long v = insn.args[1];
+            // Readings ConstReadingElision proved overwritten before anything
+            // can observe them; only ever non-zero on a rescue retry.
+            int dead = deadConstReadings == null ? 0
+                    : deadConstReadings.getOrDefault(insn.offset, 0);
             for (TypeInference.Def d : it.defs) {
                 for (int scalar : DexType.scalarBits(d.scalars)) {
                     int slot = locals.slotOrMinusOne(d.register, scalar);
                     if (slot < 0) continue;
+                    if ((dead & scalar) != 0 && d.register == insn.arg(0)) {
+                        ConstReadingElision.elided.incrementAndGet();
+                        continue;
+                    }
                     pushConst(scalar, v, wide);
                     out.varOp(storeOp(scalar), slot);
                 }
@@ -3473,7 +3665,8 @@ public final class Translator {
                     // same range already covers everything it could catch, and
                     // the JVM tries handlers in table order anyway.
                     if (!types.isReachable(c.handlerOffset)) continue;
-                    CodeWriter.Label h = cur.handlerStubs.get(c.handlerOffset);
+                    CodeWriter.Label h = cur.cloneLabels.get(c.handlerOffset);
+                    if (h == null) h = cur.handlerStubs.get(c.handlerOffset);
                     if (h == null) h = cur.labels.get(c.handlerOffset);
                     if (h == null) {
                         // On the ordinary path a reachable handler always has a
@@ -3832,6 +4025,12 @@ public final class Translator {
             // scratch before the body runs, so its parameter slots are dead here
             // and TOP is both correct and the only safe answer.
             if (ps.index == 0) fillParameterSlots(slots, dexOffset);
+            // ...except the receiver a part of a spilled constructor keeps in
+            // slot 0 (MethodSplitter, THE <init> SPILL): its prologue never
+            // moves it, nothing writes it, and its portals read it.
+            else if (ps.part != null && ps.part.receiver) {
+                slots[0] = StackMapWriter.VType.object(ownerName);
+            }
             for (Locals.Entry e : locals.entries()) {
                 DexType t = st.get(e.register);
                 if (t == null || t.isDead()) continue;

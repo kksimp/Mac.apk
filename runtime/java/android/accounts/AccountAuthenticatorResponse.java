@@ -10,11 +10,9 @@ import android.os.Parcelable;
  * AccountManager.
  *
  * AOSP wraps an IAccountAuthenticatorResponse Binder living in the
- * AccountManagerService. Mac.apk has no such service, so there is no peer to
- * deliver to and the three callbacks are genuinely inert -- an authenticator
- * that calls onResult() is talking to a framework component we do not run.
- * That is an absence, not a fabrication: pretending the result was accepted
- * somewhere would be worse.
+ * AccountManagerService. With the Mac.apk system broker on, that peer exists
+ * (com.macapk.loader.AccountsService) and the callbacks reach it across
+ * processes; an in-process session uses a Sink; a detached response is inert.
  *
  * The Parcelable half IS real, because the response travels to the
  * authenticator's own Activity inside KEY_ACCOUNT_AUTHENTICATOR_RESPONSE and
@@ -53,12 +51,43 @@ public class AccountAuthenticatorResponse implements Parcelable {
 
     AccountAuthenticatorResponse(Sink sink) { mResponseBinder = null; mSink = sink; }
 
-    public void onResult(Bundle result) { if (mSink != null) mSink.onResult(result); }
+    /** A response whose peer is a remote IAccountAuthenticatorResponse (the system
+     *  broker's account service session, as AccountManagerService's Session is on a
+     *  device). The flag only separates this from the public Parcel constructor. */
+    AccountAuthenticatorResponse(IBinder remote, boolean remoteMarker) {
+        mResponseBinder = remote; mSink = null;
+    }
 
-    public void onRequestContinued() { }
+    // AIDL android.accounts.IAccountAuthenticatorResponse, AOSP order.
+    static final String RESPONSE_DESCRIPTOR = "android.accounts.IAccountAuthenticatorResponse";
+    static final int TX_ON_RESULT = IBinder.FIRST_CALL_TRANSACTION;
+    static final int TX_ON_REQUEST_CONTINUED = IBinder.FIRST_CALL_TRANSACTION + 1;
+    static final int TX_ON_ERROR = IBinder.FIRST_CALL_TRANSACTION + 2;
+
+    private void sendRemote(int code, java.util.function.Consumer<Parcel> args) {
+        if (mResponseBinder == null) return;
+        Parcel d = Parcel.obtain();
+        try {
+            d.writeInterfaceToken(RESPONSE_DESCRIPTOR);
+            if (args != null) args.accept(d);
+            mResponseBinder.transact(code, d, null, IBinder.FLAG_ONEWAY);
+        } catch (android.os.RemoteException ignored) {
+            // AOSP logs and drops it: the session that asked is gone.
+        } finally { d.recycle(); }
+    }
+
+    public void onResult(Bundle result) {
+        if (mSink != null) mSink.onResult(result);
+        else sendRemote(TX_ON_RESULT, d -> d.writeBundle(result));
+    }
+
+    public void onRequestContinued() {
+        if (mSink == null) sendRemote(TX_ON_REQUEST_CONTINUED, null);
+    }
 
     public void onError(int errorCode, String errorMessage) {
         if (mSink != null) mSink.onError(errorCode, errorMessage);
+        else sendRemote(TX_ON_ERROR, d -> { d.writeInt(errorCode); d.writeString(errorMessage); });
     }
 
     @Override public int describeContents() { return 0; }

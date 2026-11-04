@@ -528,6 +528,14 @@ public abstract class PackageManager {
      *  name. GMS measurement (zzfj.zzie) calls this during init; missing it ->
      *  NoSuchMethodError on the FA worker thread. */
     public String getNameForUid(int uid) {
+        if (com.macapk.loader.AppUids.enabled()) {
+            // AOSP: a shared uid answers "sharedUserName:uid", else the package.
+            String shared = com.macapk.loader.AppUids.sharedNameFor(uid);
+            if (shared != null) return shared + ":" + uid;
+            String[] p = com.macapk.loader.AppUids.packagesFor(uid);
+            if (p != null) return p[0];
+            return null;
+        }
         android.app.Application app = android.app.Application.macapk_get();
         return (app != null) ? app.getPackageName() : null;
     }
@@ -540,6 +548,10 @@ public abstract class PackageManager {
      *  that uid and null for anything else. Returning the running package for an
      *  arbitrary uid would be a lie a caller-identity check could act on. */
     public String[] getPackagesForUid(int uid) {
+        if (com.macapk.loader.AppUids.enabled()) {
+            String[] p = com.macapk.loader.AppUids.packagesFor(uid);
+            if (p != null) return p;
+        }
         android.app.Application app = android.app.Application.macapk_get();
         if (app == null) return null;
         int selfUid = android.os.Process.myUid();
@@ -674,6 +686,22 @@ public abstract class PackageManager {
             ai.metaData = archiveMetaData(m);
         }
         info.applicationInfo = ai;
+        // Installed-registry lookups also use this archive path. Like AOSP's
+        // PackageInfoUtils.generateWithComponents, return requested features
+        // under GET_CONFIGURATIONS so callers can discover feature-based plugins.
+        if ((flags & GET_CONFIGURATIONS) != 0 && !m.reqFeatures.isEmpty()) {
+            FeatureInfo[] features = new FeatureInfo[m.reqFeatures.size()];
+            for (int i = 0; i < features.length; i++) {
+                com.macapk.loader.Manifest.FeatureEntry e = m.reqFeatures.get(i);
+                FeatureInfo fi = new FeatureInfo();
+                fi.name = e.name;
+                fi.version = e.version;
+                fi.reqGlEsVersion = e.reqGlEsVersion;
+                if (e.required) fi.flags |= FeatureInfo.FLAG_REQUIRED;
+                features[i] = fi;
+            }
+            info.reqFeatures = features;
+        }
         // GET_PERMISSIONS: AOSP fills BOTH halves for a parsed archive
         // (PackageParser.generatePackageInfo, android11-release
         // core/java/android/content/pm/PackageParser.java:803-825):
@@ -979,6 +1007,20 @@ public abstract class PackageManager {
             throws NameNotFoundException {
         android.app.Application app = android.app.Application.macapk_get();
         if (app == null || appPackageName == null) throw new NameNotFoundException(appPackageName);
+        // The platform package "android" (framework-res.apk): a device returns a
+        // Resources over the framework AssetManager, which Resources.getSystem()
+        // is. getApplicationInfo("android") already answers (platformPackageInfo),
+        // so this is the matching resources half. Without it GMS's Chimera
+        // ChimeraApkLoader cannot load ANY remote module whose resources link the
+        // framework package: it calls getResourcesForApplication("android") and a
+        // throw here surfaced as "Failed to load resources for module
+        // FileBasedSplitApk(...)" -> "Unable to load Cronet module" (and every
+        // other DynamiteModule remote load), which also knocked out the gRPC
+        // network path. Mirrors AOSP getResourcesForApplication("android").
+        if ("android".equals(appPackageName)) {
+            android.content.res.Resources sys = android.content.res.Resources.getSystem();
+            if (sys != null) return sys;
+        }
         if (!appPackageName.equals(app.getPackageName())) {
             throw new NameNotFoundException(appPackageName);
         }
@@ -2463,6 +2505,14 @@ public abstract class PackageManager {
     }
 
     /** Callback for requestChecksums. Source: frameworks/base .../PackageManager.java */
+    /** @SystemApi: told when an app's runtime permissions change. Mac.apk
+     *  grants at install and never changes them, so it is never called. */
+    public interface OnPermissionsChangedListener {
+        void onPermissionsChanged(int uid);
+    }
+    public void addOnPermissionsChangeListener(OnPermissionsChangedListener listener) {}
+    public void removeOnPermissionsChangeListener(OnPermissionsChangedListener listener) {}
+
     public interface OnChecksumsReadyListener {
         void onChecksumsReady(java.util.List<ApkChecksum> checksums);
     }

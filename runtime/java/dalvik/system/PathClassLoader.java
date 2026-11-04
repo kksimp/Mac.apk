@@ -21,6 +21,12 @@
 package dalvik.system;
 
 public class PathClassLoader extends BaseDexClassLoader {
+    // Parallel-capable. ART never serializes a whole class loader: classes load
+    // under per-class locks. On HotSpot, a loader that does not register gets
+    // getClassLoadingLock(name) == the loader itself, so every thread loading
+    // ANY class waits on one lock (JFR on WhatsApp: 718 waits, the UI thread
+    // up to 695 ms). Each class up the chain to URLClassLoader must register.
+    static { ClassLoader.registerAsParallelCapable(); }
 
     /** Mac.apk-internal: forwards to BaseDexClassLoader's URL[] ctor.
      *

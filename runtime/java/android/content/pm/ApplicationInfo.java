@@ -65,6 +65,14 @@ public class ApplicationInfo extends PackageItemInfo implements android.os.Parce
     public String[] overlayPaths;
     public int    targetSdkVersion;
     public int    minSdkVersion;
+    /** AOSP public field (ApplicationInfo.targetSandboxVersion). The
+     *  app-sandbox schema the app opted into via
+     *  android:targetSandboxVersion; AOSP defaults it to 1 and only
+     *  manifests that request the stricter sandbox set 2. Play Services'
+     *  event logger reads it reflectively while building a crash/telemetry
+     *  record, throwing NoSuchFieldError on a background thread when it is
+     *  absent. Generic: any app that reads it sees AOSP's own default. */
+    public int    targetSandboxVersion = 1;
     public int    flags;
     public int    theme;
     public int    uid = 10000;            // arbitrary stable per-app uid
@@ -290,6 +298,7 @@ public class ApplicationInfo extends PackageItemInfo implements android.os.Parce
         uid = orig.uid;
         minSdkVersion = orig.minSdkVersion;
         targetSdkVersion = orig.targetSdkVersion;
+        targetSandboxVersion = orig.targetSandboxVersion;
         compileSdkVersion = orig.compileSdkVersion;
         compileSdkVersionCodename = orig.compileSdkVersionCodename;
         enabled = orig.enabled;
@@ -332,6 +341,13 @@ public class ApplicationInfo extends PackageItemInfo implements android.os.Parce
     public boolean isResourceOverlay() {
         return (privateFlags & PRIVATE_FLAG_IS_RESOURCE_OVERLAY) != 0;
     }
+
+    /** AOSP ApplicationInfo.isInstantApp(): whether this is an instant (not
+     *  installed) app. Mac.apk only ever loads a normally-installed APK, so this
+     *  is false for everything we generate -- the answer a device gives for any
+     *  installed package. The Play Store reads it during device-config init
+     *  (NoSuchMethodError without it). */
+    public boolean isInstantApp() { return false; }
 
     /** AOSP ApplicationInfo.isProfileableByShell() (API 29): `<profileable
      *  android:shell="true">`. Not parsed here -> false, AOSP's own default. */

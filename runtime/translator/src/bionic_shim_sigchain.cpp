@@ -490,6 +490,19 @@ int linux_si_code(int host_sig, int code) {
 //   * a region that allows it (so the pager failed)       -> SIGBUS / BUS_ADRERR
 // ESR fields per the Arm ARM (ESR_ELx): EC [31:26] 0x20/0x21 instruction abort,
 // 0x24/0x25 data abort; for data aborts ISS WnR is bit 6; DFSC is [5:0].
+// True when pc lies in the dyld shared cache, i.e. in a macOS system library
+// (libsqlite3, libsystem, WebKit...). Guest code never runs there: it lives in
+// the translator's own mappings. _dyld_get_shared_cache_range is a plain
+// pointer read, safe in a signal handler.
+extern "C" const void* _dyld_get_shared_cache_range(size_t* length);
+static bool pc_in_dyld_shared_cache(uintptr_t pc) {
+    size_t len = 0;
+    const void* base = _dyld_get_shared_cache_range(&len);
+    if (!base || !len) return false;
+    const uintptr_t b = uintptr_t(base);
+    return pc >= b && pc < b + len;
+}
+
 struct LinuxFault { int sig; int code; };
 LinuxFault classify_memory_fault(uintptr_t far, uint32_t esr) {
     const uint32_t ec = esr >> 26;
@@ -697,6 +710,32 @@ extern "C" int __macapk_sigchain_deliver(int host_sig, siginfo_t* info, void* uc
     if (host_sig == SIGSEGV || host_sig == SIGBUS || host_sig == SIGILL || host_sig == SIGFPE) {
         if (JvmHandleFn jh = g_jvm_handle.load(std::memory_order_acquire)) {
             if (jh(host_sig, info, ucv, /*abort_if_unrecognized=*/0)) return 1;
+        }
+    }
+
+    // A SIGILL raised by macOS's OWN code (a trap inside a dyld-shared-cache
+    // library: pointer-authentication failure, an assert `brk`) is not an event
+    // of the Android program, so no guest handler may run for it. On a device
+    // the guest's SIGILL action is reached only by a fault in the app's own
+    // code or Bionic; here the host's system libraries execute on host threads
+    // too (WebKit's SQLite thread opening a store, CoreFoundation, Metal...),
+    // and handing their traps to an app's crash handler (Breakpad re-raising,
+    // OpenSSL's cpuid probe siglongjmp'ing across a foreign thread) turns a
+    // host fault into a second, misleading one. Memory faults keep the existing
+    // path: a guest pointer that faults inside the memcpy/strlen shims IS the
+    // guest's SIGSEGV, as on Android.
+    if (host_sig == SIGILL) {
+        const uintptr_t hpc = uintptr_t(uc->uc_mcontext->__ss.__pc);
+        if (pc_in_dyld_shared_cache(hpc)) {
+            static std::atomic<int> nh{0};
+            if (nh.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::fprintf(stderr,
+                    "[sigchain] SIGILL at pc=%p is inside a macOS system library (host "
+                    "fault, not the guest's) -- not delivered to a guest handler; to the "
+                    "runtime's crash path\n", reinterpret_cast<void*>(hpc));
+                std::fflush(stderr);
+            }
+            return 0;
         }
     }
 

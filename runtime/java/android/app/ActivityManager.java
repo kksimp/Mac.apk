@@ -160,7 +160,7 @@ public class ActivityManager {
         self.importance = RunningAppProcessInfo.IMPORTANCE_FOREGROUND;
         self.importanceReasonCode = 0;
         self.lru = 0;
-        self.pkgList = new String[] { self.processName };
+        self.pkgList = new String[] { ActivityThread.currentPackageName() };
         return Collections.singletonList(self);
     }
 

@@ -355,8 +355,12 @@ public abstract class Drawable {
     public void setDither(boolean dither) {}
     public void setFilterBitmap(boolean filter) {}
     public boolean isFilterBitmap() { return false; }
-    public void setAutoMirrored(boolean mirrored) {}
-    public boolean isAutoMirrored() { return false; }
+    // android:autoMirrored / setAutoMirrored: flip horizontally under RTL
+    // (back arrows, chevrons). Was a no-op, so every such icon pointed the
+    // LTR way in a Hebrew/Arabic UI.
+    private boolean mMacapkAutoMirrored;
+    public void setAutoMirrored(boolean mirrored) { mMacapkAutoMirrored = mirrored; }
+    public boolean isAutoMirrored() { return mMacapkAutoMirrored; }
     public void setHotspot(float x, float y) {}
     public void setHotspotBounds(int left, int top, int right, int bottom) {}
     public void getHotspotBounds(android.graphics.Rect outRect) {}

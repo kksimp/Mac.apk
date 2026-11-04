@@ -584,7 +584,7 @@ struct AppStubMain {
         // holds multiple rows per package (three for hillclimb), so package
         // keying would touch the wrong row. Optional so bundles generated
         // before this key existed still launch (they just do not record).
-        let dirName = plist["MacapkDirName"] as? String
+        var dirName = plist["MacapkDirName"] as? String
         stubLog("starting \(package) (\(label) \(versionName)) from \(bundleRoot.path)")
 
         // 3. Resolve the ONE shared runtime.
@@ -764,10 +764,21 @@ struct AppStubMain {
         //    Taken BEFORE the payload is resolved (it used to come after):
         //    moving the app's data out of the bundle (step 5) must never race a
         //    running copy of the app, and the lock is what proves there is none.
+        //
+        //    A SECONDARY PROCESS of the app is not a second copy of it. The system
+        //    broker starts one runtime per android:process the app's manifest uses
+        //    (SystemServer.launch), each through this same stub, and tells it so
+        //    with MACAPK_SECONDARY_PROCESS=1. The app is already running -- that
+        //    is why the broker is asking for ANOTHER of its processes -- so the
+        //    lock below would be held, and "already running; activating" would
+        //    exit 0 and the process the broker is waiting for would never exist.
+        //    A secondary process neither takes nor tests the single-instance lock,
+        //    and has no window to bring forward.
+        let secondaryProcess = ProcessInfo.processInfo.environment["MACAPK_SECONDARY_PROCESS"] == "1"
         let runDir = Paths.runDir
         try? fm.createDirectory(at: runDir, withIntermediateDirectories: true)
         let pidPath = runDir.appendingPathComponent("\(dirName ?? package).pid").path
-        let fd = open(pidPath, O_RDWR | O_CREAT, 0o644)
+        let fd = secondaryProcess ? -1 : open(pidPath, O_RDWR | O_CREAT, 0o644)
         // Whether THIS launch holds the lock. Only then may step 5 move the
         // app's data: a stale lock (below) means an orphaned helper of the last
         // run may still be writing into the tree.
@@ -823,6 +834,9 @@ struct AppStubMain {
                 _ = pidText.withCString { write(fd, $0, strlen($0)) }
                 // fd intentionally left open (and inherited) across execv.
             }
+        } else if secondaryProcess {
+            stubLog("secondary process \(ProcessInfo.processInfo.environment["MACAPK_PROCESS_NAME"] ?? "?") "
+                    + "of a running app: single-instance lock not taken")
         } else {
             stubLog("WARN: cannot open pidfile \(pidPath) (errno \(errno)); "
                     + "continuing without single-instance protection")
@@ -859,6 +873,35 @@ struct AppStubMain {
         // before we pick what to launch (InPlaceRecovery).
         InPlaceRecovery.recoverIfInterrupted(androidRoot: androidRoot,
                                              log: { FileHandle.standardError.write(Data("[MacApkAppStub] \($0)\n".utf8)) })
+
+        // 6b. A dotted per-version folder name (`<pkg>_1.2.3`, every install made
+        //     before GitHub #82) becomes `<pkg>_1_2_3`: saves, caches, registry
+        //     row and this bundle's MacapkDirName move together (DirNameMigration).
+        //     After the interrupted-update recovery above, which may still name the
+        //     old folders. Only under the lock, which proves no copy of the app is running.
+        //     Never fatal: on any refusal the app keeps its dotted name and this
+        //     launch proceeds under it exactly as before.
+        if holdsLock, let current = dirName, DirNaming.isLegacy(current, package: package),
+           (ProcessInfo.processInfo.environment["MACAPK_DIRNAME_MIGRATE"] ?? "1") != "0" {
+            RegistryStore.shared.log = { stubLog($0) }
+            let moved = DirNameMigration.migrate(
+                dirName: current, package: package, androidRoot: androidRoot,
+                bundle: bundleRoot, store: RegistryStore.shared, log: { stubLog($0) })
+            if moved.migrated {
+                dirName = moved.dirName
+                // The single-instance lock follows the identity: the installer's
+                // running-app check looks for run/<dirName>.pid.
+                let newPid = runDir.appendingPathComponent("\(moved.dirName).pid").path
+                let nfd = open(newPid, O_RDWR | O_CREAT, 0o644)
+                if nfd >= 0, flock(nfd, LOCK_EX | LOCK_NB) == 0 {
+                    ftruncate(nfd, 0)
+                    lseek(nfd, 0, SEEK_SET)
+                    _ = "\(getpid())\n".withCString { write(nfd, $0, strlen($0)) }
+                } else if nfd >= 0 {
+                    close(nfd)
+                }
+            }
+        }
         var apkURL: URL? = installedBaseApk(androidRoot: androidRoot, package: package)
         var legacyRetained: [URL] = []
         for name in retainedApkNames {
@@ -953,6 +996,17 @@ struct AppStubMain {
         //    versioned code-cache side of the bundle's android tree.
         setenv("MACAPK_APP_CACHE_DIR", codeDir.path, 1)
         setenv("MACAPK_APP_LABEL", label, 1)
+        // The app's saved environment overrides (the info sheet's "Environment
+        // overrides" and its toggles such as "Run in Android TV mode") apply to
+        // THIS app on every launch path. They used to reach it only from the
+        // launcher window, so a Dock or Finder launch ignored them.
+        if let dirName,
+           let reg = try? RegistryStore.shared.loadReadOnly(),
+           let row = reg.apps.first(where: { $0.dirName == dirName }) {
+            for (k, v) in row.env {
+                setenv(k, v, 1)
+            }
+        }
         //
         //    SELF-HEAL THE BUNDLE ICON FIRST. A bundle can legitimately reach
         //    this point with no icon at all: BundleGenerator.generate() runs
@@ -1023,7 +1077,15 @@ struct AppStubMain {
         //    package legitimately has several installed versions (three
         //    hillclimb bundles on the owner's machine), and a package-keyed
         //    log would have them overwrite each other's evidence.
-        let logIdentity = dirName ?? package
+        //    A secondary process (see step 4) logs to its OWN file, so it neither
+        //    rotates away the main process's live log nor interleaves with it:
+        //    app_<identity>-<process name>.log.
+        var logIdentity = dirName ?? package
+        if secondaryProcess {
+            let proc = ProcessInfo.processInfo.environment["MACAPK_PROCESS_NAME"] ?? "secondary"
+            let safe = String(proc.map { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" ? $0 : "_" })
+            logIdentity += "-" + safe
+        }
         let runLogPath = beginRunLog(
             runtime: runtime, identity: logIdentity,
             header: ["---- run log \(ISO8601DateFormatter().string(from: Date())) ----",
@@ -1032,6 +1094,27 @@ struct AppStubMain {
                      "stub pid: \(getpid())"])
         if let runLogPath {
             stubLog("run log: \(runLogPath)")
+        }
+
+        // 9b. Google services ready at launch (owner, 2026-10-31: "make sure
+        //    google play auto opens the other 2 apks it needs ... so the user
+        //    doesnt have to"). Play services and Services Framework run in
+        //    their own processes, started by the system broker -- which boots
+        //    the system apps that listen for BOOT_COMPLETED (SystemServer
+        //    .bootSystemServices) the moment launchd starts it. launchd can only
+        //    start it once Mac.apk.app has registered it as a background item,
+        //    and an app opened from the Dock never passes through the control
+        //    panel that registers it. So with "Use Google GMS" on and launchd
+        //    holding no org.macapk.system, ask Mac.apk.app to register it (a
+        //    hidden, windowless instance: --ensure-system-broker) before this
+        //    app starts asking for the services. Bounded and never fatal.
+        if ProcessInfo.processInfo.environment["MACAPK_SERVICE_HOST"] == nil,
+           let app = macapkApp {
+            SystemBrokerCheck.ensureRegistered(macapkApp: app)
+            SystemBrokerCheck.start()
+            if package == PlayBootstrap.playPackage && !secondaryProcess {
+                PlayBootstrap.run(macapkApp: app)
+            }
         }
 
         // 10. Become the runtime. execv inherits environ (with the setenv
@@ -1154,5 +1237,154 @@ struct AppStubMain {
                    "exec of \(execPath) failed: \(err) (errno \(errno)). "
                    + "The Mac.apk runtime may be damaged; rebuild or reinstall Mac.apk.",
                    exitCode: 69)
+    }
+}
+
+
+// MARK: - Google Play launch sequence
+
+/// What has to be true before the Play Store opens (owner, 2026-11-02: "a better
+/// system that installs and opens Google play's required services before the
+/// play store opens"). On a phone Play services and the Services Framework are
+/// simply there; here they are installed apps run by the system broker, so Play's
+/// stub makes it so, in order:
+///   1. both required apps are installed (a clear message if not; the stub cannot
+///      fetch an APK, only the user can supply one);
+///   2. no process of an earlier build is serving them (a broker older than the
+///      staged runtime, and the service hosts it started, are stopped and the
+///      broker restarted: the stale-process blank screen);
+///   3. the broker has booted them and reports ready (bounded wait, never fatal:
+///      a bind from Play still waits for its service to attach).
+/// Only with "Use Google GMS" on; with it off Play runs on the stand-in store.
+enum PlayBootstrap {
+    static let playPackage = "com.android.vending"
+    static let required: [(package: String, label: String)] = [
+        ("com.google.android.gsf", "Google Services Framework"),
+        ("com.google.android.gms", "Google Play services"),
+    ]
+
+    static func run(macapkApp: URL) {
+        guard SystemBrokerCheck.switchOn else { return }
+        // 1. Installed?
+        let reg = try? RegistryStore.shared.load()
+        let missing = required.filter { reg?.records(forPackage: $0.package).isEmpty ?? true }
+        if !missing.isEmpty {
+            let names = missing.map { $0.label }.joined(separator: " and ")
+            fatalAlert("Google Play needs \(names)",
+                       "\"Use Google GMS\" is on, but \(names) \(missing.count == 1 ? "is" : "are") "
+                     + "not installed. Install \(missing.count == 1 ? "it" : "them") in Mac.apk first "
+                     + "(drop the APK onto Mac.apk), then open Google Play again, or turn "
+                     + "\"Use Google GMS\" off to use the built-in store.",
+                       exitCode: 67, openMacApk: macapkApp)
+        }
+        // 2. Stale broker? Older than the runtime we are about to run.
+        let staged = RuntimeInstall.stagedRoot.appendingPathComponent("Resources/build-id.txt")
+        if let pid = StaleBackground.brokerPid(),
+           let started = StaleBackground.startTime(of: pid),
+           let stamp = (try? FileManager.default.attributesOfItem(atPath: staged.path))?[.modificationDate] as? Date,
+           started < stamp {
+            stubLog("play: the system broker (pid \(pid)) predates the staged runtime; restarting it and its service hosts")
+            _ = StaleBackground.stop(log: { stubLog($0) })
+            StaleBackground.restartBroker(wasRunning: true, log: { stubLog($0) })
+        }
+        // 3. Ready? By default Play's own runtime boots ALONGSIDE the services (JVM,
+        //    manifest, class loader, resources, window), and the runtime holds just
+        //    before any of the app's code runs (Boot.awaitSystemReady) until the
+        //    broker's readiness file says they are up: the same guarantee, with
+        //    Play's boot off the critical path instead of added to it.
+        //    MACAPK_PLAY_OVERLAP=0 restores the wait here, before the exec.
+        if ProcessInfo.processInfo.environment["MACAPK_PLAY_OVERLAP"] != "0" {
+            setenv("MACAPK_AWAIT_SYSTEM_READY", StaleBackground.readyFile.path, 1)
+            setenv("MACAPK_AWAIT_SYSTEM_READY_TIMEOUT_S", "180", 1)
+            stubLog("play: Google services are booting; Play boots alongside and waits for them before its app code runs")
+            return
+        }
+        waitForReady()
+    }
+
+    /// The pre-exec wait (the previous behaviour, MACAPK_PLAY_OVERLAP=0).
+    private static func waitForReady() {
+        let deadline = Date().addingTimeInterval(180)   // a cold broker boots two JVMs; binds wait up to this long anyway
+        let ready = StaleBackground.readyFile
+        while Date() < deadline {
+            if let text = try? String(contentsOf: ready, encoding: .utf8),
+               let pid = pid_t(text.split(separator: "\n").first.map(String.init) ?? ""),
+               kill(pid, 0) == 0 {
+                let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+                let failed = lines.count > 2 ? lines[2] : ""
+                stubLog(failed.isEmpty ? "play: Google services ready (\(lines.count > 1 ? lines[1] : ""))"
+                                       : "WARN: play: Google services ready, but did not start: \(failed)")
+                return
+            }
+            usleep(250_000)
+            SystemBrokerCheck.start()   // no-op while running; starts it if it died
+        }
+        stubLog("WARN: play: Google services not reported ready in 180s; opening Play anyway (binds wait for them)")
+    }
+}
+
+// MARK: - The system broker's background item
+
+/// Is the "Use Google GMS" switch on, and does launchd hold the broker? When the
+/// switch is on and launchd does not, Mac.apk.app registers it (SMAppService can
+/// only be driven from the bundle that ships the agent plist).
+enum SystemBrokerCheck {
+    static let label = "org.macapk.system"
+
+    static var switchOn: Bool {
+        let f = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Mac.apk/use-google-gms")
+        return FileManager.default.fileExists(atPath: f.path)
+    }
+
+    /// `launchctl print gui/<uid>/org.macapk.system` succeeds only for a job
+    /// launchd knows (registered, running or not).
+    static var registered: Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["print", "gui/\(getuid())/\(label)"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
+
+    static func ensureRegistered(macapkApp: URL) {
+        guard switchOn, !registered else { return }
+        stubLog("Use Google GMS is on but launchd has no \(label); asking \(macapkApp.lastPathComponent) to register it")
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        // -n: a new instance even while the control panel runs (an open event
+        // to the running one would not carry the argument); -g -j: no window,
+        // no activation; -W: wait for it to finish registering.
+        p.arguments = ["-n", "-g", "-j", "-W", macapkApp.path, "--args", "--ensure-system-broker"]
+        do { try p.run() } catch {
+            stubLog("WARN: could not start \(macapkApp.path) to register \(label): \(error)")
+            return
+        }
+        let deadline = Date().addingTimeInterval(15)
+        while p.isRunning && Date() < deadline { usleep(100_000) }
+        if p.isRunning { p.terminate() }
+        stubLog(registered ? "\(label) registered" : "WARN: \(label) still not registered; Google services stay unavailable this launch")
+    }
+
+    /// Start the broker now, before this app's runtime comes up (owner,
+    /// 2026-10-31: "play can never launch without play services"). launchd
+    /// would start it on the app's first lookup anyway; starting it here
+    /// gives its boot (SystemServer.bootSystemServices: Play services and the
+    /// Services Framework) a head start, and every later bind from the app
+    /// waits for the service process to attach (SystemServer.ensureRunning).
+    /// `kickstart` without -k leaves an already-running broker alone.
+    static func start() {
+        guard switchOn, registered else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["kickstart", "gui/\(getuid())/\(label)"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run(); p.waitUntilExit() } catch { return }
+        stubLog(p.terminationStatus == 0 ? "\(label) started (system apps boot with it)"
+                                         : "WARN: launchctl kickstart \(label) exited \(p.terminationStatus)")
     }
 }

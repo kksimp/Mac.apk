@@ -81,7 +81,9 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     public static final int LAYER_TYPE_HARDWARE = 2;
 
     // ---- Layout state ----
-    private final Context context;
+    /** AOSP View.mContext (protected, non-final): ByteDance Nita and other view-reuse frameworks swap it by
+     *  reflection (View.class.getDeclaredField("mContext")) when they re-parent a pre-built view to its real activity. */
+    protected Context mContext;
     private int id = NO_ID;
     private int left, top, right, bottom;
     private int paddingLeft, paddingTop, paddingRight, paddingBottom;
@@ -133,7 +135,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     protected long nativeHandle;
 
     public View(Context context) {
-        this.context = context;
+        this.mContext = context;
         // AOSP View(Context) latches sThrowOnInvalidFloatProperties from
         // targetSdkVersion here (View.java:5370) -- the FIRST View constructed
         // in the process decides it for every View afterwards. See
@@ -658,9 +660,9 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         onVisibilityChanged(changedView, visibility);
     }
 
-    public final Context getContext() { return context; }
+    public final Context getContext() { return mContext; }
     public android.content.res.Resources getResources() {
-        return context != null ? context.getResources() : null;
+        return mContext != null ? mContext.getResources() : null;
     }
     /** AOSP getHandler():
      *      final AttachInfo attachInfo = mAttachInfo;
@@ -681,7 +683,11 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     private android.os.Handler mViewHandler;
     public android.os.Handler getHandler() {
         if (sIsShownDetachedAosp && !macapkAttached) return null;
-        if (mViewHandler == null) mViewHandler = new android.os.Handler();
+        // The UI looper explicitly: AOSP's View handler is the ViewRootImpl
+        // handler of the UI thread, whichever thread asks first. An implicit
+        // `new Handler()` binds the CALLING thread's Looper when it has
+        // prepared one, so a worker that touched the view first would own it.
+        if (mViewHandler == null) mViewHandler = new android.os.Handler(android.os.Looper.getMainLooper());
         return mViewHandler;
     }
     // android.view.Display getter (API 17+). Flappy Bird's
@@ -764,7 +770,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         // (its ContextThemeWrapper had no ctx entry) and threw
         // "ViewTreeLifecycleOwner not found" in onAttachedToWindow, so its
         // composition never got created.
-        for (Context ctx = context; ctx != null;
+        for (Context ctx = mContext; ctx != null;
                 ctx = (ctx instanceof android.content.ContextWrapper)
                         ? ((android.content.ContextWrapper) ctx).getBaseContext() : null) {
             java.util.HashMap<Integer, Object> ctxTags = sContextKeyedTags.get(ctx);
@@ -862,8 +868,8 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         if (c == null) {
             c = "";
             try {
-                if (context != null) {
-                    android.content.res.Resources res = context.getResources();
+                if (mContext != null) {
+                    android.content.res.Resources res = mContext.getResources();
                     if (res != null) {
                         String nm = res.getResourceEntryName(key);
                         if (nm != null) {
@@ -966,8 +972,8 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         if (c != null) return c;
         boolean owner = false;
         try {
-            if (context != null) {
-                android.content.res.Resources res = context.getResources();
+            if (mContext != null) {
+                android.content.res.Resources res = mContext.getResources();
                 if (res != null) {
                     String nm = res.getResourceEntryName(key);
                     owner = nm != null && VIEW_TREE_OWNER_RES_NAMES.contains(nm);
@@ -984,7 +990,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
      *  so androidx's `getTag(ownerKey) as? XxxOwner` succeeds -- the AOSP root
      *  owner that ComponentActivity.initializeViewTreeOwners would have installed. */
     private Object activityOwnerFor() {
-        for (Context ctx = context; ctx != null;
+        for (Context ctx = mContext; ctx != null;
                 ctx = (ctx instanceof android.content.ContextWrapper)
                         ? ((android.content.ContextWrapper) ctx).getBaseContext() : null) {
             if (ctx instanceof android.app.Activity) return ctx;
@@ -1054,9 +1060,9 @@ public class View implements android.graphics.drawable.Drawable.Callback,
                     + " value=" + t.getClass().getName());
             }
             sObservedOwnerKeys.add(key);
-            if (context != null) {
+            if (mContext != null) {
                 java.util.HashMap<Integer, Object> m = sContextKeyedTags
-                    .computeIfAbsent(context, k -> new java.util.HashMap<>());
+                    .computeIfAbsent(mContext, k -> new java.util.HashMap<>());
                 // v1.0.1643: AOSP's root owner for an activity-context view is
                 // the Activity (ComponentActivity.initializeViewTreeOwners on the
                 // decor). A SUBTREE owner -- a Fragment view's
@@ -1064,7 +1070,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
                 // context -- must not replace it in this per-context fallback, or
                 // every later lookup resolves to (and pins) that narrower owner.
                 Object prev = m.get(key);
-                android.app.Activity act = macapkActivityOf(context);
+                android.app.Activity act = macapkActivityOf(mContext);
                 if (!(prev != null && prev == act && t != act)) m.put(key, t);
             }
         }
@@ -1145,6 +1151,22 @@ public class View implements android.graphics.drawable.Drawable.Callback,
      *  Cached per-class. */
     private static boolean isViewTreeOwnerTagValue(Object v) {
         if (v == null) return false;
+        // v1.0.2311: NAME-FREE root-owner detection. AOSP
+        // ComponentActivity.initializeViewTreeOwners sets the ACTIVITY ITSELF as the
+        // decor's ViewTreeLifecycle/ViewModelStore/SavedStateRegistry/... owner
+        // (decorView.setTag(R.id.view_tree_lifecycle_owner, this)). An Activity used as
+        // a view-tree tag value therefore IS the root owner by construction. Recognise
+        // it WITHOUT resolving any androidx class name -- the ONLY path that works for a
+        // FULLY R8-obfuscated app (the Play Store), where the owner interface names AND
+        // androidx.lifecycle.Lifecycle$State itself are renamed, so both the name fast
+        // path and the "rename-proof" structural probe below fail (lifecycleStateClass
+        // returns null) and the owner-key is never learned -> getTag's Activity fallback
+        // never fires -> the first ComposeView throws "ViewTreeLifecycleOwner not found"
+        // and composition is never built (blank white). A ComponentActivity implements
+        // all the owner interfaces and is driven to RESUMED, so this is correct, and the
+        // getTag fallback's macapkActivitySatisfiesOwnerKey guard still rejects a wrong
+        // family for un-minified apps. Measured on com.android.vending 53.7.23.
+        if (v instanceof android.app.Activity) return true;
         Class<?> vc = v.getClass();
         Boolean cached = sOwnerTagClassCache.get(vc);
         if (cached != null) return cached;
@@ -1277,7 +1299,14 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     // T cast in declaration matches AOSP's <T extends View> signature.
     @SuppressWarnings("unchecked")
     public <T extends View> T findViewById(int searchId) {
-        if (searchId != NO_ID && this.id == searchId) return (T) this;
+        if (searchId == NO_ID) return null;
+        return findViewTraversal(searchId);
+    }
+    /** AOSP View.findViewTraversal: look for the id in this view (ViewGroup overrides
+     *  this to search its children). */
+    @SuppressWarnings("unchecked")
+    protected <T extends View> T findViewTraversal(int searchId) {
+        if (searchId == this.id) return (T) this;
         return null;
     }
     @SuppressWarnings("unchecked")
@@ -2592,7 +2621,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         event.setEnabled(isEnabled());
         event.setContentDescription(getContentDescription());
         try {
-            if (context != null) event.setPackageName(context.getPackageName());
+            if (mContext != null) event.setPackageName(mContext.getPackageName());
         } catch (Throwable ignored) {}
     }
     public void onInitializeAccessibilityNodeInfo(
@@ -3774,7 +3803,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     private boolean hasRtlSupport() {
         try {
             android.content.pm.ApplicationInfo ai =
-                (context != null) ? context.getApplicationInfo() : null;
+                (mContext != null) ? mContext.getApplicationInfo() : null;
             return ai != null
                 && (ai.flags & android.content.pm.ApplicationInfo.FLAG_SUPPORTS_RTL) != 0;
         } catch (Throwable ignored) {
@@ -3790,7 +3819,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         int targetSdk = 0;
         try {
             android.content.pm.ApplicationInfo ai =
-                (context != null) ? context.getApplicationInfo() : null;
+                (mContext != null) ? mContext.getApplicationInfo() : null;
             if (ai != null) targetSdk = ai.targetSdkVersion;
         } catch (Throwable ignored) {}
         return targetSdk < android.os.Build.VERSION_CODES.JELLY_BEAN_MR1 || !hasRtlSupport();
@@ -3800,8 +3829,8 @@ public class View implements android.graphics.drawable.Drawable.Callback,
      *  LTR when no Context/Resources is reachable. */
     private int configuredLayoutDirection() {
         try {
-            if (context != null) {
-                android.content.res.Resources res = context.getResources();
+            if (mContext != null) {
+                android.content.res.Resources res = mContext.getResources();
                 if (res != null && res.getConfiguration() != null) {
                     return res.getConfiguration().getLayoutDirection() == LAYOUT_DIRECTION_RTL
                         ? LAYOUT_DIRECTION_RTL : LAYOUT_DIRECTION_LTR;
@@ -3811,13 +3840,11 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         return LAYOUT_DIRECTION_LTR;
     }
     /** AOSP resolves LAYOUT_DIRECTION_LOCALE via
-     *  TextUtils.getLayoutDirectionFromLocale (ICU ULocale.isRightToLeft).
-     *  android.text.TextUtils has no such method in this tree, so use the same
-     *  JDK query android.content.res.Configuration.setLayoutDirection(Locale)
-     *  already uses, keeping the two answers consistent. */
+     *  TextUtils.getLayoutDirectionFromLocale (ICU ULocale.isRightToLeft), the
+     *  same AWT-free table Configuration.setLayoutDirection(Locale) uses. */
     private static int layoutDirectionFromLocale(java.util.Locale loc) {
         try {
-            if (loc != null && !java.awt.ComponentOrientation.getOrientation(loc).isLeftToRight()) {
+            if (android.text.TextUtils.macapkIsLocaleRtl(loc)) {
                 return LAYOUT_DIRECTION_RTL;
             }
         } catch (Throwable ignored) {}
@@ -3908,7 +3935,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
      *  view that belongs to no window. */
     public WindowInsetsController getWindowInsetsController() {
         try {
-            Context c = context;
+            Context c = mContext;
             while (c instanceof android.content.ContextWrapper
                    && !(c instanceof android.app.Activity)) {
                 Context b = ((android.content.ContextWrapper) c).getBaseContext();
@@ -4515,6 +4542,23 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     }
     /** AOSP `View.isPaddingResolved()` (View.java:20208-20210). */
     boolean isPaddingResolved() { return mPaddingResolved; }
+    /** LayoutInflater: android:paddingStart / paddingEnd from the XML or its
+     *  style, kept RELATIVE as AOSP's constructor keeps them (mUserPaddingStart/
+     *  End, :6272-6287) and resolved against the layout direction by
+     *  resolvePadding -- now and again whenever the direction resolves. Pass
+     *  Integer.MIN_VALUE for an edge the XML does not set. The inflater used to
+     *  write start into paddingLeft and end into paddingRight, so under RTL
+     *  every relative padding sat on the wrong side (AppCompat's popup menu
+     *  items: paddingEnd on the right, the title pushed against the left edge). */
+    void macapkSetXmlRelativePadding(int start, int end) {
+        if (start != UNDEFINED_PADDING) mUserPaddingStart = start;
+        if (end != UNDEFINED_PADDING) mUserPaddingEnd = end;
+        mUserPaddingLeftInitial = paddingLeft;
+        mUserPaddingRightInitial = paddingRight;
+        mPaddingResolved = false;
+        resolvePadding();
+    }
+
     /** AOSP `View.setPaddingRelative` (android-11.0.0_r48 View.java:24378-24398).
      *  Material's RelativePadding.applyToView calls this to push
      *  WindowInsets-derived padding back onto the view; without it,
@@ -5981,9 +6025,16 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         // content underneath.
         //
         // v1.0.128: theme-aware fill via `?attr/colorSurface`.
+        // A TOOLBAR is not filled (MACAPK_TOOLBAR_CHROME): AOSP's Toolbar has
+        // no default background, so one without a background is transparent
+        // and shows whatever is behind it -- typically its AppBarLayout, whose
+        // style background (?attr/colorPrimary, Material's
+        // MaterialShapeDrawable included) is drawn. Filling the Toolbar with
+        // colorSurface painted a white band over that colour: PalGate's blue
+        // app bar came out white and its white "OK" button vanished into it.
         if (name.endsWith("AppBarLayout")
-            || name.endsWith("Toolbar")
-            || name.endsWith("MaterialToolbar")) {
+            || (MACAPK_TOOLBAR_CHROME
+                && (name.endsWith("Toolbar") || name.endsWith("MaterialToolbar")))) {
             int fill = backgroundColor;
             if ((fill & 0xFF000000) != 0) return; // already opaque
             // Honor an EXPLICIT background (incl. transparent). F-Droid's
@@ -6001,6 +6052,10 @@ public class View implements android.graphics.drawable.Drawable.Callback,
             return;
         }
     }
+    /** Gate: MACAPK_TOOLBAR_CHROME=1 restores the colorSurface fill behind a
+     *  Toolbar / MaterialToolbar with no background (see macapkPaintMaterialChrome). */
+    static final boolean MACAPK_TOOLBAR_CHROME =
+        "1".equals(System.getenv("MACAPK_TOOLBAR_CHROME"));
     protected void onDraw(android.graphics.Canvas canvas)      {}
     protected void dispatchDraw(android.graphics.Canvas canvas) {}
 
@@ -6035,7 +6090,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         if (h == null) {
             synchronized (this) {
                 h = mPostHandler;
-                if (h == null) mPostHandler = h = new android.os.Handler();
+                if (h == null) mPostHandler = h = new android.os.Handler(android.os.Looper.getMainLooper());
             }
         }
         return h;
@@ -6152,6 +6207,12 @@ public class View implements android.graphics.drawable.Drawable.Callback,
                     && o.mMode == android.graphics.Outline.MODE_ROUND_RECT
                     && o.mRadius > 0f) {
                 return o.mRadius;
+            }
+            // A rect with mixed corner radii is a PATH outline; its largest
+            // radius gives a round rect inside it (Outline.macapkPathShadowRadius).
+            if (o.mMode == android.graphics.Outline.MODE_PATH
+                    && o.macapkPathShadowRadius > 0f) {
+                return o.macapkPathShadowRadius;
             }
         } catch (Throwable ignored) {}
         return -1f;
@@ -7378,6 +7439,16 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         if (!android.os.Looper.MACAPK_REAL_LOOPER) return;
         mDrawableStateDirty = true;
         drawableStateChanged();
+        // AOSP View.refreshDrawableState (android14 View.java:23683-23691):
+        //     ViewParent parent = mParent;
+        //     if (parent != null) parent.childDrawableStateChanged(this);
+        // This is how a group with addStatesFromChildren (TextInputLayout and
+        // its inputFrame) learns that its EditText became focused, so the box
+        // stroke and the floating label switch to the focused colors.
+        ViewParent p = parent;
+        if (p != null) {
+            try { p.childDrawableStateChanged(this); } catch (Throwable ignored) {}
+        }
     }
 
     protected int[] onCreateDrawableState(int extraSpace) {

@@ -2420,6 +2420,230 @@ public enum ApkRetention {
     }
 }
 
+// MARK: - Per-version folder names without dots (GitHub #82)
+
+/// The per-version folder is `<package>_<versionName with every "." as "_">`:
+/// `com.cricfytv.sports_7_2`, not `com.cricfytv.sports_7.2`. Apps that guard
+/// against a cloned package (streaming, banking and game APKs count the dots in
+/// `getFilesDir().getPath()` against the package's own) tripped on the version's
+/// dots, because on a device that path never carries a version at all. With the
+/// dots folded out the path has exactly the package's dots, and the isolation of
+/// two versions of one package is unchanged.
+///
+/// The name is DATA, not identity: the real versionName lives in meta.json, the
+/// registry row and Info.plist (MacapkVersionName). Nothing may recover a version
+/// by parsing it back out (`1_2_3` cannot be told from a version that really
+/// contains underscores); every reader that needs the version string prefers the
+/// recorded one and parses the folder name only as a last resort.
+///
+/// Installs made before this carry the dotted spelling. They keep working under
+/// it (the runtime adopts an existing dotted folder instead of starting an empty
+/// one beside it) until `DirNameMigration` renames them, and every comparison
+/// between a folder name and a package+versionName goes through `same` so a dotted
+/// and an underscored spelling of one version are one install. Mirrored in C++ by
+/// runtime/include/macapk/dir_naming.h.
+public enum DirNaming {
+    /// "1.2.3" -> "1_2_3".
+    public static func versionComponent(_ v: String) -> String {
+        v.replacingOccurrences(of: ".", with: "_")
+    }
+
+    /// The folder name for a NEW install: the package alone when the version is
+    /// unknown, else `<package>_<version with dots folded>`.
+    public static func dirName(package: String, versionName: String) -> String {
+        versionName.isEmpty ? package : package + "_" + versionComponent(versionName)
+    }
+
+    /// The name an install ALREADY recorded (any of the package's `existing`
+    /// dirNames) should keep when it is the same version as `versionName`: a dotted legacy spelling stays as
+    /// it is (its folders, registry row, bundle plist and bundle identifier all
+    /// carry it) until the migration renames the lot together. Otherwise the new
+    /// spelling.
+    public static func dirName(package: String, versionName: String,
+                               adopting existing: [String]) -> String {
+        let wanted = dirName(package: package, versionName: versionName)
+        if existing.contains(wanted) { return wanted }
+        return existing.first { same($0, wanted, package: package) } ?? wanted
+    }
+
+    /// `dirName` rewritten to the dot-free spelling (unchanged when it does not
+    /// start with `<package>_`: the bare-package spelling, or a foreign name).
+    public static func canonical(_ dirName: String, package: String) -> String {
+        let prefix = package + "_"
+        guard !package.isEmpty, dirName.hasPrefix(prefix) else { return dirName }
+        return prefix + versionComponent(String(dirName.dropFirst(prefix.count)))
+    }
+
+    /// True for the pre-#82 spelling: a version part that still has a dot.
+    public static func isLegacy(_ dirName: String, package: String) -> Bool {
+        canonical(dirName, package: package) != dirName
+    }
+
+    /// One install under either spelling.
+    public static func same(_ a: String, _ b: String, package: String) -> Bool {
+        a == b || canonical(a, package: package) == canonical(b, package: package)
+    }
+
+    /// Two version strings that name one version, in either spelling.
+    public static func sameVersion(_ a: String, _ b: String) -> Bool {
+        a == b || versionComponent(a) == versionComponent(b)
+    }
+}
+
+/// Renames one installed app's dotted per-version folders to the dot-free
+/// spelling (GitHub #82), keeping everything in them.
+///
+/// Runs in the app's own stub, under the single-instance lock (so no copy of the
+/// app is running), and moves four things together or none: the data folder
+/// `data/data/<dir>` (the app's saves and its `cache/`), the code folder
+/// `.macapk/code/<dir>` (the converted code and translated libraries, which are
+/// version-specific caches and expensive to rebuild), the registry row's
+/// dirName, and the bundle's `MacapkDirName`. A failure after the first rename
+/// puts the renames back, so a half-migrated app cannot exist.
+///
+/// Never deletes user data: a data folder at the target that holds anything but
+/// our own regenerable artifacts stops the migration (the app keeps its dotted
+/// name and is retried at the next launch); the dotted data folder is renamed,
+/// never copied or merged. The bundle's CFBundleIdentifier is left alone: macOS
+/// keys the app's WebKit store, privacy grants and defaults by it.
+///
+/// The old data folder name stays behind as a relative link to the new one, the
+/// same compatibility link an in-place update leaves, so an absolute path the app
+/// saved earlier keeps resolving.
+public enum DirNameMigration {
+    public struct Outcome {
+        public var dirName: String        // the name to use from here on
+        public var migrated = false
+        public var reason = ""
+    }
+
+    public static func migrate(dirName: String, package: String, androidRoot: URL,
+                               bundle: URL?, store: RegistryStore?,
+                               log: ((String) -> Void)? = nil) -> Outcome {
+        var out = Outcome(dirName: dirName)
+        let target = DirNaming.canonical(dirName, package: package)
+        guard target != dirName else { out.reason = "already dot-free"; return out }
+        let fm = FileManager.default
+        let root = androidRoot.resolvingSymlinksInPath()
+        let dd = root.appendingPathComponent("data/data", isDirectory: true)
+        let cc = root.appendingPathComponent(".macapk/code", isDirectory: true)
+        let oldData = dd.appendingPathComponent(dirName), newData = dd.appendingPathComponent(target)
+        let oldCode = cc.appendingPathComponent(dirName), newCode = cc.appendingPathComponent(target)
+
+        func exists(_ u: URL) -> Bool {
+            DataCarryForward.isSymlink(u) || fm.fileExists(atPath: u.path)
+        }
+        func realDir(_ u: URL) -> Bool {
+            var isDir: ObjCBool = false
+            return fm.fileExists(atPath: u.path, isDirectory: &isDir) && isDir.boolValue
+                && !DataCarryForward.isSymlink(u)
+        }
+        func skip(_ why: String) -> Outcome {
+            out.reason = why
+            log?("[dirname] \(dirName) keeps its name: \(why)")
+            return out
+        }
+
+        let plistURL = bundle?.appendingPathComponent("Contents/Info.plist")
+        if let p = plistURL, fm.fileExists(atPath: p.path), !fm.isWritableFile(atPath: p.path) {
+            return skip("Info.plist is not writable")
+        }
+        let dataThere = realDir(oldData), codeThere = realDir(oldCode)
+        if !dataThere && !codeThere { return skip("no dotted folder to rename") }
+
+        // The target must be free, or hold nothing but our own regenerable output.
+        // Anything else is data the app wrote under the new name: never merged.
+        var clearedTargetData = false
+        if dataThere && exists(newData) {
+            guard realDir(newData), isArtifactsOnly(newData) else {
+                return skip("data/data/\(target) already holds app data")
+            }
+            clearedTargetData = true
+        }
+
+        // 1. data
+        var movedData = false, movedCode = false
+        if dataThere {
+            if clearedTargetData {
+                do { try fm.removeItem(at: newData) }
+                catch { return skip("could not clear the empty data/data/\(target): \(error.localizedDescription)") }
+            }
+            do { try fm.moveItem(at: oldData, to: newData); movedData = true }
+            catch { return skip("could not rename the data folder: \(error.localizedDescription)") }
+        }
+        // 2. code (a rebuilt code folder already at the target wins; the old one is a cache)
+        if codeThere {
+            if exists(newCode) {
+                log?("[dirname] .macapk/code/\(target) already exists; leaving the old code folder")
+            } else {
+                do { try fm.moveItem(at: oldCode, to: newCode); movedCode = true }
+                catch { log?("[dirname] could not rename the code folder (\(error.localizedDescription)); it will be rebuilt") }
+            }
+        }
+        func undoRenames() {
+            if movedCode { try? fm.moveItem(at: newCode, to: oldCode) }
+            if movedData { try? fm.moveItem(at: newData, to: oldData) }
+        }
+        // 3. registry row
+        if let store = store {
+            do {
+                try store.mutate(timeoutMs: 3000) { reg in
+                    if let i = reg.apps.firstIndex(where: { $0.dirName == dirName }) {
+                        reg.apps[i].dirName = target
+                    }
+                }
+            } catch {
+                undoRenames()
+                return skip("could not update the registry (\(error.localizedDescription)); renames undone")
+            }
+        }
+        // 4. bundle Info.plist (generated bundles are never code-signed: a plain rewrite)
+        if let p = plistURL, fm.fileExists(atPath: p.path), !rewritePlistDirName(p, to: target) {
+            if let store = store {
+                try? store.mutate(timeoutMs: 3000) { reg in
+                    if let i = reg.apps.firstIndex(where: { $0.dirName == target }) {
+                        reg.apps[i].dirName = dirName
+                    }
+                }
+            }
+            undoRenames()
+            return skip("could not rewrite MacapkDirName; renames undone")
+        }
+        // 5. compatibility link for absolute paths the app saved
+        if movedData {
+            DataCarryForward.retargetLinks(in: dd, from: dirName, to: target, log: log)
+            if !exists(oldData) {
+                do { try fm.createSymbolicLink(atPath: oldData.path, withDestinationPath: target) }
+                catch { log?("[dirname] could not leave a link at \(dirName): \(error.localizedDescription)") }
+            }
+        }
+        out.dirName = target
+        out.migrated = true
+        out.reason = "renamed \(dirName) -> \(target)"
+        log?("[dirname] \(out.reason)")
+        return out
+    }
+
+    /// True when every top-level entry is one of our regenerable artifacts.
+    static func isArtifactsOnly(_ dir: URL) -> Bool {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return false }
+        return names.allSatisfy { DataCarryForward.isArtifactName($0) }
+    }
+
+    /// Replace MacapkDirName in an Info.plist, atomically, touching nothing else.
+    static func rewritePlistDirName(_ url: URL, to dirName: String) -> Bool {
+        guard let d = try? Data(contentsOf: url) else { return false }
+        var fmt = PropertyListSerialization.PropertyListFormat.xml
+        guard var dict = (try? PropertyListSerialization.propertyList(from: d, options: [], format: &fmt))
+                as? [String: Any],
+              dict["MacapkDirName"] != nil else { return false }
+        dict["MacapkDirName"] = dirName
+        guard let out = try? PropertyListSerialization.data(fromPropertyList: dict, format: fmt, options: 0)
+        else { return false }
+        return (try? out.write(to: url, options: .atomic)) != nil
+    }
+}
+
 // MARK: - JVM crash-dump pruning (v1.0.1650, lane "disk")
 
 /// Bounds the `hs_err_pid<N>.log` files HotSpot writes into the logs dir
@@ -3292,7 +3516,7 @@ public enum KeptData {
         // arbitrary kept version to it would restore the wrong saves, so only
         // an equally version-less entry qualifies.
         guard let hit = entries(forPackage: package)
-                .first(where: { $0.versionName == versionName }) else { return nil }
+                .first(where: { DirNaming.sameVersion($0.versionName, versionName) }) else { return nil }
         let dst = androidRoot.appendingPathComponent("data/data")
                              .appendingPathComponent(hit.dirName, isDirectory: true)
         // Never overwrite a data dir that already holds an install. The kept
@@ -3697,8 +3921,9 @@ public final class InstallPipeline {
         // guess about.
         var journalledDirName: String? = nil
         if let pkg = peek.package {
-            let provisional = provisionalDirName(package: pkg, versionName: peek.versionName,
-                                                 existing: existing)
+            let provisional = provisionalDirName(
+                package: pkg, versionName: peek.versionName, existing: existing,
+                sameVersionNames: registry.apps.filter { $0.package == pkg }.map(\.dirName))
             journalledDirName = provisional
             try? store.upsert(AppRecord(
                 package: pkg,
@@ -3745,7 +3970,8 @@ public final class InstallPipeline {
             // second one "<Label> (<lastSeg>)"; finalizeBundle stamps the new
             // dirName once extraction has produced it.
             let dir0 = (inPlace ? existing?.dirName : nil)
-                ?? (ver0.isEmpty ? pkg0 : "\(pkg0)_\(ver0)")
+                ?? DirNaming.dirName(package: pkg0, versionName: ver0,
+                                     adopting: registry.apps.filter { $0.package == pkg0 }.map(\.dirName))
             do {
                 bundleURL = try gen(pkg0, peek.label ?? pkg0, ver0,
                                     peek.versionCode ?? 0, nil,
@@ -4238,7 +4464,8 @@ public final class InstallPipeline {
         // "downgrade" from strings: "1.10" < "1.9" lexically, and warning a
         // user about a downgrade that is not one erodes the warning.
         if let n = newName, !n.isEmpty {
-            return n == old.versionName || n == old.version ? .reinstall : .update
+            return DirNaming.sameVersion(n, old.versionName) || DirNaming.sameVersion(n, old.version)
+                ? .reinstall : .update
         }
         return .reinstall
     }
@@ -4247,9 +4474,14 @@ public final class InstallPipeline {
     /// runtime sanitizes the version its own way, so this is a guess; the row
     /// is replaced with the real one right after extraction.
     private func provisionalDirName(package: String, versionName: String?,
-                                    existing: AppRecord?) -> String {
+                                    existing: AppRecord?,
+                                    sameVersionNames: [String]) -> String {
         if let v = versionName, !v.isEmpty {
-            return "\(package)_\(ApkRetention.sanitizeComponent(v))"
+            // An install already recorded under the dotted spelling of this version
+            // keeps it (DirNaming), so the journal row is that row, not a twin.
+            return DirNaming.dirName(package: package,
+                                     versionName: ApkRetention.sanitizeComponent(v),
+                                     adopting: sameVersionNames)
         }
         return existing?.dirName ?? package
     }
@@ -4495,7 +4727,10 @@ public final class InstallPipeline {
             let found = FoundApp(
                 dirName: name, package: pkg,
                 label: (j["label"] as? String) ?? "",
-                version: Self.versionFromDirName(name, package: pkg),
+                // The folder name folds the version's dots (DirNaming), so the
+                // recorded versionName is the only faithful display string.
+                version: ((j["versionName"] as? String).flatMap { $0.isEmpty ? nil : $0 })
+                    ?? Self.versionFromDirName(name, package: pkg),
                 versionName: (j["versionName"] as? String) ?? "",
                 versionCode: vc,
                 installedApk: (j["installedApk"] as? String) ?? "")
@@ -5354,6 +5589,7 @@ public enum RuntimeInstall {
         "Resources/macapk-runtime",
         "Resources/libskiko-macos-arm64.dylib",
         "Resources/libmacapk-skia-metal.dylib",
+        "Resources/libmacapk-binder.dylib",
         "Resources/libGLESv2.dylib",
         "Resources/libEGL.dylib",
         "Resources/libvulkan.dylib",
@@ -5839,6 +6075,14 @@ public enum RuntimeInstall {
                + "helper binaries for anything they load by path -- until relaunched.")
         }
 
+        // Every app process of the PREVIOUS build, background service hosts
+        // and the apps the user opened alike, is stopped now (owner, 2026-11-02:
+        // after a new build Google Play opened to no screen until Play
+        // services, the Services Framework and the Play Store were killed by
+        // hand; updating Mac.apk is the only time this happens). The next
+        // launch or bind starts them from this build.
+        let stoppedBackground = StaleBackground.stop(log: log)
+
         // Swap. Move the old tree aside first so the window in which no
         // runtime exists is a rename, not a recursive delete.
         let aside = Paths.supportDir.appendingPathComponent(
@@ -5910,6 +6154,9 @@ public enum RuntimeInstall {
                          + "Nothing was installed.")
         }
         try? fm.removeItem(at: removedMarkerURL)
+        // The tree is in place: bring the broker back on it (started by launchd
+        // from the SAME Mac.apk.app, so it is the new build's SystemServer).
+        StaleBackground.restartBroker(wasRunning: stoppedBackground.brokerWasRunning, log: log)
 
         let id = buildId(at: stagedRoot) ?? "unknown"
         let dirs = Self.payloadDirs(in: src)
@@ -6132,6 +6379,134 @@ public enum RuntimeInstall {
             if v?.isRegularFile == true, let s = v?.fileSize { total += Int64(s) }
         }
         return total
+    }
+}
+
+// MARK: - Stale background processes
+
+/// Terminates the app processes a previous build left running when the shared
+/// runtime is replaced: every `macapk-runtime` (service hosts the broker
+/// started, Play services, the Services Framework, and apps the user opened)
+/// and then the system broker itself (`macapk-system`, restarted afterwards).
+/// They keep running the old build's code and binder protocol, so a new app
+/// talking to them gets a blank screen. The owner chose to stop opened apps
+/// too (2026-11-02): it only happens when Mac.apk is updated.
+///
+/// A process that is itself a service host never cleans up: its siblings and
+/// its broker are the ones being waited on. `MACAPK_KEEP_BACKGROUND=1` skips
+/// the whole thing, for an A/B that wants the old processes alive.
+enum StaleBackground {
+    static let brokerLabel = "org.macapk.system"
+
+    struct Outcome { var brokerWasRunning = false; var stopped: [pid_t] = [] }
+
+    /// The environment of `pid` (same user only), from KERN_PROCARGS2:
+    /// argc, exec path, NUL padding, argv, then the env strings.
+    static func environment(of pid: pid_t) -> [String: String]? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return nil }
+        var buf = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0, size > 4 else { return nil }
+        var argc: Int32 = 0
+        memcpy(&argc, buf, 4)
+        var i = 4
+        while i < size && buf[i] != 0 { i += 1 }          // exec path
+        while i < size && buf[i] == 0 { i += 1 }          // padding
+        var skipped: Int32 = 0
+        while i < size && skipped < argc {                // argv
+            while i < size && buf[i] != 0 { i += 1 }
+            i += 1
+            skipped += 1
+        }
+        var env: [String: String] = [:]
+        while i < size {
+            var j = i
+            while j < size && buf[j] != 0 { j += 1 }
+            if j == i { break }
+            let kv = String(decoding: buf[i..<j], as: UTF8.self)
+            if let eq = kv.firstIndex(of: "=") {
+                env[String(kv[..<eq])] = String(kv[kv.index(after: eq)...])
+            }
+            i = j + 1
+        }
+        return env
+    }
+
+    /// Live processes: (pid, executable file name).
+    static func processes() -> [(pid: pid_t, exe: String)] {
+        var pids = [pid_t](repeating: 0, count: 4096)
+        let n = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size))
+        guard n > 0 else { return [] }
+        var out: [(pid_t, String)] = []
+        for pid in pids.prefix(Int(n)) where pid > 0 {
+            var buf = [CChar](repeating: 0, count: 4096)
+            guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { continue }
+            out.append((pid, URL(fileURLWithPath: String(cString: buf)).lastPathComponent))
+        }
+        return out
+    }
+
+    /// The broker's readiness file (SystemServer.readyFile): written when the
+    /// system apps it boots have attached. Removed whenever the broker is
+    /// stopped so a dead broker's file never reads as ready.
+    static var readyFile: URL { Paths.runDir.appendingPathComponent("system-ready") }
+
+    /// When `pid` started, or nil.
+    static func startTime(of pid: pid_t) -> Date? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        let t = info.kp_proc.p_un.__p_starttime
+        return Date(timeIntervalSince1970: TimeInterval(t.tv_sec) + TimeInterval(t.tv_usec) / 1_000_000)
+    }
+
+    static func brokerPid() -> pid_t? { processes().first { $0.exe == "macapk-system" }?.pid }
+
+    static func stop(log: ((String) -> Void)?) -> Outcome {
+        var outcome = Outcome()
+        let me = ProcessInfo.processInfo.environment
+        if me["MACAPK_KEEP_BACKGROUND"] == "1" || me["MACAPK_SERVICE_HOST"] != nil { return outcome }
+        let procs = processes()
+        outcome.brokerWasRunning = procs.contains { $0.exe == "macapk-system" }
+        var victims: [pid_t] = []
+        for p in procs where p.pid != getpid() && (p.exe == "macapk-runtime" || p.exe.hasPrefix("MacApkAppStub")) {
+            // Every app of the previous build: the service hosts, and (owner,
+            // 2026-11-02: it only matters when Mac.apk is updated) the apps the
+            // user opened. A mixed old-runtime/new-helper app is worse than a
+            // relaunch.
+            victims.append(p.pid)
+        }
+        if victims.isEmpty { return outcome }
+        log?("[runtime] stopping \(victims.count) process(es) of the previous build: "
+           + victims.map { String($0) }.joined(separator: " "))
+        for pid in victims { kill(pid, SIGTERM) }
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline, victims.contains(where: { kill($0, 0) == 0 }) { usleep(100_000) }
+        for pid in victims where kill(pid, 0) == 0 {
+            log?("[runtime] pid \(pid) ignored SIGTERM; killing")
+            kill(pid, SIGKILL)
+        }
+        outcome.stopped = victims
+        return outcome
+    }
+
+    /// Restart the broker so it runs the new SystemServer. Only if it was
+    /// running: launchd starts it on demand otherwise, from the new build.
+    static func restartBroker(wasRunning: Bool, log: ((String) -> Void)?) {
+        guard wasRunning else { return }
+        try? FileManager.default.removeItem(at: readyFile)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["kickstart", "-k", "gui/\(getuid())/\(brokerLabel)"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run(); p.waitUntilExit() } catch {
+            log?("[runtime] WARN could not restart \(brokerLabel): \(error)"); return
+        }
+        log?(p.terminationStatus == 0 ? "[runtime] restarted \(brokerLabel) on the new build"
+                                      : "[runtime] WARN launchctl kickstart -k \(brokerLabel) exited \(p.terminationStatus)")
     }
 }
 

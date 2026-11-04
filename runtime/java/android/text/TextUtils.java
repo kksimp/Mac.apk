@@ -1017,12 +1017,8 @@ public class TextUtils {
      *  has no such method in this tree, so (matching the same JDK query
      *  android.view.View's private duplicate and
      *  android.content.res.Configuration.setLayoutDirection(Locale) already
-     *  use, keeping every call site's answer consistent) we ask
-     *  java.awt.ComponentOrientation, empirically verified on this host
-     *  (JDK 21.0.11) to answer ar/he/iw/fa/ur/yi/ji correctly, and close
-     *  the gap it gets wrong with a small hardcoded table for the
-     *  remaining ICU-RTL scripts it reports as LTR (Pashto/Sindhi/Uyghur/
-     *  Divehi/Syriac). The AOSP body also OR's in
+     *  use, keeping every call site's answer consistent) we answer from a
+     *  language/script table (macapkIsLocaleRtl; no AWT). The AOSP body also OR's in
      *  DisplayProperties.debug_force_rtl(), a developer-settings "force
      *  RTL layout" debug toggle with no Mac.apk equivalent (there is no
      *  such settings screen here); omitted, matching the overwhelmingly
@@ -1033,21 +1029,31 @@ public class TextUtils {
             : android.view.View.LAYOUT_DIRECTION_LTR;
     }
 
-    // ICU-RTL language codes java.awt.ComponentOrientation.getOrientation
-    // reports as LEFT_TO_RIGHT on this JDK even though they are RTL
-    // scripts per ICU / real Android: Pashto, Sindhi, Uyghur, Divehi,
-    // Syriac. Verified empirically this session (JDK 21.0.11).
-    private static final java.util.Set<String> EXTRA_RTL_LANGUAGES =
-        new java.util.HashSet<>(java.util.Arrays.asList("ps", "sd", "ug", "dv", "syr"));
+    // ICU's right-to-left languages and scripts (ULocale.isRightToLeft). This used
+    // to ask java.awt.ComponentOrientation and patch its gaps, but loading that
+    // class initialises AWT, which the converter/prep threads must never do
+    // (debug/bootspeed_gate.sh OVERLAP), and Configuration's field initialiser
+    // reaches it on every construction. A table needs no AWT and covers the
+    // languages the JDK query answered (ar, fa, iw/he, ur) plus the ones it got
+    // wrong or never knew.
+    private static final java.util.Set<String> RTL_LANGUAGES =
+        new java.util.HashSet<>(java.util.Arrays.asList(
+            "ar", "fa", "he", "iw", "ur", "yi", "ji", "ps", "sd", "ug", "dv", "syr", "ckb"));
+    private static final java.util.Set<String> RTL_SCRIPTS =
+        new java.util.HashSet<>(java.util.Arrays.asList(
+            "Arab", "Hebr", "Thaa", "Syrc", "Nkoo", "Adlm", "Rohg", "Mand", "Samr"));
+
+    /** True when `locale` is written right to left (AOSP: ICU
+     *  ULocale.forLocale(locale).isRightToLeft()). AWT-free. */
+    public static boolean macapkIsLocaleRtl(java.util.Locale locale) {
+        if (locale == null || locale.equals(java.util.Locale.ROOT)) return false;
+        String script = locale.getScript();
+        if (script != null && !script.isEmpty()) return RTL_SCRIPTS.contains(script);
+        return RTL_LANGUAGES.contains(locale.getLanguage());
+    }
 
     private static boolean isLocaleRightToLeft(java.util.Locale locale) {
-        if (locale == null || locale.equals(java.util.Locale.ROOT)) return false;
-        if (EXTRA_RTL_LANGUAGES.contains(locale.getLanguage())) return true;
-        try {
-            return !java.awt.ComponentOrientation.getOrientation(locale).isLeftToRight();
-        } catch (Throwable ignored) {
-            return false;
-        }
+        return macapkIsLocaleRtl(locale);
     }
 
     /** TextPaint overload (distinct descriptor from the Paint form).

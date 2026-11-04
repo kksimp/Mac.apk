@@ -11,6 +11,7 @@
 #include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -387,9 +388,25 @@ AotState ApplyJdkSelectionAndAotCache(std::vector<std::string>& opts) {
     return st;
 }
 
+// The host Mac's hardware model ("Mac14,7"), read once from sysctl hw.model and
+// handed to Java as MACAPK_HOST_MODEL, which android.os.Build.MODEL reads. One
+// sysctlbyname call per process, no shell-out. Left alone when the variable is
+// already set (a harness or a test can pin it); Build.MODEL falls back to
+// "Mac" when it is missing, empty or not printable.
+static void ExportHostModel() {
+    if (std::getenv("MACAPK_HOST_MODEL") != nullptr) return;
+    char model[64] = {0};
+    size_t len = sizeof model - 1;
+    if (sysctlbyname("hw.model", model, &len, nullptr, 0) != 0) return;
+    model[sizeof model - 1] = '\0';
+    if (model[0] == '\0') return;
+    setenv("MACAPK_HOST_MODEL", model, 0);
+}
+
 }  // namespace
 
 void StartJvm(const JvmConfig& cfg, JavaVM** out_vm, JNIEnv** out_env) {
+    ExportHostModel();
     // We allocate the option strings on the stack (in a vector) and pass
     // pointers to JNI; HotSpot copies them, so they don't need to outlive
     // the call.
@@ -627,6 +644,22 @@ void StartJvm(const JvmConfig& cfg, JavaVM** out_vm, JNIEnv** out_env) {
     }
     for (const auto& opt : cfg.extra_options) {
         owned_options.push_back(opt);
+    }
+    // A SERVICE HOST (started by the system broker, MACAPK_SERVICE_HOST=1) is a
+    // background process with no UI: Play services, the Services Framework, a
+    // secondary process of an app. On a device ART compiles such a process lazily
+    // and cheaply; here every one is a JVM, and a cold broker boots several at once
+    // on a few cores, so the C2 compiler dominates the cold start. Measured on the
+    // real Play services host (warm, 16 s, 8 cores): 17.3 CPU-s, of which the
+    // JIT 11.0 s; with C1 only 12.3 CPU-s, JIT 1.8 s (-29% CPU on the shared
+    // cores the next process is waiting for). Hot code still compiles, one tier
+    // lower. MACAPK_SERVICE_HOST_JIT=full keeps the full tiered pipeline; a later
+    // MACAPK_JVM_OPTS still wins. Foreground apps are untouched.
+    if (const char* sh = std::getenv("MACAPK_SERVICE_HOST")) {
+        const char* jit = std::getenv("MACAPK_SERVICE_HOST_JIT");
+        if (std::strcmp(sh, "1") == 0 && !(jit && std::strcmp(jit, "full") == 0)) {
+            owned_options.push_back("-XX:TieredStopAtLevel=1");
+        }
     }
     // MACAPK_JVM_OPTS: space-separated extra JVM options for debugging
     // (e.g. "-Xint", "-XX:TieredStopAtLevel=1", "-XX:CompileCommand=exclude,...").

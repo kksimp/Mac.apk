@@ -288,16 +288,16 @@ public class FrameLayout extends ViewGroup {
             // rect, accounting for margins. AOSP FrameLayout treats
             // UNSPECIFIED_GRAVITY (-1) as DEFAULT_CHILD_GRAVITY which
             // is TOP|START (= TOP|LEFT in LTR).
+            // AOSP: DEFAULT_CHILD_GRAVITY = TOP | START, and
+            // Gravity.getAbsoluteGravity(gravity, getLayoutDirection()) -- so an
+            // RTL FrameLayout puts an unspecified child at the top-RIGHT and a
+            // bottom|end FAB at the bottom-LEFT. START/END used to be read as
+            // LEFT/RIGHT unconditionally, leaving every such child on the LTR side.
             int g = (gravity == -1 || gravity == 0)
-                ? (android.view.Gravity.TOP | android.view.Gravity.LEFT) : gravity;
+                ? (android.view.Gravity.TOP | android.view.Gravity.START) : gravity;
+            g = android.view.Gravity.getAbsoluteGravity(g, getLayoutDirection());
             int horiz = g & android.view.Gravity.HORIZONTAL_GRAVITY_MASK;
             int vert  = g & android.view.Gravity.VERTICAL_GRAVITY_MASK;
-
-            // Treat START / END as LEFT / RIGHT (LTR -- we don't
-            // currently drive RTL layout direction here).
-            if ((horiz & android.view.Gravity.RELATIVE_LAYOUT_DIRECTION) != 0) {
-                horiz &= ~android.view.Gravity.RELATIVE_LAYOUT_DIRECTION;
-            }
 
             int childLeft;
             if (horiz == android.view.Gravity.CENTER_HORIZONTAL) {

@@ -427,6 +427,11 @@ bool elfexec_dlopen_on() {
     return on;
 }
 
+extern "C" int __macapk_arm64_ns_resolve_dep(const char* need, const char* requester, char* path, size_t path_n);   // bionic_shim.cpp
+
+extern "C" int __macapk_arm64_ns_enforcing(void);   // bionic_shim.cpp
+static bool ns_dep_failure_fatal() { return __macapk_arm64_ns_enforcing() != 0; }
+
 struct GuestLib {
     std::vector<void*> deps;   // DT_NEEDED images, in DT_NEEDED order (dlsym's search order)
 };
@@ -570,21 +575,37 @@ void* load_tree(const std::string& file, int depth) {
     if (depth > 16) return nullptr;            // a malformed / cyclic graph
     char rp[PATH_MAX];
     const std::string key = ::realpath(file.c_str(), rp) ? std::string(rp) : file;
-    auto hit = dl_by_path().find(key);
-    if (hit != dl_by_path().end()) return hit->second;
-    if (void* h = __macapk_arm64_native_find_loaded_file(key.c_str())) {   // this FILE, loaded at startup
-        dl_libs().emplace(h, GuestLib{});
-        dl_by_path()[key] = h;
-        return h;
-    }
     ElfDyn dyn;
+    auto hit = dl_by_path().find(key);
+    void* already = hit != dl_by_path().end() ? hit->second : nullptr;
+    if (!already) already = __macapk_arm64_native_find_loaded_file(key.c_str());   // loaded at startup
+    if (already) {
+        // One image per file: a second namespace shares it, but the library's dependencies
+        // must still be reachable from THIS namespace (bionic would load them there).
+        if (__macapk_arm64_ns_enforcing() && parse_dyn(file, dyn)) {
+            char nspath[PATH_MAX];
+            for (const std::string& need : dyn.needed)
+                if (__macapk_arm64_ns_resolve_dep(need.c_str(), key.c_str(), nspath, sizeof nspath) == 4)
+                    return nullptr;
+        }
+        if (hit == dl_by_path().end()) { dl_libs().emplace(already, GuestLib{}); dl_by_path()[key] = already; }
+        return already;
+    }
     if (!parse_dyn(file, dyn)) return nullptr;
     const std::string name = dyn.soname.empty() ? base_of(file) : dyn.soname;
     GuestLib lib;
     const std::string origin = dir_of(key);
     for (const std::string& need : dyn.needed) {
-        if (void* h = __macapk_arm64_native_find_loaded(need.c_str())) { lib.deps.push_back(h); continue; }
-        const std::string found = find_on_paths(need, dyn.runpath, origin);
+        // Inside a guest-created linker namespace the namespace decides where (and whether) a
+        // dependency is found; otherwise the loaded-soname check and LD_LIBRARY_PATH/RUNPATH.
+        char nspath[PATH_MAX];
+        const int nsr = __macapk_arm64_ns_resolve_dep(need.c_str(), key.c_str(), nspath, sizeof nspath);
+        if (nsr == 4 && ns_dep_failure_fatal()) return nullptr;   // bionic fails the whole dlopen
+        if (nsr == 3 || nsr == 4) continue;                    // platform library / unresolved
+        if (nsr == 0 || nsr == 2)
+            if (void* h = __macapk_arm64_native_find_loaded(need.c_str())) { lib.deps.push_back(h); continue; }
+        if (nsr == 2) continue;
+        const std::string found = nsr == 1 ? std::string(nspath) : find_on_paths(need, dyn.runpath, origin);
         if (found.empty() || !is_arm64_elf(found)) continue;   // platform library -> the shim
         if (void* h = load_tree(found, depth + 1)) lib.deps.push_back(h);
         else return nullptr;                                  // bionic fails the whole dlopen

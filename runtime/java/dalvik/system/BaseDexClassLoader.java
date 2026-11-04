@@ -17,6 +17,30 @@ import java.net.URL;
 import java.net.URLClassLoader;
 
 public class BaseDexClassLoader extends URLClassLoader {
+    // Parallel-capable. ART never serializes a whole class loader: classes load
+    // under per-class locks. On HotSpot, a loader that does not register gets
+    // getClassLoadingLock(name) == the loader itself, so every thread loading
+    // ANY class waits on one lock (JFR on WhatsApp: 718 waits, the UI thread
+    // up to 695 ms). Each class up the chain to URLClassLoader must register.
+    static { ClassLoader.registerAsParallelCapable(); }
+
+    /** AOSP: {@code private final DexPathList pathList}. Native code and
+     *  hotfix/safe-mode SDKs name it directly (JNI GetFieldID with
+     *  "Ldalvik/system/DexPathList;", or reflection): ByteDance's SafeModeSdk
+     *  LoaderNativeBridge.getSafeModeClassNative died with NoSuchFieldError
+     *  here (issue #105). Real loading stays URLClassLoader-backed; see
+     *  DexPathList for what the object does and does not mirror. */
+    private final DexPathList pathList;
+
+    private static String urlsToDexPath(URL[] urls) {
+        StringBuilder sb = new StringBuilder();
+        if (urls != null) for (URL u : urls) {
+            if (u == null || !"file".equals(u.getProtocol())) continue;
+            if (sb.length() > 0) sb.append(File.pathSeparator);
+            sb.append(u.getPath());
+        }
+        return sb.toString();
+    }
 
     /** AOSP signature. dexPath is a colon-separated list of code paths;
      *  optimizedDirectory + librarySearchPath are advisory on a real device
@@ -24,6 +48,7 @@ public class BaseDexClassLoader extends URLClassLoader {
     public BaseDexClassLoader(String dexPath, File optimizedDirectory,
                               String librarySearchPath, ClassLoader parent) {
         super(buildUrls(dexPath), parent);
+        pathList = new DexPathList(this, dexPath, librarySearchPath, optimizedDirectory);
         // ART searches a loader's JNI libraries in path-sorted order; see
         // ArtJniLibraryOrder. Before anything can load through this loader.
         ArtJniLibraryOrder.apply(this);
@@ -33,6 +58,7 @@ public class BaseDexClassLoader extends URLClassLoader {
      *  (AppClassLoader, the no-dex DexClassLoader path). */
     protected BaseDexClassLoader(URL[] urls, ClassLoader parent) {
         super(urls, parent);
+        pathList = new DexPathList(this, urlsToDexPath(urls), null, null);
         ArtJniLibraryOrder.apply(this);
     }
 
@@ -198,6 +224,7 @@ public class BaseDexClassLoader extends URLClassLoader {
                 // subclass, so we can call it.
                 URL converted = MacApkDexConverter.convertFileToJarUrl(f);
                 addURL(converted);
+                pathList.addDexPath(p);
                 added = true;
             } catch (RuntimeException e) {
                 // Lazy surface: leave the path unusable. findClass throws
@@ -273,8 +300,32 @@ public class BaseDexClassLoader extends URLClassLoader {
      *  java.lang.ClassLoader.findLibrary and the JVM throws
      *  IllegalAccessError (Smash Hit died in onCreate this way). The base
      *  implementation has no library knowledge -- AppClassLoader overrides
-     *  with the real translate-and-cache lookup. */
+     *  with the real translate-and-cache lookup.
+     *
+     *  Delegation to the nearest AppClassLoader ancestor (added 2026-11-01):
+     *  System.loadLibrary dispatches findLibrary to the DEFINING class loader
+     *  only -- the JVM does not walk parents for it. On a device a child
+     *  DexClassLoader still resolves the app's native libs because its
+     *  DexPathList.nativeLibraryDirectories include the app's own lib dir; ours
+     *  carry no native-lib knowledge (DexClassLoader even discards its
+     *  librarySearchPath), so any System.loadLibrary from a class defined by a
+     *  child loader returned null and failed. Concretely: GMS's Chimera
+     *  "cronet_dynamite" module is defined by a child DexClassLoader, and its
+     *  CronetLibraryLoader.System.loadLibrary("cronet[.<ver>]") never reached
+     *  our translator even though the split's libcronet .so was already
+     *  extracted and translated into the SAME install lib dir AppClassLoader
+     *  indexes -- GMS then fell back to a degraded Java HTTP stack. Walk up to
+     *  the owning AppClassLoader (which is where the translate-and-cache lookup
+     *  lives) and let it resolve. This can only ADD resolutions: the base used
+     *  to return null unconditionally, so nothing that works today changes.
+     *  AppClassLoader is final and overrides findLibrary, so it never reaches
+     *  this body -- no self-delegation. */
     public String findLibrary(String name) {
+        for (ClassLoader p = getParent(); p != null; p = p.getParent()) {
+            if (p instanceof com.macapk.loader.AppClassLoader) {
+                return ((com.macapk.loader.AppClassLoader) p).findLibrary(name);
+            }
+        }
         return null;
     }
 

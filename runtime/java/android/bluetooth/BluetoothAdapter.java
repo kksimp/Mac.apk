@@ -1,22 +1,20 @@
 // android.bluetooth.BluetoothAdapter
 //
-// Mac.apk does not bridge macOS Bluetooth to the guest. AOSP's
-// getDefaultAdapter() returns null on a context with no Bluetooth
-// available to the app (no hardware, or no BLUETOOTH permission) -- a
-// state real apps already handle -- so returning null is the honest
-// answer, not a no-op lie. Frozen Bubble calls getDefaultAdapter() from
-// its input path; the method was missing -> NoSuchMethodError.
+// BLE is provided by the opt-in CoreBluetooth bridge. Classic Bluetooth,
+// OS pairing and controller power changes remain unsupported.
 package android.bluetooth;
 
 public class BluetoothAdapter {
+    private static final BluetoothAdapter DEFAULT = new BluetoothAdapter();
     public BluetoothAdapter() {}
 
-    /** No Bluetooth adapter is exposed to guest apps. AOSP returns null
-     *  here on devices/contexts without Bluetooth; we always do. */
-    public static BluetoothAdapter getDefaultAdapter() { return null; }
+    /** Hardware-backed adapter presence; access remains subject to macOS authorization. */
+    public static BluetoothAdapter getDefaultAdapter() {
+        return com.macapk.loader.BluetoothBridge.available() ? DEFAULT : null;
+    }
 
-    public boolean isEnabled()       { return false; }
-    public int     getState()        { return STATE_OFF; }
+    public boolean isEnabled()       { return com.macapk.loader.BluetoothBridge.isEnabled(); }
+    public int     getState()        { return com.macapk.loader.BluetoothBridge.state(); }
     public String  getAddress()      { return "02:00:00:00:00:00"; } // AOSP's redacted constant
     public String  getName()         { return null; }
     public boolean enable()          { return false; }
@@ -115,21 +113,22 @@ public class BluetoothAdapter {
     }
 
     public android.bluetooth.le.BluetoothLeScanner getBluetoothLeScanner() {
-        return new android.bluetooth.le.BluetoothLeScanner();
+        return isEnabled() && com.macapk.loader.BluetoothBridge.authorization() == 3
+            ? new android.bluetooth.le.BluetoothLeScanner() : null;
     }
 
     /**
-     * Null, matching getBluetoothLeScanner() above: there is no Bluetooth
-     * bridge, so there is no advertiser. AOSP returns null here whenever the
-     * adapter is off or the controller cannot advertise, so callers already
-     * handle it -- and a non-null advertiser would let an app believe it had
-     * started broadcasting.
+     * A live advertiser is exposed only after macOS grants Bluetooth access
+     * and the radio is enabled. Starting it still reports the host's result.
      */
     public android.bluetooth.le.BluetoothLeAdvertiser getBluetoothLeAdvertiser() {
-        return null;
+        return isEnabled() && com.macapk.loader.BluetoothBridge.authorization() == 3
+            ? com.macapk.loader.BluetoothPeripheralBridge.createAdvertiser() : null;
     }
 
-    public boolean isMultipleAdvertisementSupported() { return false; }
+    public boolean isMultipleAdvertisementSupported() {
+        return com.macapk.loader.BluetoothPeripheralBridge.supportsLegacyAdvertising();
+    }
     public boolean isLeExtendedAdvertisingSupported() { return false; }
     public boolean isLePeriodicAdvertisingSupported() { return false; }
     public boolean isOffloadedScanBatchingSupported() { return false; }

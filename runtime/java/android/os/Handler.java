@@ -107,7 +107,8 @@ public class Handler {
      *      }
      *
      *  On the app's GLThread (a renderer callback, Looper.macapkOnGlRendererThread)
-     *  that is exactly what we do. Everywhere else we still bind the MAIN
+     *  that is exactly what we do. On a thread that called Looper.prepare() we
+     *  bind its own Looper, as AOSP does. Everywhere else we still bind the MAIN
      *  looper, as before: our other threads do not yet carry AOSP's Looper
      *  identities, and making this strict there is a separate change
      *  (docs/gl-thread-has-no-looper_2026-10-01.md, OPEN). Public (hidden) so
@@ -118,6 +119,15 @@ public class Handler {
             macapkRequireLooperOnGlThread();
             return Looper.myLooper();
         }
+        // A thread that called Looper.prepare() owns a queue, and AOSP binds
+        // the implicit Handler to it (Handler.java:224, mLooper =
+        // Looper.myLooper()). Binding MAIN here split such a worker in two:
+        // Unity's UnityMain prepares a Looper, builds `new Handler(Callback)`
+        // and puts its render-driving IdleHandler on Looper.myQueue(), so the
+        // handler's messages ran on the UI queue while the idle handler sat on
+        // UnityMain's, and the game never rendered (issue #98, CN Genshin).
+        Looper own = Looper.macapkPreparedLooper();
+        if (own != null) return own;
         return Looper.getMainLooper();
     }
 

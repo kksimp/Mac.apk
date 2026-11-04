@@ -45,6 +45,9 @@ public class LocalizedNumberFormatter
             if (mMinIntegerDigits != null) {
                 df.setMinimumIntegerDigits(mMinIntegerDigits);
             }
+            if (mRoundingMode != null) {
+                df.setRoundingMode(mRoundingMode);
+            }
             if (mPrecision != null) {
                 mPrecision.applyTo(df);
                 if (mPrecision instanceof Precision.SignificantDigits) {

@@ -782,13 +782,24 @@ public final class WindowOverlayStack {
         if (outline.mMode == android.graphics.Outline.MODE_ROUND_RECT && !outline.mRect.isEmpty()) {
             r.set(outline.mRect);
             radius = Math.max(0f, outline.mRadius);
+        } else if (outline.mMode == android.graphics.Outline.MODE_PATH && outline.mPath != null
+                && !Float.isNaN(outline.macapkPathShadowRadius)) {
+            // A rect with mixed corner radii (GradientDrawable's radius array, a
+            // usual popup-menu background): cast the round rect of its bounds and
+            // its largest corner radius, which lies inside the shape, so the
+            // shadow never shows outside a rounded corner.
+            final android.graphics.RectF pb = new android.graphics.RectF();
+            outline.mPath.computeBounds(pb, true);
+            r.set(Math.round(pb.left), Math.round(pb.top), Math.round(pb.right), Math.round(pb.bottom));
+            if (r.isEmpty()) return;
+            radius = Math.max(0f, outline.macapkPathShadowRadius);
         } else {
-            // EMPTY casts nothing (AOSP too). A convex PATH (a shape with mixed
-            // corners) is skipped rather than approximated: a square shadow under
-            // a rounded panel would show dark corners outside it, and the M12
-            // rule is to under-shadow rather than paint a box. Every dialog
-            // background in the corpus census is a round rect (GradientDrawable
-            // with a uniform radius, MaterialShapeDrawable's isRoundRect()).
+            // EMPTY casts nothing (AOSP too). Any other convex PATH is skipped
+            // rather than approximated: a square shadow under a rounded panel
+            // would show dark corners outside it, and the M12 rule is to
+            // under-shadow rather than paint a box. Every dialog background in
+            // the corpus census is a round rect (GradientDrawable with a uniform
+            // radius, MaterialShapeDrawable's isRoundRect()).
             return;
         }
         final float alpha = Math.max(0f, Math.min(1f, outline.mAlpha))

@@ -302,6 +302,67 @@ final class MethodSplitter {
     // plan only a part OVER the ceiling is spilled, and every part that fits
     // keeps its parameters.
 
+    /**
+     * DEX2JVM_CTOR_RESCUE (default ON; =0 restores the argument-slot refusal
+     * for constructors, byte for byte, and the method is stubbed as before).
+     *
+     * A part of a split &lt;init&gt; whose live set does not fit JVMS 4.3.3's
+     * 255 argument slots receives its values through private transient
+     * synthetic INSTANCE fields of the object under construction. See "THE
+     * &lt;init&gt; SPILL" below.
+     */
+    static final boolean CTOR_SPILL =
+            !"0".equals(System.getenv("DEX2JVM_CTOR_RESCUE"));
+
+    // THE <init> SPILL
+    //
+    // The same wall stands in front of constructors. R8 keeps a value it uses
+    // more than once in ONE register for the whole method, so a long generated
+    // constructor that fills several collections from a shared pool of boxed
+    // keys and values has hundreds of registers live at every point. Measured
+    // on WhatsApp 2.26.42.71's X/08W.<init>()V (391 registers, 27,940 code
+    // units, 71,858 bytes of bytecode, no branch, no try, no monitor): super()
+    // first, then five ImmutableMap builders filled with ~2,600 put() calls
+    // whose Integer/Boolean/String operands sit in registers. Every plan needed
+    // 259..341 argument slots, the stub replaced the constructor, and the app
+    // died in Application.onCreate on `new X/08W()`.
+    //
+    // Static fields would be wrong here -- constructors run concurrently on
+    // many threads and nest -- but the object under construction is a carrier
+    // that has none of those problems:
+    //   - a constructor runs exactly once per object, and a cut can only sit
+    //     after super() (rule 6), so the object is initialized wherever a part
+    //     is entered and nothing else ever constructs it again;
+    //   - two threads, or a nested `new` of the same class inside the
+    //     constructor, construct DIFFERENT objects, so their fields never mix;
+    //   - a portal writes the fields of the one part it calls immediately
+    //     before the call, and that part's entry stub reads them first thing,
+    //     so no code -- not even app code reached through the receiver --
+    //     runs between the write and the read;
+    //   - a field is typed with exactly the parameter's descriptor, so
+    //     putfield/getfield move the value with NO cast (the header's no-cast
+    //     rule holds, for the same reason it does for the <clinit> spill), and
+    //     a reference field is nulled by the entry that reads it, so the object
+    //     does not keep alive what the original method let die.
+    // The fields are private, TRANSIENT and synthetic: Java serialization and
+    // the default serialVersionUID both ignore private transient fields, and
+    // so do the reflection-based mappers that skip transient fields.
+    //
+    // To reach those fields every part of such a chain takes the object under
+    // construction as an extra FIRST argument (slot 0, `receiver`), ahead of
+    // the entry id. Part 0 is the constructor itself, whose JVM local 0 is
+    // `this` and is never written by the body (register slots start above the
+    // arguments), so a portal anywhere after super() can always push it; a
+    // part receives it in slot 0 and keeps it there, because its register
+    // slots start at the ORIGINAL method's argument count, which is at least
+    // one for a constructor. Parts that fit keep their parameters, now after
+    // the receiver and the id.
+    //
+    // Like the <clinit> spill this is a last resort: it runs only after the
+    // parameter-only ladder failed with this ceiling among its refusals, so a
+    // constructor any earlier plan placed is translated byte for byte as
+    // before.
+
     /** The LAST valid cut whose distance from `startBytes` is within `bound`,
      *  or -1. Factored out so the widened second attempt cannot drift from the
      *  first: both passes must apply identical validity rules and differ only
@@ -354,6 +415,38 @@ final class MethodSplitter {
      *  runs on min(cores,8) threads, so this is ThreadLocal for the same reason
      *  LAST_ENTRY_FAILURE is. */
     private static final ThreadLocal<String> CURRENT_METHOD = new ThreadLocal<>();
+
+    /**
+     * DEX2JVM_SPLIT_CLONE_HANDLERS (default ON; =0 never clones): when a plan
+     * finds NO valid cut, plan again with small TERMINAL handlers cloned into
+     * every part whose ranges use them, instead of pinning every such range
+     * into the handler's part. See cloneableHandlers().
+     *
+     * WHY. Rule (2) keeps a try range and its handlers in one part, which is
+     * the right rule for a handler that continues into the body. But R8
+     * merges identical handlers, and a Litho/Compose-style `finally` (end a
+     * trace section, pop a scope, rethrow) becomes ONE three-instruction
+     * handler shared by ranges spread over the whole method. Measured on
+     * WhatsApp's X/435.A0y (19,623 code units, 67,463 bytes): 105 of its 118
+     * ranges share `move-exception v1; invoke-virtual {v0} X/5ds.A08;
+     * throw v1` at 0x4aea, 97% of the way down, so the spans of rule (2)
+     * covered the method and the splitter reported "no valid cut". A handler
+     * that ends in throw or return, and that nothing enters except the
+     * exception edge, has no successor in the body; a copy of it in each part
+     * behaves exactly like the original, so the shared handler stops being a
+     * reason to keep the ranges together.
+     *
+     * Armed only after that refusal, so every plan this file produced before
+     * is produced unchanged.
+     */
+    static final boolean CLONE_HANDLERS =
+            !"0".equals(System.getenv("DEX2JVM_SPLIT_CLONE_HANDLERS"));
+
+    /** Longest handler block, in instructions, worth copying into a part. */
+    private static final int MAX_CLONE_INSNS = 8;
+
+    /** Set by the "no valid cut" refusal: the one refusal cloning can cure. */
+    private static final ThreadLocal<Boolean> NO_CUT = new ThreadLocal<>();
 
     /** Set when the refusal depends on WHERE THE CUTS LANDED, so a different
      *  budget would produce a different plan and is worth trying.
@@ -471,8 +564,15 @@ final class MethodSplitter {
         /** Argument slots including the leading entry id. */
         int argSlots;
         /** True when {@link #params} travel through static fields rather than
-         *  arguments; the descriptor is then just the entry id. See CLINIT_SPILL. */
+         *  arguments; the descriptor is then just the entry id. See CLINIT_SPILL.
+         *  With {@link #receiver}, through instance fields of the receiver
+         *  instead, and the descriptor is the receiver and the entry id. */
         boolean spilled;
+        /** True when the part takes the object under construction as its
+         *  first argument (slot 0) and the entry id as its second. Set on every
+         *  part of a plan whose spill fields are instance fields (THE
+         *  &lt;init&gt; SPILL). */
+        boolean receiver;
 
         Part(int index, int startOffset, String name) {
             this.index = index;
@@ -490,11 +590,25 @@ final class MethodSplitter {
          *  unless a part is spilled. */
         private final List<String[]> spillFields;
 
+        /** Handler offset -> its block's DEX offsets, for each handler copied
+         *  into the parts whose ranges use it. Empty unless the plan needed it. */
+        private final Map<Integer, int[]> cloneBlocks;
+        /** Any offset inside a cloned block -> that block's handler offset. */
+        private final Map<Integer, Integer> cloneBlockOf = new HashMap<>();
+
         Plan(List<Part> parts) { this(parts, java.util.Collections.emptyList()); }
 
         Plan(List<Part> parts, List<String[]> spillFields) {
+            this(parts, spillFields, java.util.Collections.<Integer, int[]>emptyMap());
+        }
+
+        Plan(List<Part> parts, List<String[]> spillFields, Map<Integer, int[]> cloneBlocks) {
             this.parts = parts;
             this.spillFields = spillFields;
+            this.cloneBlocks = cloneBlocks;
+            for (Map.Entry<Integer, int[]> e : cloneBlocks.entrySet()) {
+                for (int o : e.getValue()) cloneBlockOf.put(o, e.getKey());
+            }
             this.starts = new int[parts.size()];
             for (int i = 0; i < parts.size(); i++) {
                 starts[i] = parts.get(i).startOffset;
@@ -504,9 +618,24 @@ final class MethodSplitter {
 
         List<Part> parts() { return parts; }
 
-        /** The static fields a spilled part's values travel through, as
-         *  {name, descriptor}, for the translator to declare on the class. */
+        /** The DEX offsets of a cloned handler's block, or null when the
+         *  handler at {@code handlerOffset} is not cloned. */
+        int[] cloneBlock(int handlerOffset) { return cloneBlocks.get(handlerOffset); }
+
+        /** The cloned handler whose block contains {@code dexOffset}, or null. */
+        Integer clonedHandlerContaining(int dexOffset) { return cloneBlockOf.get(dexOffset); }
+
+        /** The fields a spilled part's values travel through, as
+         *  {name, descriptor}, for the translator to declare on the class:
+         *  static fields, or instance fields when {@link #instanceSpill}. */
         List<String[]> spillFields() { return spillFields; }
+
+        /** True when the spill fields are instance fields of the object under
+         *  construction and every part takes it as its first argument (THE
+         *  &lt;init&gt; SPILL). */
+        boolean instanceSpill() {
+            return parts.size() > 1 && parts.get(1).receiver;
+        }
 
         /** Which part a DEX offset belongs to. Parts partition the offset space
          *  into ascending half-open ranges, so this is a plain bucket search and
@@ -560,6 +689,11 @@ final class MethodSplitter {
      *                    an interface's.
      * @param takenFields field names already on the class, so a spill field
      *                    cannot collide
+     * @param receiverDescriptor with {@code spillAllowed}: the descriptor of
+     *                    the object under construction, whose INSTANCE fields
+     *                    the spill uses and which every part then takes as its
+     *                    first argument (THE &lt;init&gt; SPILL); null for the
+     *                    static-field spill of a &lt;clinit&gt;
      */
     static Plan compute(List<TypeInference.Insn> norm,
                         TypeInference.Result types,
@@ -575,8 +709,44 @@ final class MethodSplitter {
                         Set<String> taken,
                         String methodTag,
                         boolean spillAllowed,
-                        Set<String> takenFields) {
+                        Set<String> takenFields,
+                        String receiverDescriptor) {
+        NO_CUT.set(Boolean.FALSE);
+        Plan p = computeOnce(norm, types, locals, tries, deferredNew, thisUninit, bytecodeOf,
+                totalBytes, targetBytes, allowWiden, returnDescriptor, taken, methodTag,
+                spillAllowed, takenFields, receiverDescriptor, false);
+        if (p != null || !CLONE_HANDLERS || !Boolean.TRUE.equals(NO_CUT.get())) return p;
+        if (DEBUG) {
+            System.err.println("[dex-split] " + methodTag
+                    + ": replanning with terminal handlers cloned per part");
+        }
+        NO_CUT.set(Boolean.FALSE);
+        return computeOnce(norm, types, locals, tries, deferredNew, thisUninit, bytecodeOf,
+                totalBytes, targetBytes, allowWiden, returnDescriptor, taken, methodTag,
+                spillAllowed, takenFields, receiverDescriptor, true);
+    }
+
+    private static Plan computeOnce(List<TypeInference.Insn> norm,
+                        TypeInference.Result types,
+                        Translator.Locals locals,
+                        List<TypeInference.TryBlock> tries,
+                        Map<Integer, Integer> deferredNew,
+                        Set<Integer> thisUninit,
+                        java.util.function.IntUnaryOperator bytecodeOf,
+                        int totalBytes,
+                        int targetBytes,
+                        boolean allowWiden,
+                        String returnDescriptor,
+                        Set<String> taken,
+                        String methodTag,
+                        boolean spillAllowed,
+                        Set<String> takenFields,
+                        String receiverDescriptor,
+                        boolean cloning) {
         CURRENT_METHOD.set(methodTag);
+        // THE <init> SPILL: only together with the spill itself, so every
+        // plan this file produced before is produced unchanged.
+        final String receiver = spillAllowed && CTOR_SPILL ? receiverDescriptor : null;
         RETRY_WORTHWHILE.set(Boolean.FALSE);
         LAST_SLOT_DEMAND.set(0);
         final int n = norm.size();
@@ -609,7 +779,14 @@ final class MethodSplitter {
         for (int i = n - 1; i >= 0; i--) sufMin[i] = Math.min(sufMin[i + 1], minTo[i]);
 
         // (2) Every try block's covered range AND its handlers, as an index span
-        // that must not be straddled.
+        // that must not be straddled -- except a handler that is CLONED into
+        // each part that needs it (only on the replan; see CLONE_HANDLERS),
+        // whose own block is kept whole instead.
+        Map<Integer, int[]> clones = cloning
+                ? cloneableHandlers(norm, types, tries, off, indexOf, resolve, deferredNew,
+                                    thisUninit)
+                : java.util.Collections.<Integer, int[]>emptyMap();
+        if (cloning && clones.isEmpty()) return refuse("no handler can be cloned");
         List<int[]> spans = new ArrayList<>();
         for (TypeInference.TryBlock t : tries) {
             int lo = Integer.MAX_VALUE, hi = -1;
@@ -619,11 +796,16 @@ final class MethodSplitter {
                 }
             }
             for (TypeInference.Catch c : t.catches) {
+                if (clones.containsKey(c.handlerOffset)) continue;
                 Integer x = indexOf.get(c.handlerOffset);
                 if (x == null) continue;
                 lo = Math.min(lo, x); hi = Math.max(hi, x);
             }
             if (hi >= 0) spans.add(new int[]{ lo, hi });
+        }
+        for (int[] block : clones.values()) {
+            Integer a = indexOf.get(block[0]), b = indexOf.get(block[block.length - 1]);
+            if (a != null && b != null) spans.add(new int[]{ a, b });
         }
 
         // (5) MONITORS. JVMS 2.11.10 structured locking is defined PER METHOD, so
@@ -848,8 +1030,11 @@ final class MethodSplitter {
                         + " (" + (bytecodeOf.applyAsInt(off[pick]) - startBytes) + " bytes)");
                 }
             }
-            if (pick < 0) return refuse("no valid cut within %d bytes of index %d",
-                                       allowWiden ? hardCeil : targetBytes, startIdx);
+            if (pick < 0) {
+                NO_CUT.set(Boolean.TRUE);
+                return refuse("no valid cut within %d bytes of index %d",
+                              allowWiden ? hardCeil : targetBytes, startIdx);
+            }
             cuts.add(pick);
             startIdx = pick;
             if (cuts.size() > 64) return refuse("more than 64 parts");
@@ -910,6 +1095,7 @@ final class MethodSplitter {
         Set<String> usedFields = new HashSet<>(takenFields);
         for (int k = 1; k < parts.size(); k++) {
             Part part = parts.get(k);
+            part.receiver = receiver != null;
             Map<String, Param> union = new LinkedHashMap<>();
             int id = 0;
             for (int t : entryOffsets.get(k)) {
@@ -929,23 +1115,34 @@ final class MethodSplitter {
             ps.sort(Comparator.<Param>comparingInt(p -> p.slot)
                               .thenComparingInt(p -> p.scalar)
                               .thenComparing(p -> p.descriptor));
-            int slot = 1;   // slot 0 is the entry id
-            StringBuilder desc = new StringBuilder("(I");
+            // Slot 0 is the entry id -- or, with a receiver, the object under
+            // construction, and the entry id is slot 1.
+            String head = part.receiver ? "(" + receiver + "I" : "(I";
+            int slot = part.receiver ? 2 : 1;
+            StringBuilder desc = new StringBuilder(head);
             for (Param p : ps) {
                 p.scratchSlot = slot;      // provisional; rebased in the emitter
                 slot += p.width();
                 desc.append(p.descriptor);
             }
-            if (slot > MAX_PARAM_SLOTS && spillAllowed && CLINIT_SPILL) {
+            boolean spillable = spillAllowed && (part.receiver || CLINIT_SPILL);
+            if (slot > MAX_PARAM_SLOTS && spillable) {
                 // The live set is wider than any descriptor can be: hand it over
-                // through fields instead. See THE ARGUMENT-SLOT WALL above.
+                // through fields instead. See THE ARGUMENT-SLOT WALL above, and
+                // THE <init> SPILL for the instance-field flavour. An instance
+                // field's name carries the method tag: a class's constructors
+                // all spill into the same object, and two overloads must not
+                // pick one name.
+                String base = part.receiver
+                        ? Options.syntheticPrefix + "$spill$" + methodTag + "$"
+                        : Options.syntheticPrefix + "$spill$";
                 for (Param p : ps) {
                     p.scratchSlot = -1;
                     String name = spillNameByKey.get(p.key());
                     if (name == null) {
-                        name = Options.syntheticPrefix + "$spill$" + spillNameByKey.size();
+                        name = base + spillNameByKey.size();
                         for (int d = 1; usedFields.contains(name); d++) {
-                            name = Options.syntheticPrefix + "$spill$" + spillNameByKey.size() + "_" + d;
+                            name = base + spillNameByKey.size() + "_" + d;
                         }
                         usedFields.add(name);
                         spillNameByKey.put(p.key(), name);
@@ -955,12 +1152,12 @@ final class MethodSplitter {
                 }
                 part.spilled = true;
                 part.params.addAll(ps);
-                part.argSlots = 1;
-                part.descriptor = "(I)" + returnDescriptor;
+                part.argSlots = part.receiver ? 2 : 1;
+                part.descriptor = head + ")" + returnDescriptor;
                 if (DEBUG) {
                     System.err.println("[dex-split] " + methodTag + ": part " + k
                         + " needs " + slot + " argument slots; spilled " + ps.size()
-                        + " values to static fields");
+                        + " values to " + (part.receiver ? "instance" : "static") + " fields");
                 }
                 continue;
             }
@@ -983,7 +1180,141 @@ final class MethodSplitter {
             }
             System.err.println(sb);
         }
-        return new Plan(parts, spillFields);
+        if (DEBUG && !clones.isEmpty()) {
+            System.err.println("[dex-split] " + methodTag + ": " + clones.size()
+                + " terminal handler(s) cloned per part: " + hexKeys(clones));
+        }
+        return new Plan(parts, spillFields, clones);
+    }
+
+    private static String hexKeys(Map<Integer, int[]> m) {
+        StringBuilder b = new StringBuilder();
+        for (int k : new TreeSet<>(m.keySet())) {
+            if (b.length() > 0) b.append(',');
+            b.append("0x").append(Integer.toHexString(k));
+        }
+        return b.toString();
+    }
+
+    /**
+     * Handler offset -> the DEX offsets of its block, for every handler whose
+     * code may be COPIED into each part that has a range using it.
+     *
+     * All of it checked:
+     *   - it starts with move-exception (the copy consumes the exception the
+     *     JVM pushes, exactly like the original; Translator's handler-stub
+     *     path is never cloned);
+     *   - it is a straight line of at most MAX_CLONE_INSNS reachable
+     *     instructions ending in throw or return: no successor in the body, so
+     *     where the copy sits cannot change what runs after it;
+     *   - nothing enters it but the exception edge: no instruction of it is a
+     *     branch or switch target, the instruction before it does not fall
+     *     through into it, and no other handler starts inside it;
+     *   - no instruction of it is covered by a try range (the copy would need
+     *     handlers of its own), sits in a deferred-new window, or is of a
+     *     family outside cloneSafe (no monitors, no allocation, no
+     *     invoke-direct/super, no invoke-custom/polymorphic);
+     *   - its entry state holds no uninitialized reference and `this` is
+     *     initialized there: a frame naming uninitialized(N) points at a `new`
+     *     by bytecode offset, which means nothing in another part.
+     * The copy reads only what the original reads, and those values reach
+     * every covered instruction already: computeLiveness gives each covered
+     * instruction the handler's live-in, so a part's parameters include them.
+     */
+    private static Map<Integer, int[]> cloneableHandlers(List<TypeInference.Insn> norm,
+                                                         TypeInference.Result types,
+                                                         List<TypeInference.TryBlock> tries,
+                                                         int[] off, Map<Integer, Integer> indexOf,
+                                                         Resolver resolve,
+                                                         Map<Integer, Integer> deferredNew,
+                                                         Set<Integer> thisUninit) {
+        Map<Integer, int[]> out = new java.util.TreeMap<>();
+        final int n = norm.size();
+        Set<Integer> handlers = new TreeSet<>();
+        for (TypeInference.TryBlock t : tries) {
+            for (TypeInference.Catch c : t.catches) handlers.add(c.handlerOffset);
+        }
+        if (handlers.isEmpty()) return out;
+        java.util.BitSet inTry = new java.util.BitSet();
+        for (TypeInference.TryBlock t : tries) {
+            if (t.endOffset > t.startOffset) inTry.set(t.startOffset, t.endOffset);
+        }
+        // Indices reached by an edge that is not plain fall-through.
+        java.util.BitSet jumpedTo = new java.util.BitSet(n);
+        for (int i = 0; i < n; i++) {
+            if (!types.isReachable(off[i])) continue;
+            for (int s : successors(norm.get(i))) {
+                if (s == norm.get(i).nextOffset) continue;
+                int si = resolve.indexAtOrAfter(s);
+                if (si >= 0) jumpedTo.set(si);
+            }
+        }
+        candidates:
+        for (int h : handlers) {
+            Integer hi = indexOf.get(h);
+            if (hi == null || !types.isReachable(h)) continue;
+            if ((norm.get(hi).opcode & 0xFF) != 0x0d) continue;          // move-exception
+            if (thisUninit != null && thisUninit.contains(h)) continue;
+            if (hi > 0 && types.isReachable(off[hi - 1])) {
+                for (int s : successors(norm.get(hi - 1))) {
+                    if (resolve.indexAtOrAfter(s) == hi) continue candidates;   // falls into it
+                }
+            }
+            RegisterState st = types.entryState(h);
+            if (st == null) continue;
+            for (int r = 0; r < st.size(); r++) {
+                DexType t = st.get(r);
+                if (t == null || t.isDead() || (t.scalar() & DexType.OBJ) == 0) continue;
+                DexType.Ref ref = t.ref();
+                if (ref != null && (ref.kind == DexType.Ref.KIND_UNINIT
+                                 || ref.kind == DexType.Ref.KIND_UNINIT_THIS)) continue candidates;
+            }
+            List<Integer> block = new ArrayList<>();
+            for (int k = hi; k < n && k < hi + MAX_CLONE_INSNS; k++) {
+                TypeInference.Insn in = norm.get(k);
+                if (!types.isReachable(in.offset) || jumpedTo.get(k)) continue candidates;
+                if (k > hi && handlers.contains(in.offset)) continue candidates;
+                int nextSet = inTry.nextSetBit(in.offset);
+                if (nextSet >= 0 && nextSet < Math.max(in.nextOffset, in.offset + 1)) {
+                    continue candidates;
+                }
+                if (insideDeferredNew(in.offset, deferredNew)) continue candidates;
+                int fam = TypeInference.familyOf(in.opcode);
+                if (!cloneSafe(fam)) continue candidates;
+                block.add(in.offset);
+                if (fam == TypeInference.F_THROW || fam == TypeInference.F_RETURN) {
+                    int[] b = new int[block.size()];
+                    for (int j = 0; j < b.length; j++) b[j] = block.get(j);
+                    out.put(h, b);
+                    continue candidates;
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Families a handler copy may contain: straight-line, no allocation, no
+     *  monitor, no constructor call, nothing that needs a label of its own. */
+    private static boolean cloneSafe(int family) {
+        switch (family) {
+            case TypeInference.F_MOVE: case TypeInference.F_MOVE_WIDE:
+            case TypeInference.F_MOVE_RESULT:
+            case TypeInference.F_CONST32: case TypeInference.F_CONST64:
+            case TypeInference.F_CONST_STRING: case TypeInference.F_CONST_CLASS:
+            case TypeInference.F_CHECK_CAST: case TypeInference.F_INSTANCE_OF:
+            case TypeInference.F_ARRAY_LEN: case TypeInference.F_CMP:
+            case TypeInference.F_ARRAY_GET: case TypeInference.F_ARRAY_PUT:
+            case TypeInference.F_INSTANCE_GET: case TypeInference.F_INSTANCE_PUT:
+            case TypeInference.F_STATIC_GET: case TypeInference.F_STATIC_PUT:
+            case TypeInference.F_INVOKE_VIRTUAL: case TypeInference.F_INVOKE_STATIC:
+            case TypeInference.F_INVOKE_INTERFACE:
+            case TypeInference.F_UNARY_OP: case TypeInference.F_BINARY_OP:
+            case TypeInference.F_BINARY_OP_CONST:
+            case TypeInference.F_THROW: case TypeInference.F_RETURN:
+                return true;
+            default:
+                return false;
+        }
     }
 
     /** Maps an edge target to the index of the instruction that receives control. */

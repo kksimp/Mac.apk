@@ -39,7 +39,10 @@ public class Application extends ContextWrapper
         implements android.content.ComponentCallbacks2 {
     private static Application sInstance;
 
-    private String packageName = "com.macapk.unknown";
+    /** The sentinel a secondary Application/Context carries when the loader
+     *  never ran macapkInit on it (see macapkResolvePackageName). */
+    static final String UNKNOWN_PACKAGE = "com.macapk.unknown";
+    private String packageName = UNKNOWN_PACKAGE;
     private File   filesDir;
     private File   cacheDir;
     private AssetManager assets;
@@ -89,7 +92,26 @@ public class Application extends ContextWrapper
 
     public Application() {
         super(null);
-        sInstance = this;
+        // Track the process's PRIMARY Application, never a secondary one the app
+        // itself constructs. AOSP keeps exactly one process Application in
+        // ActivityThread.mInitialApplication (makeApplicationInner), and an
+        // Application object app code `new`s afterward is a plain object that
+        // never becomes "the application". GMS's Chimera framework constructs a
+        // ModuleApplication per loaded module (com.google.android.gms.chimera
+        // .modules.*.ModuleApplication); each one used to clobber sInstance with
+        // an instance Mac.apk never attached -- default packageName
+        // "com.macapk.unknown", EMPTY serviceMap/providerMap -- so every
+        // Application.getInstance() after a module loaded returned an empty app.
+        // That broke service resolution: ServiceRegistry.resolveImplicit ->
+        // getInstance().getPackageManager().queryIntentServices returned 0 for a
+        // GMS-package action (e.g. com.google.android.gms.droidguard.service.START),
+        // so bindService answered false and GMS's own DroidGuard client logged
+        // "unable to connect to service". The primary is constructed first
+        // (makeApplicationInner, before any module loads) and is also pinned
+        // authoritatively by ActivityThread.handleBindApplication via
+        // macapkSetProcessApplication, so "first wins" here is the belt to that
+        // method's suspenders.
+        if (sInstance == null) sInstance = this;
         // AOSP: an Application's base Context is a real ContextImpl -- which is
         // NOT a ContextWrapper and is never null (ActivityThread builds it via
         // ContextImpl.createAppContext, then Application.attach() installs it).
@@ -164,7 +186,7 @@ public class Application extends ContextWrapper
         private final Application app;
         AppBaseContext(Application app) { this.app = app; }
         // The 8 abstract getters + close kin, served from the app's fields.
-        @Override public String getPackageName()            { return app.packageName; }
+        @Override public String getPackageName()            { return macapkResolvePackageName(app.packageName); }
         @Override public Resources getResources()           { return app.resources; }
         @Override public Resources getResourcesDirect()     { return app.resources; }
         @Override public AssetManager getAssets()           { return app.assets; }
@@ -173,7 +195,7 @@ public class Application extends ContextWrapper
             return app.classLoader != null ? app.classLoader
                                            : Thread.currentThread().getContextClassLoader();
         }
-        @Override public File getFilesDir()                 { return app.filesDir != null ? app.filesDir : new File("."); }
+        @Override public File getFilesDir()                 { return macapkFilesDirFor(app); }
         @Override public File getCacheDir()                 { return app.cacheDir != null ? app.cacheDir : new File("."); }
         @Override public File getDir(String name, int mode) { File d = new File(getDataDir(), "app_" + name); d.mkdirs(); return d; }
         // v1.0.1586: the SAME answer the Application gives (ApplicationInfo.
@@ -363,14 +385,17 @@ public class Application extends ContextWrapper
      * Per AOSP frameworks/base Application.java, this is a STATIC method
      * that returns the name of the current process. The default process
      * name equals the package name; android:process="..." manifest
-     * entries produce ":suffix" forms which Mac.apk does not split.
+     * entries produce ":suffix" forms, which the system broker runs as their
+     * own processes (com.macapk.loader.SystemServer) when it is enabled.
      * Google Calculator's CalculatorApplication.onCreate calls this
      * during boot -- absent, it threw NoSuchMethodError after the
      * isIsolated stub let it past the first wall (v1.0.42).
      */
     public static String getProcessName() {
-        Application app = sInstance;
-        return (app != null) ? app.packageName : "com.macapk.host";
+        // The process is bound BEFORE the Application constructor runs. Its
+        // Context/package fields are populated later and cannot name a process
+        // for subclass field initializers (AOSP delegates to ActivityThread).
+        return ActivityThread.currentProcessName();
     }
 
     /** Application-scope <meta-data android:name="..." android:value=
@@ -439,6 +464,18 @@ public class Application extends ContextWrapper
     public File   getMacApkNativeLibDir(){ return nativeLibraryDir; }
 
     public static Application getInstance() { return sInstance; }
+
+    /** Pin the process's PRIMARY Application authoritatively, the one
+     *  ActivityThread.makeApplicationInner created (AOSP's mInitialApplication).
+     *  Called from ActivityThread.handleBindApplication right after the primary
+     *  is made. The constructor's "first wins" already sets it in the normal
+     *  path (the primary is constructed before any Chimera ModuleApplication);
+     *  this makes the primary win even if some Application were constructed
+     *  before it, and documents that sInstance is the process app, never a
+     *  module's. Idempotent and null-safe. */
+    public static void macapkSetProcessApplication(Application app) {
+        if (app != null) sInstance = app;
+    }
 
     /** THE canonical read of the APP's OWN declared targetSdkVersion, for the
      *  compat gates that have no Context to ask (android.os.AsyncTask,
@@ -591,12 +628,32 @@ public class Application extends ContextWrapper
             "ActivityLifecycleCallbacks." + phase + " threw in "
             + (cb == null ? "null" : cb.getClass().getName()) + ": " + t);
     }
+    // AOSP Activity.performCreate dispatches these in THREE phases around the
+    // activity's own onCreate: dispatchActivityPreCreated (the first line of
+    // performCreate, BEFORE onCreate), then onCreate, then
+    // dispatchActivityPostCreated (the last line, AFTER onCreate); the plain
+    // onActivityCreated fires between the body and post. Keeping them as three
+    // methods lets ActivityHost place PreCreated ahead of onCreate, which an app
+    // relies on to stamp per-activity state its own onCreate then reads. (The
+    // Play Store's ActivityLifecycleCallbacks stamps the activity's creation
+    // Instant in onActivityPreCreated; MainActivity.onCreate then computes
+    // Duration.between(thatInstant, now) and NPEs if PreCreated ran late.)
+    public void dispatchActivityPreCreated(Activity a, Bundle b) {
+        ActivityLifecycleCallbacks[] cbs = snapshotLifecycleCallbacks();
+        lcTrace("preCreated", cbs);
+        if (cbs == null) return;
+        for (ActivityLifecycleCallbacks cb : cbs) { try { cb.onActivityPreCreated(a, b); } catch (Throwable t) { lcThrew("onActivityPreCreated", cb, t); } }
+    }
     public void dispatchActivityCreated(Activity a, Bundle b) {
         ActivityLifecycleCallbacks[] cbs = snapshotLifecycleCallbacks();
         lcTrace("created", cbs);
         if (cbs == null) return;
-        for (ActivityLifecycleCallbacks cb : cbs) { try { cb.onActivityPreCreated(a, b); } catch (Throwable t) { lcThrew("onActivityPreCreated", cb, t); } }
         for (ActivityLifecycleCallbacks cb : cbs) { try { cb.onActivityCreated(a, b); } catch (Throwable t) { lcThrew("onActivityCreated", cb, t); } }
+    }
+    public void dispatchActivityPostCreated(Activity a, Bundle b) {
+        ActivityLifecycleCallbacks[] cbs = snapshotLifecycleCallbacks();
+        lcTrace("postCreated", cbs);
+        if (cbs == null) return;
         for (ActivityLifecycleCallbacks cb : cbs) { try { cb.onActivityPostCreated(a, b); } catch (Throwable t) { lcThrew("onActivityPostCreated", cb, t); } }
     }
     public void dispatchActivityStarted(Activity a) {
@@ -763,9 +820,66 @@ public class Application extends ContextWrapper
         default void onActivityPostDestroyed(Activity activity) {}
     }
 
-    @Override public String getPackageName()     { return packageName; }
-    @Override public Resources getResources()    { return resources; }
-    @Override public AssetManager getAssets()    { return assets; }
+    /** The package name a Context in this process should report. On a device
+     *  every Context in a process reports that process's package; a secondary
+     *  Application the app -- or GMS's Chimera framework -- constructs and
+     *  attaches itself is never run through macapkInit, so its own packageName
+     *  field keeps the UNKNOWN_PACKAGE sentinel. GMS's GmsCoreVersionCodeProvider
+     *  (bnmh) and its auth-request builder (bqjy.<init>) call getPackageName() on
+     *  exactly such a context and then sign the token request with the result;
+     *  the sentinel then fails GMS's own consumer-package signature check
+     *  (alba.e -> "Invalid package signature for app=com.macapk.unknown") and
+     *  every getToken returns BAD_AUTHENTICATION (AUTH_SECURITY_ERROR). Resolve
+     *  the sentinel to the bound process package so a secondary context answers
+     *  the way a device does. Faithful: real Android has no "unknown" package in
+     *  a live process. Returns the sentinel unchanged only if the process package
+     *  is not yet known (very early boot), preserving prior behaviour there. */
+    static String macapkResolvePackageName(String pn) {
+        if (pn != null && !UNKNOWN_PACKAGE.equals(pn)) return pn;
+        String proc = com.macapk.loader.Boot.packageName();
+        if (proc != null && !proc.isEmpty()) return proc;
+        Application a = sInstance;
+        if (a != null && a.packageName != null && !UNKNOWN_PACKAGE.equals(a.packageName)) {
+            return a.packageName;
+        }
+        return pn;
+    }
+
+    @Override public String getPackageName()     { return macapkResolvePackageName(packageName); }
+    /** AOSP ContextWrapper.getResources()/getAssets()/getPackageManager() all
+     *  forward to mBase. This Application answers from its own fields (set by
+     *  macapkInit), which is right for the process's bound Application but wrong
+     *  for a SECONDARY Application the app constructs and attaches itself: the
+     *  Tinker-style wrapper pattern (MuteApplicationStub -> tinker MuteApplication
+     *  builds the real MainApplication and calls its attachBaseContext(base)
+     *  reflectively) never runs macapkInit on the delegate, so its fields stay
+     *  null and the delegate's attachBaseContext/onCreate read a null Resources,
+     *  AssetManager and (via the UNKNOWN package) a null PackageInfo -- issue #111,
+     *  and ByteDance's Mira plugin framework then NPEs in
+     *  replaceApplicationRes -> updateAssetManager. Returns the attached base
+     *  Context only when this instance was never initialised and the base is some
+     *  other object, so the bound Application keeps its field reads and a
+     *  base -> app -> base cycle cannot form. */
+    private Context macapkUninitDelegate() {
+        if (resources != null || assets != null) return null;
+        Context b = getBaseContext();
+        if (b == null || b == this) return null;
+        if (b instanceof AppBaseContext && ((AppBaseContext) b).app == this) return null;
+        return b;
+    }
+
+    @Override public Resources getResources() {
+        Resources r = resources;
+        if (r != null) return r;
+        Context d = macapkUninitDelegate();
+        return d != null ? d.getResources() : null;
+    }
+    @Override public AssetManager getAssets() {
+        AssetManager a = assets;
+        if (a != null) return a;
+        Context d = macapkUninitDelegate();
+        return d != null ? d.getAssets() : null;
+    }
     @Override public Context getApplicationContext() { return this; }
 
     // cocos2d-x 2.0/2.1's Cocos2dxActivity.setPackageName (called from the
@@ -820,7 +934,10 @@ public class Application extends ContextWrapper
         } catch (Throwable ignored) {}
         return apkPath != null ? apkPath : "";
     }
-    @Override public PackageManager getPackageManager() { return macapkPackageManagerReal(); }
+    @Override public PackageManager getPackageManager() {
+        Context d = macapkUninitDelegate();
+        return d != null ? d.getPackageManager() : macapkPackageManagerReal();
+    }
     /** The process's one PackageManager, built on first use. Private so the
      *  paths that must not take a virtual hop (macapkApplicationInfoReal,
      *  AppBaseContext) can reach it; an Application subclass that overrides
@@ -902,6 +1019,21 @@ public class Application extends ContextWrapper
             // sourceDir to nativeSetApkPath). The fallback below carries the
             // install paths, which is the part those callers need.
             info = null;
+        }
+        // AOSP never leaves ApplicationInfo.dataDir null, and a null here NPEs a
+        // caller that builds a File from it (Boot.installSystemProviders ->
+        // HostDocumentsProvider.init(new File(ai.dataDir))). The PM record can
+        // come back NON-null but with dataDir == null when reportedDataDir never
+        // reached the PM instance makeAppInfo used -- e.g. the hosted app IS the
+        // Play Store (com.android.vending), whose self-query the PM answers from a
+        // record whose reportedDataDir/constructor dataDir are both unset. The
+        // throw-fallback below covers only the PM == null / threw case, so this
+        // null slipped straight through. macapkDataDir holds the real data dir
+        // Boot published (macapkSetDataDir assigns it unconditionally), so fill
+        // from it, then the code dir -- the same values the fallback below uses.
+        if (info != null && info.dataDir == null) {
+            info.dataDir = macapkDataDir != null ? macapkDataDir.getAbsolutePath()
+                         : appDir != null ? appDir.getAbsolutePath() : null;
         }
         if (info == null) {
             info = new android.content.pm.ApplicationInfo();
@@ -989,7 +1121,25 @@ public class Application extends ContextWrapper
         if (classLoader != null) return classLoader;
         return Thread.currentThread().getContextClassLoader();
     }
-    @Override public File getFilesDir()          { return filesDir != null ? filesDir : new File("."); }
+    @Override public File getFilesDir()          { return macapkFilesDirFor(this); }
+
+    /** A SECONDARY Application the app itself constructs (a GMS Chimera
+     *  ModuleApplication, e.g. com.google.android.gms.chimera.modules.droidguard
+     *  .ModuleApplication) is never attached by Mac.apk, so its filesDir field is
+     *  null and getFilesDir() used to answer "." (the process cwd). On a device
+     *  such a module runs IN the GMS process and shares that process's data dir,
+     *  so its file I/O must land in the PRIMARY app's data dir. Without this,
+     *  DroidGuard's persistent cache (DGPC) resolved getDatabasePath("dg.db") to
+     *  <cwd>/databases/dg.db and failed with SQLITE_CANTOPEN on every attempt,
+     *  because getDataDir / getDatabasePath / open* are all defined in terms of
+     *  getFilesDir(). Fall back to the primary (sInstance, the process app pinned
+     *  by ActivityThread); only "." when there is no primary either. */
+    static File macapkFilesDirFor(Application a) {
+        if (a != null && a.filesDir != null) return a.filesDir;
+        Application p = sInstance;
+        if (p != null && p != a && p.filesDir != null) return p.filesDir;
+        return new File(".");
+    }
     @Override public File getCacheDir()          { return cacheDir != null ? cacheDir : new File("."); }
     @Override public File getDir(String name, int mode) {
         File d = new File(getDataDir(), "app_" + name); d.mkdirs(); return d;
@@ -1013,7 +1163,10 @@ public class Application extends ContextWrapper
      *  StackOverflow (FATAL AppInit1, System.exit(10)) in attachBaseContext, before
      *  the first activity. Same terminator rule as getContentResolver /
      *  getSystemService. The shared prefsCache keeps one object per file. */
-    synchronized SharedPreferences macapkGetSharedPreferencesReal(String name, int mode) {
+    // NOT synchronized on `this` (see getSystemService for the deadlock this
+    // avoids): prefsCache is the only shared state, so lock IT, and a background
+    // getSharedPreferences never blocks on an app holding its own monitor.
+    SharedPreferences macapkGetSharedPreferencesReal(String name, int mode) {
         // AOSP's pre-KitKat null-name compat; the citation is on
         // android.content.Context.getSharedPreferences, which carries the same
         // branch. A no-op for every non-null name and every app at or above 19.
@@ -1024,14 +1177,16 @@ public class Application extends ContextWrapper
                 name = "null";
             }
         }
-        SharedPreferences p = prefsCache.get(name);
-        if (p != null) return p;
-        // Interned by FILE, not by this cache's key: the same file reached
-        // through a raw Context must be the SAME object, or two independent
-        // locks interleave the atomic-write dance and can destroy the data.
-        p = com.macapk.loader.SharedPrefsImpl.macapkGet(this, name);
-        prefsCache.put(name, p);
-        return p;
+        synchronized (prefsCache) {
+            SharedPreferences p = prefsCache.get(name);
+            if (p != null) return p;
+            // Interned by FILE, not by this cache's key: the same file reached
+            // through a raw Context must be the SAME object, or two independent
+            // locks interleave the atomic-write dance and can destroy the data.
+            p = com.macapk.loader.SharedPrefsImpl.macapkGet(this, name);
+            prefsCache.put(name, p);
+            return p;
+        }
     }
 
     /** Cache of system service shims. Apps frequently fetch the same
@@ -1039,12 +1194,24 @@ public class Application extends ContextWrapper
      *  process and we mirror that. */
     private final HashMap<String, Object> systemServices = new HashMap<>();
 
-    @Override public synchronized Object getSystemService(String name) {
-        Object svc = systemServices.get(name);
-        if (svc != null) return svc;
-        svc = createSystemService(name);
-        if (svc != null) systemServices.put(name, svc);
-        return svc;
+    // AOSP's ContextImpl serves system services from per-context caches and
+    // NEVER locks the Context/Application instance to do it. This used to be
+    // `synchronized` (on `this`), which deadlocks any app that holds its own
+    // Application monitor while a background thread fetches a service: the real
+    // Play Store's ClassicApplication.onCreate does exactly that -- a
+    // synchronized(app) init block awaits a Guava aggregate future whose worker
+    // threads call getSystemService / getSharedPreferences, so they blocked on
+    // the app monitor onCreate held and never completed the future (circular
+    // wait). Lock the private cache instead of `this`. See also
+    // macapkGetSharedPreferencesReal.
+    @Override public Object getSystemService(String name) {
+        synchronized (systemServices) {
+            Object svc = systemServices.get(name);
+            if (svc != null) return svc;
+            svc = createSystemService(name);
+            if (svc != null) systemServices.put(name, svc);
+            return svc;
+        }
     }
 
     private Object createSystemService(String name) {

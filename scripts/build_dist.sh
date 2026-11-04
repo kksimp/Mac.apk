@@ -383,6 +383,9 @@ fi
 # keep the location entitlement, or TCC refuses it without a prompt.
 [ -d "$APP/Contents/Helpers/Mac.apk Location.app" ] && \
     sign "$APP/Contents/Helpers/Mac.apk Location.app" --entitlements "$ENT" --identifier org.macapk.location
+# The system broker (SMAppService agent's BundleProgram) hosts a JVM: $ENT.
+[ -f "$APP/Contents/Helpers/macapk-system" ] && \
+    sign "$APP/Contents/Helpers/macapk-system" --entitlements "$ENT" --identifier org.macapk.system
 sign "$RES/macapk-runtime" --entitlements "$ENT"
 [ -f "$BIN/macapk-translator" ] && sign "$BIN/macapk-translator" --entitlements "$ENT"
 # 5d. seal the whole bundle last (entitlements on the launcher executable too)

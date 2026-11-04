@@ -14,6 +14,9 @@
 //   REDIRECT_EXIT     System.exit / Runtime.exit / Runtime.halt go to
 //                     MacApkProcessExit, which plays ActivityManager's part
 //                     instead of exiting the shared JVM.
+//   REDIRECT_NATIVE_LOAD  System.mapLibraryName / System.load / Runtime.load go to
+//                     MacApkNativeLoad, which answers with Android's file name
+//                     (libX.so) and loads such a file by translating it first.
 //   LOG_TAG           apk_unpacker.cpp prefixes converter stderr with
 //                     "[macapk-dex]" unless a line already starts "[macapk",
 //                     and debug/dexconv_formats.py parses that tag.
@@ -34,6 +37,7 @@ public final class HostDefaults {
     public static final String SYNTHETIC_PREFIX = "macapk";
     public static final String REDIRECT_UNSAFE = "com/macapk/loader/MacApkUnsafe";
     public static final String REDIRECT_EXIT = "com/macapk/loader/MacApkProcessExit";
+    public static final String REDIRECT_NATIVE_LOAD = "com/macapk/loader/MacApkNativeLoad";
     public static final String LOG_TAG = "macapk-dex";
     public static final String PARSED_MARKER = "true";
     public static final String LIBRARY = "classloader";

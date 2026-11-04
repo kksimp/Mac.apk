@@ -100,6 +100,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <dlfcn.h>
+#include <sqlite3.h>   // types and constants only: the calls are resolved with dlsym below
 #include <sys/stat.h>
 
 // cocoa_bridge.mm: the host MTKView the widget overlay composites onto
@@ -3357,3 +3359,91 @@ void RegisterWebViewBridgeMethods(JNIEnv* env) {
 
 }  // namespace webview
 }  // namespace macapk
+
+// ---------------------------------------------------------------------------
+// MacApkWebViewCheckpointStores -- flush WebKit's SQLite write-ahead logs on exit.
+//
+// WHY. The process ends with _exit() (cocoa_bridge.mm), as an Android process
+// death does, which closes none of the databases WebKit's UI-process half holds
+// open in ~/Library/WebKit/<bundle id>/WebsiteDataStore/<uuid>/ (the
+// EnhancedSecurity sites DB, AlternativeServices, ResourceLoadStatistics).
+// Each leaves a non-empty "-wal". The NEXT launch's first open of such a store
+// has to RECOVER it, and recovery writes a notice through sqlite3_log
+// (walIndexRecover -> "recovered N frames"); on 2026-11-03 that call crashed
+// Instagram's login (docs entry v1.0.2370). A WAL checkpointed to zero length
+// has no frames to recover, so nothing is logged and the next open is a plain
+// one -- the state every app is already in after a store was closed normally.
+//
+// WHAT. For every "*-wal" under this app's WebKit folder that is not empty,
+// open the database read-write with a short busy timeout, run
+// PRAGMA wal_checkpoint(TRUNCATE) and close. If WebKit still holds a write
+// lock the checkpoint answers BUSY and we leave that file alone: best effort,
+// bounded to about a second overall, never blocks the exit.
+// Called from the quit and backstop paths just before _exit, on a non-main
+// thread, so it touches only the filesystem and SQLite, never AppKit/WebKit.
+// ---------------------------------------------------------------------------
+// BEGIN MacApkWebViewCheckpointStores (debug/webview_wal_gate.sh compiles exactly this text)
+extern "C" void MacApkWebViewCheckpointStores(void) {
+    @autoreleasepool {
+        // MACAPK_WEBKIT_ROOT: the folder to scan, for the offline gate only.
+        const char* seam = getenv("MACAPK_WEBKIT_ROOT");
+        NSString* root;
+        if (seam && *seam) {
+            root = [NSString stringWithUTF8String:seam];
+        } else {
+            NSString* bid = NSBundle.mainBundle.bundleIdentifier;
+            if (!bid.length) return;
+            root = [NSHomeDirectory() stringByAppendingPathComponent:
+                    [@"Library/WebKit" stringByAppendingPathComponent:bid]];
+        }
+        NSFileManager* fm = NSFileManager.defaultManager;
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:root isDirectory:&isDir] || !isDir) return;
+        // The calls are resolved at run time (the system libsqlite3 is always
+        // loaded in this process), so this file adds no link dependency for the
+        // test drivers that compile it on its own.
+        struct Q {
+            int (*open)(const char*, sqlite3**, int, const char*);
+            int (*close)(sqlite3*);
+            int (*busy)(sqlite3*, int);
+            int (*exec)(sqlite3*, const char*, int (*)(void*, int, char**, char**), void*, char**);
+            int (*ckpt)(sqlite3*, const char*, int, int*, int*);
+        } q;
+        void* lib = dlopen("/usr/lib/libsqlite3.dylib", RTLD_LAZY | RTLD_NOLOAD);
+        if (!lib) lib = dlopen("/usr/lib/libsqlite3.dylib", RTLD_LAZY);
+        if (!lib) return;
+        q.open  = (decltype(q.open))dlsym(lib, "sqlite3_open_v2");
+        q.close = (decltype(q.close))dlsym(lib, "sqlite3_close");
+        q.busy  = (decltype(q.busy))dlsym(lib, "sqlite3_busy_timeout");
+        q.exec  = (decltype(q.exec))dlsym(lib, "sqlite3_exec");
+        q.ckpt  = (decltype(q.ckpt))dlsym(lib, "sqlite3_wal_checkpoint_v2");
+        if (!q.open || !q.close || !q.busy || !q.exec || !q.ckpt) return;
+        const CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        int done = 0, busy = 0;
+        NSDirectoryEnumerator* en = [fm enumeratorAtPath:root];
+        for (NSString* rel in en) {
+            if (CFAbsoluteTimeGetCurrent() - t0 > 1.0) break;
+            if (![rel hasSuffix:@"-wal"]) continue;
+            NSString* wal = [root stringByAppendingPathComponent:rel];
+            NSDictionary* at = [fm attributesOfItemAtPath:wal error:nil];
+            if ([at fileSize] == 0) continue;
+            NSString* db = [wal substringToIndex:wal.length - 4];
+            sqlite3* h = nullptr;
+            if (q.open(db.fileSystemRepresentation, &h, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK) {
+                if (h) q.close(h);
+                continue;
+            }
+            q.busy(h, 100);
+            // A fresh connection has not attached the WAL yet and a checkpoint
+            // on it is a silent no-op: touch the schema first.
+            q.exec(h, "SELECT count(*) FROM sqlite_master", nullptr, nullptr, nullptr);
+            int logFrames = 0, ckptFrames = 0;
+            const int rc = q.ckpt(h, nullptr, SQLITE_CHECKPOINT_TRUNCATE, &logFrames, &ckptFrames);
+            if (rc == SQLITE_OK) ++done; else ++busy;
+            q.close(h);
+        }
+        if (done || busy)
+            std::fprintf(stderr, "[quit] webview stores: checkpointed %d WAL file(s), %d busy\n", done, busy);
+    }
+}
+// END MacApkWebViewCheckpointStores

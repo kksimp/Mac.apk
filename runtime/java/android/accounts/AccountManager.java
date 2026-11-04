@@ -345,6 +345,43 @@ public class AccountManager {
         }
     }
 
+    // === The system broker's account service ===================================
+    // With the Mac.apk system broker on, accounts are system-wide the way they are
+    // on a device: one store in the broker (com.macapk.loader.AccountsService), a
+    // type owned by the package whose authenticator declares it, tokens minted by
+    // that authenticator across processes. Every method below checks sys(type)
+    // first. com.google stays with the in-process com.macapk.gms stand-in only
+    // while the real Google Play services is not installed.
+    private static boolean sys(String type) {
+        if (!com.macapk.loader.SystemAccounts.active()) return false;
+        if (com.macapk.gms.GoogleAuthenticator.ACCOUNT_TYPE.equals(type)) return realGms();
+        return true;
+    }
+
+    private static boolean realGms() {
+        return com.macapk.loader.SystemClient.hasPeerPackage("com.google.android.gms");
+    }
+
+    private static volatile boolean sSysReceiver;
+
+    /** On a device AccountManager's listeners hear LOGIN_ACCOUNTS_CHANGED from the
+     *  service; the broker broadcasts it to running apps after a change. */
+    private void ensureSysReceiver() {
+        if (sSysReceiver) return;
+        Context c = appContext();
+        if (c == null) return;
+        sSysReceiver = true;
+        try {
+            c.registerReceiver(new android.content.BroadcastReceiver() {
+                @Override public void onReceive(Context ctx, Intent intent) { notifyAccountsChanged(); }
+            }, new android.content.IntentFilter(LOGIN_ACCOUNTS_CHANGED_ACTION));
+        } catch (Throwable t) { sSysReceiver = false; }
+    }
+
+    private static void requireAccount(Account a) {
+        if (a == null) throw new IllegalArgumentException("account is null");
+    }
+
     // === Queries =============================================================
 
     // ⚠ THE WHOLE FILE HAS TWO MODES, and the second one is new (v1.0.1171).
@@ -361,6 +398,10 @@ public class AccountManager {
     // links and still behaves exactly as before.
 
     public Account[] getAccounts() {
+        if (com.macapk.loader.SystemAccounts.active()) {
+            Account[] remote = com.macapk.loader.SystemAccounts.getAccounts(null);
+            return realGms() ? remote : concat(remote, com.macapk.gms.GoogleAuthenticator.accounts());
+        }
         if (APP_ACCOUNTS) {
             return concat(appAccounts(null), com.macapk.gms.GoogleAuthenticator.accounts());
         }
@@ -372,6 +413,8 @@ public class AccountManager {
      *  accounts, so any other type is legitimately empty -- the same answer a
      *  device with no Exchange/Twitter/etc. account gives. */
     public Account[] getAccountsByType(String type) {
+        if (type == null && com.macapk.loader.SystemAccounts.active()) return getAccounts();
+        if (sys(type)) return com.macapk.loader.SystemAccounts.getAccounts(type);
         // AOSP getAccountsAsUser(null, ...) is every account visible to the caller; an
         // unmanaged type has none visible (no other app's accounts exist on this device).
         if (APP_ACCOUNTS && type == null) return getAccounts();
@@ -400,6 +443,14 @@ public class AccountManager {
      * an account that nothing would service.
      */
     public AuthenticatorDescription[] getAuthenticatorTypes() {
+        if (com.macapk.loader.SystemAccounts.active()) {
+            AuthenticatorDescription[] remote = com.macapk.loader.SystemAccounts.getAuthenticatorTypes();
+            AuthenticatorDescription g = realGms() ? null : com.macapk.gms.GoogleAuthenticator.description();
+            if (g == null) return remote;
+            AuthenticatorDescription[] out = java.util.Arrays.copyOf(remote, remote.length + 1);
+            out[remote.length] = g;
+            return out;
+        }
         if (APP_ACCOUNTS) {
             java.util.List<AuthenticatorDescription> all = new java.util.ArrayList<>();
             for (com.macapk.accounts.AppAuthenticators.Entry e : appTypes().values()) {
@@ -414,6 +465,10 @@ public class AccountManager {
     }
 
     public String getUserData(Account account, String key) {
+        if (account != null && sys(account.type)) {
+            if (key == null) throw new IllegalArgumentException("key is null");
+            return com.macapk.loader.SystemAccounts.getUserData(account, key);
+        }
         if (APP_ACCOUNTS && account != null) {
             int r = route(account.type);
             if (r != OLD) {
@@ -433,6 +488,10 @@ public class AccountManager {
      *  token here would turn a documented non-blocking call into a network
      *  round-trip on whatever thread the app happened to call it from. */
     public String peekAuthToken(Account account, String authTokenType) {
+        if (account != null && sys(account.type)) {
+            if (authTokenType == null) throw new IllegalArgumentException("authTokenType is null");
+            return com.macapk.loader.SystemAccounts.peekAuthToken(account, authTokenType);
+        }
         if (APP_ACCOUNTS && account != null && route(account.type) != OLD) {
             if (authTokenType == null) throw new IllegalArgumentException("authTokenType is null");
             if (route(account.type) == FOREIGN) {
@@ -448,6 +507,7 @@ public class AccountManager {
      *  WebView and Mac.apk never sees the user's password. AOSP returns null for
      *  an authenticator that stores none, which is exactly our case. */
     public String getPassword(Account account) {
+        if (account != null && sys(account.type)) return com.macapk.loader.SystemAccounts.getPassword(account);
         if (APP_ACCOUNTS) {
             if (account == null) throw new IllegalArgumentException("account is null");
             int r = route(account.type);
@@ -461,6 +521,7 @@ public class AccountManager {
      *  app-owned arm, a renamed account of the caller's own type answers its old name
      *  (AccountManagerService.getPreviousName :1561 -> readPreviousNameInternal). */
     public String getPreviousName(Account account) {
+        if (account != null && sys(account.type)) return com.macapk.loader.SystemAccounts.getPreviousName(account);
         if (APP_ACCOUNTS) {
             if (account == null) throw new IllegalArgumentException("account is null");
             if (route(account.type) == MANAGED) {
@@ -472,6 +533,9 @@ public class AccountManager {
 
     /** No account exists, so its visibility is undefined -- AOSP's own "unknown". */
     public int getAccountVisibility(Account account, String packageName) {
+        if (account != null && sys(account.type)) {
+            return com.macapk.loader.SystemAccounts.getAccountVisibility(account, packageName);
+        }
         return VISIBILITY_UNDEFINED;
     }
 
@@ -487,12 +551,24 @@ public class AccountManager {
     // === Mutations (all fail: there is nothing to mutate) ====================
 
     public boolean addAccountExplicitly(Account account, String password, Bundle userdata) {
+        if (account != null && sys(account.type)) {
+            return com.macapk.loader.SystemAccounts.addAccountExplicitly(account, password, userdata);
+        }
         if (APP_ACCOUNTS) return addAccountInternal(account, password, userdata);
         return false;
     }
 
     public boolean addAccountExplicitly(Account account, String password, Bundle userdata,
             Map<String, Integer> visibility) {
+        if (account != null && sys(account.type)) {
+            boolean ok = com.macapk.loader.SystemAccounts.addAccountExplicitly(account, password, userdata);
+            if (ok && visibility != null) {
+                for (Map.Entry<String, Integer> e : visibility.entrySet()) {
+                    com.macapk.loader.SystemAccounts.setAccountVisibility(account, e.getKey(), e.getValue());
+                }
+            }
+            return ok;
+        }
         // Visibility toward OTHER packages is moot on a one-app device; the caller always
         // sees its own type (resolveAccountVisibility: "Authenticator can always see").
         if (APP_ACCOUNTS) return addAccountInternal(account, password, userdata);
@@ -519,6 +595,11 @@ public class AccountManager {
     }
 
     public void setUserData(Account account, String key, String value) {
+        if (account != null && sys(account.type)) {
+            if (key == null) throw new IllegalArgumentException("key is null");
+            com.macapk.loader.SystemAccounts.setUserData(account, key, value);
+            return;
+        }
         if (APP_ACCOUNTS) {
             if (account == null) throw new IllegalArgumentException("account is null");
             if (key == null) throw new IllegalArgumentException("key is null");
@@ -532,6 +613,11 @@ public class AccountManager {
      *  (account, tokenType). Ours does the same via the GMS store, so a token an
      *  app obtained elsewhere is honoured on the next peek. */
     public void setAuthToken(Account account, String authTokenType, String authToken) {
+        if (account != null && sys(account.type)) {
+            if (authTokenType == null) throw new IllegalArgumentException("authTokenType is null");
+            com.macapk.loader.SystemAccounts.setAuthToken(account, authTokenType, authToken);
+            return;
+        }
         if (APP_ACCOUNTS && account != null && route(account.type) != OLD) {
             if (authTokenType == null) throw new IllegalArgumentException("authTokenType is null");
             if (route(account.type) == FOREIGN) {
@@ -548,6 +634,10 @@ public class AccountManager {
      *  quirk faithfully reproduced here: the caller passes the TOKEN VALUE, not
      *  the token type, so the invalidation is by value across the account type. */
     public void invalidateAuthToken(String accountType, String authToken) {
+        if (accountType != null && sys(accountType)) {
+            if (authToken != null) com.macapk.loader.SystemAccounts.invalidateAuthToken(accountType, authToken);
+            return;
+        }
         if (APP_ACCOUNTS && route(accountType) != OLD) {
             // AOSP: no ownership check here -- it deletes the matching token VALUE across the
             // type, which for a type the caller does not manage matches nothing.
@@ -559,6 +649,10 @@ public class AccountManager {
         com.macapk.gms.GoogleAuthenticator.invalidateAuthToken(accountType, authToken);
     }
     public void setPassword(Account account, String password) {
+        if (account != null && sys(account.type)) {
+            com.macapk.loader.SystemAccounts.setPassword(account, password);
+            return;
+        }
         if (APP_ACCOUNTS) {
             if (account == null) throw new IllegalArgumentException("account is null");
             int r = route(account.type);
@@ -572,6 +666,10 @@ public class AccountManager {
 
     /** AOSP clears the stored password; there is none, so this is genuinely a no-op. */
     public void clearPassword(Account account) {
+        if (account != null && sys(account.type)) {
+            com.macapk.loader.SystemAccounts.setPassword(account, null);
+            return;
+        }
         if (APP_ACCOUNTS) {
             if (account == null) throw new IllegalArgumentException("account is null");
             int r = route(account.type);
@@ -584,6 +682,7 @@ public class AccountManager {
     }
 
     public boolean removeAccountExplicitly(Account account) {
+        if (account != null && sys(account.type)) return com.macapk.loader.SystemAccounts.removeAccountExplicitly(account);
         if (APP_ACCOUNTS) {
             if (account == null) throw new IllegalArgumentException("account is null");
             int r = route(account.type);
@@ -600,6 +699,9 @@ public class AccountManager {
     }
 
     public boolean setAccountVisibility(Account account, String packageName, int visibility) {
+        if (account != null && sys(account.type)) {
+            return com.macapk.loader.SystemAccounts.setAccountVisibility(account, packageName, visibility);
+        }
         return false;
     }
 
@@ -634,6 +736,14 @@ public class AccountManager {
 
     public void addOnAccountsUpdatedListener(OnAccountsUpdateListener listener,
             Handler handler, boolean updateImmediately, String[] accountTypes) {
+        if (listener == null) throw new IllegalArgumentException("the listener is null");
+        if (com.macapk.loader.SystemAccounts.active()) {
+            ensureSysReceiver();
+            ListenerRecord rec = new ListenerRecord(listener, handler, accountTypes);
+            mListeners.add(rec);
+            if (updateImmediately) postAccounts(rec);
+            return;
+        }
         if (listener == null) throw new IllegalArgumentException("the listener is null");
         if (APP_ACCOUNTS) {
             ListenerRecord rec = new ListenerRecord(listener, handler, accountTypes);
@@ -713,6 +823,15 @@ public class AccountManager {
      *  carries, so a caller probing for one it needs gets a real answer. */
     public AccountManagerFuture<Boolean> hasFeatures(Account account, String[] features,
             AccountManagerCallback<Boolean> callback, Handler handler) {
+        if (account != null && sys(account.type)) {
+            if (features == null) throw new IllegalArgumentException("features is null");
+            return submit(() -> {
+                Bundle b = sysSession(account.type, AbstractAccountAuthenticator.TX_HAS_FEATURES, null, true,
+                        d -> { writeAuthAccount(d, account); d.writeStringArray(features); });
+                if (!b.containsKey(KEY_BOOLEAN_RESULT)) throw new AuthenticatorException("no result in response");
+                return b.getBoolean(KEY_BOOLEAN_RESULT);
+            }, callback, handler);
+        }
         if (com.macapk.gms.GoogleAuthenticator.handles(account)) {
             return complete(com.macapk.gms.GoogleAuthenticator.hasFeatures(account, features),
                             callback);
@@ -750,6 +869,9 @@ public class AccountManager {
     public AccountManagerFuture<Bundle> getAuthToken(Account account, String authTokenType,
             Bundle options, boolean notifyAuthFailure, AccountManagerCallback<Bundle> callback,
             Handler handler) {
+        if (account != null && sys(account.type)) {
+            return sysGetAuthToken(account, authTokenType, options, notifyAuthFailure, null, callback, handler);
+        }
         if (APP_ACCOUNTS && account != null && route(account.type) == MANAGED) {
             return appGetAuthToken(account, authTokenType, options, notifyAuthFailure, null,
                     callback, handler);
@@ -787,6 +909,9 @@ public class AccountManager {
     public AccountManagerFuture<Bundle> getAuthToken(Account account, String authTokenType,
             Bundle options, Activity activity, AccountManagerCallback<Bundle> callback,
             Handler handler) {
+        if (account != null && sys(account.type)) {
+            return sysGetAuthToken(account, authTokenType, options, false, activity, callback, handler);
+        }
         if (APP_ACCOUNTS && account != null && route(account.type) == MANAGED) {
             return appGetAuthToken(account, authTokenType, options, false, activity,
                     callback, handler);
@@ -865,6 +990,22 @@ public class AccountManager {
     public AccountManagerFuture<Bundle> addAccount(String accountType, String authTokenType,
             String[] requiredFeatures, Bundle addAccountOptions, Activity activity,
             AccountManagerCallback<Bundle> callback, Handler handler) {
+        if (accountType == null) throw new IllegalArgumentException("accountType is null");
+        if (sys(accountType)) {
+            // AOSP AccountManager.addAccount puts the caller's package into the options;
+            // the service adds KEY_CALLER_UID / KEY_CALLER_PID.
+            final Bundle opts = new Bundle();
+            if (addAccountOptions != null) opts.putAll(addAccountOptions);
+            Context c = appContext();
+            opts.putString(KEY_ANDROID_PACKAGE_NAME, c == null ? null : c.getPackageName());
+            opts.putInt(KEY_CALLER_UID, android.os.Process.myUid());
+            opts.putInt(KEY_CALLER_PID, android.os.Process.myPid());
+            return submit(() -> sysSession(accountType, AbstractAccountAuthenticator.TX_ADD_ACCOUNT,
+                    activity, true, d -> {
+                        d.writeString(accountType); d.writeString(authTokenType);
+                        d.writeStringArray(requiredFeatures); d.writeBundle(opts);
+                    }), callback, handler);
+        }
         if (!com.macapk.gms.GoogleAuthenticator.ACCOUNT_TYPE.equals(accountType)
                 || !com.macapk.gms.NativeSignIn.available()) {
             return noAuthenticator(accountType, callback);
@@ -883,17 +1024,32 @@ public class AccountManager {
 
     public AccountManagerFuture<Bundle> confirmCredentials(Account account, Bundle options,
             Activity activity, AccountManagerCallback<Bundle> callback, Handler handler) {
+        if (account != null && sys(account.type)) {
+            return submit(() -> sysSession(account.type, AbstractAccountAuthenticator.TX_CONFIRM_CREDENTIALS,
+                    activity, true, d -> { writeAuthAccount(d, account); d.writeBundle(options); }),
+                    callback, handler);
+        }
         return noAuthenticator(account == null ? null : account.type, callback);
     }
 
     public AccountManagerFuture<Bundle> updateCredentials(Account account, String authTokenType,
             Bundle options, Activity activity, AccountManagerCallback<Bundle> callback,
             Handler handler) {
+        if (account != null && sys(account.type)) {
+            return submit(() -> sysSession(account.type, AbstractAccountAuthenticator.TX_UPDATE_CREDENTIALS,
+                    activity, true, d -> {
+                        writeAuthAccount(d, account); d.writeString(authTokenType); d.writeBundle(options);
+                    }), callback, handler);
+        }
         return noAuthenticator(account == null ? null : account.type, callback);
     }
 
     public AccountManagerFuture<Bundle> editProperties(String accountType, Activity activity,
             AccountManagerCallback<Bundle> callback, Handler handler) {
+        if (accountType != null && sys(accountType)) {
+            return submit(() -> sysSession(accountType, AbstractAccountAuthenticator.TX_EDIT_PROPERTIES,
+                    activity, true, d -> d.writeString(accountType)), callback, handler);
+        }
         return noAuthenticator(accountType, callback);
     }
 
@@ -919,6 +1075,9 @@ public class AccountManager {
 
     public AccountManagerFuture<Bundle> removeAccount(Account account, Activity activity,
             AccountManagerCallback<Bundle> callback, Handler handler) {
+        if (account != null && sys(account.type)) {
+            return submit(() -> sysRemove(account, activity), callback, handler);
+        }
         if (APP_ACCOUNTS) {
             if (account == null) throw new IllegalArgumentException("account is null");
             int r = route(account.type);
@@ -938,6 +1097,13 @@ public class AccountManager {
     @Deprecated
     public AccountManagerFuture<Boolean> removeAccount(Account account,
             AccountManagerCallback<Boolean> callback, Handler handler) {
+        if (account != null && sys(account.type)) {
+            return submit(() -> {
+                Bundle b = sysRemove(account, null);
+                if (b == null || !b.containsKey(KEY_BOOLEAN_RESULT)) throw new AuthenticatorException("no result in response");
+                return b.getBoolean(KEY_BOOLEAN_RESULT);
+            }, callback, handler);
+        }
         if (APP_ACCOUNTS) {
             if (account == null) throw new IllegalArgumentException("account is null");
             int r = route(account.type);
@@ -958,6 +1124,14 @@ public class AccountManager {
 
     public AccountManagerFuture<Account> renameAccount(Account account, String newName,
             AccountManagerCallback<Account> callback, Handler handler) {
+        if (account != null && sys(account.type)) {
+            if (newName == null || newName.isEmpty()) throw new IllegalArgumentException("newName is empty or null.");
+            if (!com.macapk.loader.SystemAccounts.rename(account, newName)) {
+                throw new NullPointerException("Attempt to read from field "
+                        + "'java.lang.String android.accounts.Account.name' on a null object reference");
+            }
+            return complete(new Account(newName, account.type), callback);
+        }
         if (APP_ACCOUNTS) {
             // AOSP client checks, then AccountManagerService.renameAccount (:2106).
             if (account == null) throw new IllegalArgumentException("account is null.");
@@ -1098,6 +1272,46 @@ public class AccountManager {
         return new AuthenticatorException(message);
     }
 
+    /** runSession's twin for the system broker: the same AmsTask rules, but the
+     *  authenticator is another app's and the broker's account service runs the
+     *  Session (com.macapk.loader.AccountsService.runSession). `authCode` is the
+     *  IAccountAuthenticator method and `args` its arguments after the response. */
+    private static Bundle sysSession(String accountType, int authCode, Activity activity,
+            boolean stripAuthTokenFromResult, java.util.function.Consumer<android.os.Parcel> args)
+            throws Exception {
+        final java.util.concurrent.LinkedBlockingQueue<Object> answers =
+                new java.util.concurrent.LinkedBlockingQueue<>();
+        com.macapk.loader.SystemAccounts.session(authCode, accountType, args,
+                new com.macapk.loader.SystemAccounts.Result() {
+                    @Override public void onResult(Bundle result) {
+                        answers.add(result == null ? NULL_RESULT : result);
+                    }
+                    @Override public void onError(int code, String message) {
+                        answers.add(sessionError(code, message));
+                    }
+                });
+        while (true) {
+            Object o = answers.take();
+            if (o instanceof Exception) throw (Exception) o;
+            Bundle result = o == NULL_RESULT ? null : (Bundle) o;
+            if (result == null) throw sessionError(ERROR_CODE_INVALID_RESPONSE, "null bundle returned");
+            if (stripAuthTokenFromResult) result.remove(KEY_AUTHTOKEN);
+            final Intent intent = result.getParcelable(KEY_INTENT);
+            if (result.getInt(KEY_ERROR_CODE, -1) > 0 && intent == null) {
+                throw sessionError(result.getInt(KEY_ERROR_CODE), result.getString(KEY_ERROR_MESSAGE));
+            }
+            if (intent != null && activity != null) {
+                android.os.Looper main = android.os.Looper.getMainLooper();
+                Runnable start = () -> activity.startActivity(intent);
+                if (main == null) start.run(); else new Handler(main).post(start);
+                continue;
+            }
+            return result;
+        }
+    }
+
+    private static void writeAuthAccount(android.os.Parcel d, Account a) { d.writeTypedObject(a, 0); }
+
     /** AccountManagerService.removeAccountAsUser (:2265) -> RemoveAccountSession: run()
      *  asks getAccountRemovalAllowed; its onResult removes the account only for a bundle that
      *  carries KEY_BOOLEAN_RESULT and NO KEY_INTENT, and answers the caller with that bundle
@@ -1169,6 +1383,31 @@ public class AccountManager {
                     }
                     return false;
                 }), callback, handler);
+    }
+
+    /** AOSP getAuthToken through the broker: the service answers from its token cache
+     *  or runs the authenticator's getAuthToken (and caches what it returns). */
+    private AccountManagerFuture<Bundle> sysGetAuthToken(final Account account, final String authTokenType,
+            Bundle options, boolean notifyAuthFailure, final Activity activity,
+            AccountManagerCallback<Bundle> callback, Handler handler) {
+        if (authTokenType == null) throw new IllegalArgumentException("authTokenType is null");
+        final Bundle opts = new Bundle();
+        if (options != null) opts.putAll(options);
+        Context c = appContext();
+        opts.putString(KEY_ANDROID_PACKAGE_NAME, c == null ? null : c.getPackageName());
+        if (notifyAuthFailure) opts.putBoolean("notifyOnAuthFailure", true);
+        return submit(() -> sysSession(account.type, AbstractAccountAuthenticator.TX_GET_AUTH_TOKEN, activity,
+                false, d -> { writeAuthAccount(d, account); d.writeString(authTokenType); d.writeBundle(opts); }),
+                callback, handler);
+    }
+
+    /** RemoveAccountSession through the broker: the authenticator decides; a plain
+     *  KEY_BOOLEAN_RESULT=true removes the account (its owner's removeAccountExplicitly
+     *  rights are the broker's to use, so the removal is done there). */
+    private Bundle sysRemove(Account account, Activity activity) throws Exception {
+        Bundle b = sysSession(account.type, AbstractAccountAuthenticator.TX_GET_ACCOUNT_REMOVAL_ALLOWED,
+                activity, true, d -> writeAuthAccount(d, account));
+        return b;
     }
 
     private static AbstractAccountAuthenticator bindAuthenticator(

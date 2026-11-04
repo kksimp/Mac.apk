@@ -6,7 +6,6 @@ import java.security.spec.AlgorithmParameterSpec;
 
 import javax.crypto.KeyGeneratorSpi;
 import javax.crypto.SecretKey;
-import javax.crypto.spec.SecretKeySpec;
 
 // android.security.keystore.AndroidKeyStoreKeyGeneratorSpi: the
 // KeyGeneratorSpi behind KeyGenerator.getInstance(<alg>, "AndroidKeyStore").
@@ -25,9 +24,9 @@ import javax.crypto.spec.SecretKeySpec;
 //     in the keystore (that is the whole point of the AndroidKeyStore
 //     generator -- a later KeyStore.getKey(alias, null) must return it),
 //     and returns the SecretKey.
-// The generated key is a plain software SecretKeySpec (see
-// MacApkKeyStoreBackend for why that is the correct Mac.apk analogue of
-// the device's non-extractable keymaster key).
+// AES returns an opaque app-facing handle and uses our key-class-restricted
+// Cipher service. Authentication-bound HMAC is explicitly unsupported; ordinary
+// HMAC retains its existing software representation. Storage is software-backed.
 public abstract class AndroidKeyStoreKeyGeneratorSpi extends KeyGeneratorSpi {
 
     public static final class AES extends AndroidKeyStoreKeyGeneratorSpi {
@@ -64,6 +63,7 @@ public abstract class AndroidKeyStoreKeyGeneratorSpi extends KeyGeneratorSpi {
     private KeyGenParameterSpec spec;
     private SecureRandom rng;
     private int keySizeBits = -1;
+    private AndroidKeyStoreAuthPolicy policy = AndroidKeyStoreAuthPolicy.NONE;
 
     AndroidKeyStoreKeyGeneratorSpi(String algorithm, int defaultKeySizeBits) {
         this.algorithm = algorithm;
@@ -92,6 +92,7 @@ public abstract class AndroidKeyStoreKeyGeneratorSpi extends KeyGeneratorSpi {
         spec = null;
         rng = null;
         keySizeBits = -1;
+        policy = AndroidKeyStoreAuthPolicy.NONE;
         if (!(params instanceof KeyGenParameterSpec)) {
             throw new InvalidAlgorithmParameterException(
                 "Cannot initialize without a "
@@ -121,6 +122,7 @@ public abstract class AndroidKeyStoreKeyGeneratorSpi extends KeyGeneratorSpi {
             throw new StrongBoxUnavailableException(
                 "StrongBox-backed key requested; this device has no StrongBox");
         }
+        policy = AndroidKeyStoreAuthPolicy.from(s, algorithm, bits);
         this.spec = s;
         this.rng = random;
         this.keySizeBits = bits;
@@ -134,11 +136,10 @@ public abstract class AndroidKeyStoreKeyGeneratorSpi extends KeyGeneratorSpi {
         }
         byte[] material = new byte[keySizeBits / 8];
         (rng != null ? rng : new SecureRandom()).nextBytes(material);
-        SecretKeySpec key = new SecretKeySpec(material, algorithm);
         // Bind to the alias: generating with the same alias replaces the
         // previous key, as on Android.
         MacApkKeyStoreBackend.get()
-            .putKey(spec.getKeystoreAlias(), algorithm, material);
-        return key;
+            .putKey(spec.getKeystoreAlias(), algorithm, material, policy);
+        return MacApkKeyStoreBackend.get().getKey(spec.getKeystoreAlias());
     }
 }

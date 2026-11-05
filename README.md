@@ -76,7 +76,7 @@ stores are in the [Installation](https://github.com/kksimp/Mac.apk/wiki/Installa
 > in the Mac.apk window cleans it up and can keep your saves for a reinstall.
 > [More →](https://github.com/kksimp/Mac.apk/wiki/Managing-Apps)
 
-## Known issues in v1.0.2377
+## Known issues in v1.0.2379
 
 See [Known issues](https://github.com/kksimp/Mac.apk/wiki/Known-Issues) for this release, and the
 [compatibility list](COMPATIBILITY.md) for every app tested by hand.

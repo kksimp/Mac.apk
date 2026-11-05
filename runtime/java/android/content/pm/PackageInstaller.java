@@ -1130,14 +1130,17 @@ public class PackageInstaller {
          *  (API 34): ask the user to approve an install BEFORE the APK is
          *  downloaded.
          *
-         *  Mac.apk's user approval happens natively, inside the macOS install
-         *  helper, at COMMIT time -- see the class header on why we never emit
-         *  STATUS_PENDING_USER_ACTION. There is no earlier point at which a
-         *  system dialog could ask, so a pre-approval cannot be granted here,
-         *  and AOSP's own answer when pre-approval is unavailable is a failure
-         *  status on the receiver with EXTRA_PRE_APPROVAL true. Reporting
-         *  success instead would tell the installer it may skip the later
-         *  prompt, which is exactly the prompt that protects the user. */
+         *  Mac.apk's real user approval (consent + Touch ID, naming the app)
+         *  happens natively inside the macOS install helper at COMMIT time --
+         *  see the class header. A device reports STATUS_SUCCESS with
+         *  EXTRA_PRE_APPROVAL true once pre-approval is granted, and the
+         *  installer then downloads and commits. We report exactly that, so
+         *  current F-Droid (which treats a pre-approval failure as fatal,
+         *  GitHub #139) proceeds to commit(). Nothing is skipped: success here
+         *  grants no install permission and commit() still runs the full
+         *  native gate, so the user is still prompted before anything lands.
+         *  (Until v1.0.2377 this reported STATUS_FAILURE, which blocked every
+         *  install from a pre-approval-using client.) */
         public void requestUserPreapproval(PreapprovalDetails details,
                 android.content.IntentSender statusReceiver) {
             SessionMeta m = meta();
@@ -1147,10 +1150,9 @@ public class PackageInstaller {
             fillIn.putExtra(EXTRA_SESSION_ID, state.id);
             fillIn.putExtra(EXTRA_PACKAGE_NAME,
                     details != null ? details.getPackageName() : null);
-            fillIn.putExtra(EXTRA_STATUS, STATUS_FAILURE);
-            fillIn.putExtra(EXTRA_STATUS_MESSAGE,
-                    "Pre-approval is not available; approval is requested at commit time");
-            fillIn.putExtra(EXTRA_LEGACY_STATUS, LEGACY_INSTALL_FAILED_INTERNAL_ERROR);
+            fillIn.putExtra(EXTRA_STATUS, STATUS_SUCCESS);
+            fillIn.putExtra(EXTRA_STATUS_MESSAGE, "Pre-approval granted; the install is confirmed at commit time");
+            fillIn.putExtra(EXTRA_LEGACY_STATUS, 1);
             fillIn.putExtra(EXTRA_PRE_APPROVAL, true);
             sendQuietly(statusReceiver, fillIn);
         }

@@ -12512,6 +12512,33 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
                         && (rn == (uint32_t)sp_loaded || rm == (uint32_t)sp_loaded)) {
                         for (int m = 1; m <= 2 && (q + k + m) < end; ++m)
                             if ((*(q + k + m) & 0xFF000010u) == 0x54000000u) return true;  // b.cond
+                        // Flutter's Dart AOT engine (libflutter.so) outlines
+                        // the mismatch edge, so the success path has no
+                        // b.cond. Two layouts, both of which kill the flags
+                        // before anything can branch on them:
+                        //   cmp Xt, Xu ; ret
+                        //   cmp Xt, Xu ; ldr x30, [sp], #16 ; ret
+                        // The compare against the spilled guard is already
+                        // the canary signature. Requiring b.cond left these
+                        // loads unpatched, and macOS TPIDR_EL0 is commpage
+                        // magic ~0x1004, so `ldr Xt,[Xn,#0x28]` SIGSEGV'd at
+                        // 0x102c inside FlutterJNI.nativeAttach (Dispatch
+                        // Console, Flutter 3.41). Xt is dead after the RET.
+                        for (int m = 1; m <= 3 && (q + k + m) < end; ++m) {
+                            uint32_t n = *(q + k + m);
+                            if (n == 0xD65F03C0u) return true;   // ret
+                            // A branch or a flag-setting op ends the window.
+                            // Loads, stores and reg moves (the LR reload)
+                            // do not consume the compare.
+                            if ((n & 0xFC000000u) == 0x14000000u      // b
+                                || (n & 0xFC000000u) == 0x94000000u   // bl
+                                || (n & 0xFF000010u) == 0x54000000u   // b.cond
+                                || (n & 0xFFFFFC1Fu) == 0xD61F0000u   // br
+                                || (n & 0xFFFFFC1Fu) == 0xD63F0000u   // blr
+                                || (n >> 24) == 0xEBu || (n >> 24) == 0x6Bu
+                                || (n >> 24) == 0xF1u || (n >> 24) == 0x71u)
+                                break;
+                        }
                         return false;
                     }
                     continue;   // a DIFFERENT compare (e.g. the return-value cmp that

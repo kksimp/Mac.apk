@@ -1003,6 +1003,12 @@ public class Application extends ContextWrapper
      *  this; and being private is what lets AppBaseContext.getPackageCodePath
      *  reach the same record without a hop an app could turn into a cycle. */
     private android.content.pm.ApplicationInfo macapkApplicationInfoReal() {
+        // A packer can construct the real Application and attach our existing
+        // base Context without calling macapkInit on that delegate. Its package
+        // record belongs to the attached base, just like its resources/assets;
+        // consult it before an empty pre-attach fallback cached on this object.
+        Context delegate = macapkUninitDelegate();
+        if (delegate != null) return delegate.getApplicationInfo();
         android.content.pm.ApplicationInfo cached = cachedApplicationInfo;
         if (cached != null) return cached;
         android.content.pm.ApplicationInfo info = null;

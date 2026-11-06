@@ -8,6 +8,12 @@ package android.system;
 public final class OsConstants {
     private OsConstants() {}
 
+    // Linux/Android memory protection bits used by SharedMemory clients.
+    public static final int PROT_NONE  = 0;
+    public static final int PROT_READ  = 1;
+    public static final int PROT_WRITE = 2;
+    public static final int PROT_EXEC  = 4;
+
     // errno
     public static final int EPERM   = 1;
     public static final int ENOENT  = 2;

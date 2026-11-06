@@ -3010,6 +3010,36 @@ public class TextView extends View
             // macapkActiveInput path), which is the same shape AOSP's
             // onEditorAction(int) uses when an IME action button is tapped
             // (TextView.java:7965-7969 passes null there too).
+            // A MULTI-LINE field takes Enter as a NEWLINE, on both routes. AOSP:
+            // TextView.onCreateInputConnection sets IME_FLAG_NO_ENTER_ACTION for
+            // every isMultilineInputType field ("Multi-line text editors should
+            // always show an enter key", android14 TextView.java:9061-9064), so a
+            // keyboard's Enter commits '\n' there instead of an editor action; and
+            // doKeyDown lets a hardware Enter through to the key listener (which
+            // inserts '\n') unless shouldAdvanceFocusOnEnter() -- singleLine, or
+            // an email / URI variation. Both used to end below as an editor
+            // action (soft route) or a swallowed key, so Enter never started a new
+            // line in any note editor (NoNonsense Notes, whose title is the first
+            // line, could not have a body). The test is AOSP's isMultilineInputType
+            // on the declared input type, so a field we cannot prove multi-line
+            // keeps the old behaviour.
+            if (macapkEnterInsertsNewline()) {
+                // A keyboard's Enter reaches the field as a KEYCODE_ENTER key
+                // event (LatinIME sendDownUpKeyEvent), so the app's listener is
+                // asked first on both routes, as doKeyDown does.
+                final android.view.KeyEvent kev = ev != null ? ev
+                    : new android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN,
+                                                android.view.KeyEvent.KEYCODE_ENTER);
+                if (editorActionListener == null || !macapkEditorActionConsumes(kev)) {
+                    if (MACAPK_TEXT_CARET) {
+                        macapkInsertAtSelection("\n");
+                    } else {
+                        CharSequence ins = macapkFilterInsertion("\n", cur.length(), cur.length());
+                        if (ins != null && ins.length() > 0) macapkSetTextAndNotify(cur + ins);
+                    }
+                }
+                return true;
+            }
             // Soft-input route (no KeyEvent) == the IME's action button, which
             // AOSP delivers as onEditorAction(actionId): listener first, then the
             // NEXT/PREVIOUS/DONE defaults, and a subclass override runs too.
@@ -3028,14 +3058,15 @@ public class TextView extends View
                             this, macapkActionIdForEnterEvent(), ev)) return true;
                 } catch (Throwable ignore) {}
             }
-            // SCOPED DELTA from AOSP, unchanged from before this fix: AOSP would
-            // now fall through and let a MULTI-LINE field insert the newline
-            // through its key listener. We consume instead. Our KeyListener chain
-            // is inert (see onKeyDown's header), so falling through would drop the
-            // key rather than insert anything, and turning it into a literal '\n'
-            // for every field we cannot prove is multi-line would put newlines
-            // into game name/room-code fields that today commit cleanly. Revisit
-            // together with a real ArrowKeyMovementMethod/KeyListener edit path.
+            // SCOPED DELTA from AOSP, for a field we cannot prove multi-line (a
+            // provable one took the newline above): AOSP would now fall through
+            // and let the key listener decide. We consume instead. Our
+            // KeyListener chain is inert (see onKeyDown's header), so falling
+            // through would drop the key rather than insert anything, and
+            // turning it into a literal '\n' for every field we cannot prove is
+            // multi-line would put newlines into game name/room-code fields that
+            // today commit cleanly. Revisit together with a real
+            // ArrowKeyMovementMethod/KeyListener edit path.
             return true;
         }
         if (unicodeChar >= 32 && unicodeChar != 127) {
@@ -3054,6 +3085,30 @@ public class TextView extends View
             return true;
         }
         return false;   // non-text key (arrows, etc.) -> let the game handle it
+    }
+
+    /** Enter starts a new line here: AOSP's isMultilineInputType(getInputType())
+     *  (`(type & (TYPE_MASK_CLASS | TYPE_TEXT_FLAG_MULTI_LINE)) ==
+     *  (TYPE_CLASS_TEXT | TYPE_TEXT_FLAG_MULTI_LINE)`) and not
+     *  shouldAdvanceFocusOnEnter() (singleLine, or the email / URI
+     *  variations), android14 TextView.java:7495-7498, :9310-9325. */
+    private boolean macapkEnterInsertsNewline() {
+        final int t = getInputType();
+        final int ml = android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE;
+        if ((t & (android.text.InputType.TYPE_MASK_CLASS | ml))
+                != (android.text.InputType.TYPE_CLASS_TEXT | ml)) return false;
+        if (isSingleLine()) return false;
+        final int variation = t & android.text.InputType.TYPE_MASK_VARIATION;
+        return variation != android.text.InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
+            && variation != android.text.InputType.TYPE_TEXT_VARIATION_URI;
+    }
+
+    private boolean macapkEditorActionConsumes(android.view.KeyEvent ev) {
+        try {
+            return editorActionListener.onEditorAction(this, macapkActionIdForEnterEvent(), ev);
+        } catch (Throwable ignore) {
+            return false;
+        }
     }
 
     /** The selection an edit applies to, as AOSP's key listeners read it:
@@ -4555,11 +4610,80 @@ public class TextView extends View
     private void macapkDrawLine(android.graphics.Canvas canvas, android.text.Spanned sp,
                                  String line, int srcStart, int srcCount,
                                  float x, float baselineY, android.text.TextPaint p) {
-        if (sp == null) { canvas.drawText(line, x, baselineY, p); return; }
+        if (sp == null) {
+            if (android.text.MacApkBidi.hasRtl(line, 0, line.length())) {
+                boolean paraRtl;
+                try { paraRtl = android.text.MacApkBidi.isRtlParagraph(getText(), srcStart); }
+                catch (Throwable t) { paraRtl = android.text.MacApkBidi.isRtlParagraph(line, 0); }
+                canvas.drawTextRun(line, 0, line.length(), 0, line.length(), x, baselineY, paraRtl, p);
+            } else {
+                canvas.drawText(line, x, baselineY, p);
+            }
+            return;
+        }
         if (mDrawBase == null) mDrawBase = new android.text.TextPaint();
         mDrawBase.set(p);
         float cx = x;
         final int end = Math.min(srcStart + srcCount, sp.length());
+        android.text.style.MetricAffectingSpan drawnRep = null;
+        final int visLen = Math.max(0, Math.min(line.length(), Math.min(srcCount, end - srcStart)));
+        if (visLen > 0 && android.text.MacApkBidi.hasRtl(line, 0, visLen)) {
+            // Cut at every style run and every bidi level change, then paint the
+            // pieces in visual order, each with its own direction (AOSP TextLine).
+            int[] bounds = new int[line.length() + 1];
+            int nb = 0;
+            for (int rs = srcStart; rs < end; ) {
+                int re = sp.nextSpanTransition(rs, end, android.text.style.CharacterStyle.class);
+                if (re <= rs || re > end) re = end;
+                bounds[nb++] = re - srcStart;
+                rs = re;
+            }
+            int[] pieces = android.text.MacApkBidi.visualPieces(line.substring(0, visLen), bounds, nb,
+                    android.text.MacApkBidi.isRtlParagraph(sp, srcStart));
+            for (int k = 0; k < pieces.length; k += 3) {
+                int rs = srcStart + pieces[k], re = srcStart + pieces[k + 1];
+                p.set(mDrawBase);
+                android.text.style.CharacterStyle[] runSpans =
+                    sp.getSpans(rs, re, android.text.style.CharacterStyle.class);
+                if (runSpans != null) {
+                    for (android.text.style.CharacterStyle cs : runSpans) {
+                        if (cs == null) continue;
+                        if (sp.getSpanStart(cs) >= re || sp.getSpanEnd(cs) <= rs) continue;
+                        try { cs.updateDrawState(p); } catch (Throwable ignored) {}
+                    }
+                }
+                // Replaced runs are painted by their span here too (AOSP
+                // TextLine.handleReplacement), once per span across bidi pieces.
+                android.text.style.MetricAffectingSpan bidiRepSpan =
+                        android.text.MacApkReplacement.covering(sp, rs, re);
+                if (bidiRepSpan != null) {
+                    if (bidiRepSpan != drawnRep) {
+                        drawnRep = bidiRepSpan;
+                        int r0 = Math.max(sp.getSpanStart(bidiRepSpan), srcStart);
+                        int r1 = Math.min(sp.getSpanEnd(bidiRepSpan), end);
+                        cx += android.text.MacApkReplacement.draw(canvas,
+                                (android.text.style.ReplacementSpan) bidiRepSpan.getUnderlying(),
+                                sp, r0, r1, cx, baselineY, p);
+                    }
+                    continue;
+                }
+                String run = line.substring(pieces[k], pieces[k + 1]);
+                float runW = p.measureText(run);
+                if (p.bgColor != 0) {
+                    if (mSpanBgPaint == null) mSpanBgPaint = new android.graphics.Paint();
+                    mSpanBgPaint.setColor(p.bgColor);
+                    canvas.drawRect(cx, baselineY + p.ascent(), cx + runW,
+                        baselineY + p.descent(), mSpanBgPaint);
+                }
+                canvas.drawTextRun(run, 0, run.length(), 0, run.length(), cx,
+                        baselineY + p.baselineShift, (pieces[k + 2] & 1) != 0, p);
+                cx += runW;
+            }
+            p.set(mDrawBase);
+            if (srcCount < line.length())
+                canvas.drawText(line.substring(srcCount), cx, baselineY, p);
+            return;
+        }
         int runStart = srcStart;
         while (runStart < end) {
             int runEnd = sp.nextSpanTransition(runStart, end,
@@ -4576,6 +4700,24 @@ public class TextView extends View
                     if (sp.getSpanStart(cs) >= runEnd || sp.getSpanEnd(cs) <= runStart) continue;
                     try { cs.updateDrawState(p); } catch (Throwable ignored) {}
                 }
+            }
+            // A ReplacementSpan's run is painted by the span, never as text
+            // (AOSP TextLine.handleReplacement); see android.text.MacApkReplacement.
+            android.text.style.MetricAffectingSpan repSpan =
+                    android.text.MacApkReplacement.covering(sp, runStart, runEnd);
+            if (repSpan != null) {
+                // A style transition inside the replaced range splits it into
+                // several runs; the span paints once, on the first of them.
+                if (repSpan != drawnRep) {
+                    drawnRep = repSpan;
+                    int r0 = Math.max(sp.getSpanStart(repSpan), srcStart);
+                    int r1 = Math.min(sp.getSpanEnd(repSpan), end);
+                    cx += android.text.MacApkReplacement.draw(canvas,
+                            (android.text.style.ReplacementSpan) repSpan.getUnderlying(),
+                            sp, r0, r1, cx, baselineY, p);
+                }
+                runStart = runEnd;
+                continue;
             }
             String run = line.substring(runStart - srcStart, runEnd - srcStart);
             float runW = p.measureText(run);
@@ -4615,22 +4757,33 @@ public class TextView extends View
         // resolves up the tree in View.getTextAlignment(), landing on GRAVITY
         // at the root. Measured victim: AntennaPod's welcome TextViews
         // (match_parent + textAlignment="center") drew flush-left.
+        // START/END and NORMAL follow the paragraph direction (first strong
+        // character, AOSP's default FIRSTSTRONG_LTR heuristic); VIEW_START/
+        // VIEW_END follow the view's resolved layout direction.
+        final float right = Math.max(0f, availW - contentW);
+        boolean textRtl = false;
+        try { textRtl = android.text.MacApkBidi.isRtlParagraph(getText(), 0); } catch (Throwable ignored) {}
+        final boolean viewRtl = isLayoutRtl();
         switch (getTextAlignment()) {
             case android.view.View.TEXT_ALIGNMENT_CENTER:
                 return Math.max(0f, (availW - contentW) / 2f);
             case android.view.View.TEXT_ALIGNMENT_TEXT_END:
+                return textRtl ? 0f : right;
             case android.view.View.TEXT_ALIGNMENT_VIEW_END:
-                return Math.max(0f, availW - contentW);
+                return viewRtl ? 0f : right;
             case android.view.View.TEXT_ALIGNMENT_TEXT_START:
+                return textRtl ? right : 0f;
             case android.view.View.TEXT_ALIGNMENT_VIEW_START:
-                return 0f;
+                return viewRtl ? right : 0f;
             default: // TEXT_ALIGNMENT_GRAVITY (or unresolved): fall through to gravity
         }
-        int h = gravity & android.view.Gravity.HORIZONTAL_GRAVITY_MASK;
-        if (h == android.view.Gravity.CENTER_HORIZONTAL) return Math.max(0f, (availW - contentW) / 2f);
-        if (h == (android.view.Gravity.RIGHT & android.view.Gravity.HORIZONTAL_GRAVITY_MASK))
-            return Math.max(0f, availW - contentW);
-        return 0f;
+        int h = gravity & android.view.Gravity.RELATIVE_HORIZONTAL_GRAVITY_MASK;
+        if ((h & android.view.Gravity.HORIZONTAL_GRAVITY_MASK) == android.view.Gravity.CENTER_HORIZONTAL)
+            return Math.max(0f, (availW - contentW) / 2f);
+        if (h == android.view.Gravity.LEFT) return 0f;     // absolute
+        if (h == android.view.Gravity.RIGHT) return right; // absolute
+        if (h == android.view.Gravity.END) return textRtl ? 0f : right;
+        return textRtl ? right : 0f;                        // START / unset: ALIGN_NORMAL
     }
     private float verticalGravityOffset(int availH, float contentH) {
         int v = gravity & android.view.Gravity.VERTICAL_GRAVITY_MASK;
@@ -4815,11 +4968,12 @@ public class TextView extends View
      *    applySingleLine(singleLine, !isPassword, ...) (TextView.java:6912),
      *    which lands on setTransformationMethod(SingleLineTransformationMethod
      *    .getInstance()) or setTransformationMethod(null) depending on the
-     *    multi-line flag. Our setSingleLine() never installs
-     *    SingleLineTransformationMethod at all, so mirroring the single-line
-     *    half here would newline-collapse every single-line TextView in the
-     *    fleet -- a much wider change than this lane. We clear to null, which
-     *    is AOSP's own multi-line answer and matches the rest of this tree.
+     *    multi-line flag. Only the setSingleLine() API installs
+     *    SingleLineTransformationMethod here (MACAPK_SINGLELINE_TRANSFORM),
+     *    so mirroring the single-line half here would newline-collapse every
+     *    field whose inputType merely lacks textMultiLine -- a much wider
+     *    change than this lane. We clear to null, which is AOSP's own
+     *    multi-line answer and matches the rest of this tree.
      *  - No setTypefaceFromAttrs(MONOSPACE): AOSP switches password fields to
      *    a monospace face so the dots align. Cosmetic, and our Paint has no
      *    typeface-by-index selection. */
@@ -4838,8 +4992,8 @@ public class TextView extends View
         // Only the FLAG is applied here. The rest of applySingleLine (setLines(1),
         // setHorizontallyScrolling, SingleLineTransformationMethod, the
         // MAX_LENGTH_FOR_SINGLE_LINE_EDIT_TEXT filter) stays out for the reason
-        // already recorded above this method: this tree has no
-        // SingleLineTransformationMethod wiring, and installing the layout half
+        // already recorded above this method: only setSingleLine() installs
+        // SingleLineTransformationMethod, and installing the layout half
         // here would newline-collapse fields fleet-wide. The flag on its own is
         // what isSingleLine() -- and therefore macapkActionIdForEnterEvent() --
         // needs to answer correctly, and it is also the value AOSP's
@@ -4945,7 +5099,48 @@ public class TextView extends View
         if (s) maxLines = 1;
         if (s) { macapkSetMin(1, true); macapkSetMax(1, true); }
         else   { macapkSetMax(Integer.MAX_VALUE, true); }
+        // AOSP setSingleLine -> applySingleLine(singleLine, true, true, true)
+        // (android14 TextView.java:11915-11940):
+        //     if (singleLine) { setLines(1); setHorizontallyScrolling(true);
+        //         setTransformationMethod(SingleLineTransformationMethod.getInstance()); }
+        //     else { ...; setTransformationMethod(null); }
+        // Without the transformation a single-line view kept its '\n': it
+        // MEASURED only the first paragraph while the one-line draw path ran
+        // the whole text on, so it ellipsized almost at once. MEASURED:
+        // NoNonsense Notes' search result row (title + "\n" + body, wrap_content,
+        // setSingleLine(true) when "rows" = 1) measured 99 px and showed
+        // "Shopping li ...". Scoped: the API call only (setInputType still sets
+        // the flag alone, see setInputType), and an app transformation such as
+        // a password mask is left in place. MACAPK_SINGLELINE_TRANSFORM=0
+        // restores the old behaviour.
+        if (MACAPK_SINGLELINE_TRANSFORM) {
+            final android.text.method.TransformationMethod sl =
+                android.text.method.SingleLineTransformationMethod.getInstance();
+            if (s) {
+                // Replace whatever is installed, as AOSP does -- AppCompat's
+                // setTransformationMethod override re-wraps it in emoji2's
+                // EmojiTransformationMethod, which every AppCompatTextView
+                // already carries -- except a password mask: our inflater
+                // applies XML singleLine AFTER the constructor chain, where
+                // AOSP's applySingleLine runs before setInputType installs it.
+                if (!(mTransformationMethod instanceof android.text.method.PasswordTransformationMethod)) {
+                    setTransformationMethod(sl);
+                    mMacapkSingleLineTransform = true;
+                }
+            } else if (mMacapkSingleLineTransform) {
+                // AOSP's applySingleLine(false, ...) clears the transformation.
+                // Only undo one this method installed, so a field that was
+                // never set single-line here keeps its own.
+                mMacapkSingleLineTransform = false;
+                setTransformationMethod(null);
+            }
+        }
     }
+    static final boolean MACAPK_SINGLELINE_TRANSFORM =
+        !"0".equals(System.getenv("MACAPK_SINGLELINE_TRANSFORM"));
+    /** setSingleLine(true) installed SingleLineTransformationMethod (possibly
+     *  re-wrapped by an AppCompat subclass, so not comparable by identity). */
+    private boolean mMacapkSingleLineTransform;
     public void setSingleLine() { setSingleLine(true); }
 
     /** AOSP TextView.isSingleLine() (android14-release TextView.java:7405-7408),
@@ -5501,10 +5696,55 @@ public class TextView extends View
         return new android.graphics.drawable.Drawable[]{
             mDrawableLeft, mDrawableTop, mDrawableRight, mDrawableBottom };
     }
+    /** AOSP getCompoundDrawablesRelative (android14 TextView.java:3384-3400)
+     *  returns the start/end pair that was set. When only absolute drawables
+     *  are set AOSP's start/end are null; ours keeps its older answer there,
+     *  the absolute pair read as start/end, now mirrored for an RTL view, so a
+     *  get-then-setCompoundDrawablesRelative round trip keeps each icon on its
+     *  side. */
     public android.graphics.drawable.Drawable[] getCompoundDrawablesRelative() {
-        // LTR: start==left, end==right (we don't track RTL on TextView).
+        if (mMacapkRelativeDrawables) {
+            return new android.graphics.drawable.Drawable[]{
+                mDrawableStart, mDrawableTop, mDrawableEnd, mDrawableBottom };
+        }
+        final boolean rtl = macapkRtl();
         return new android.graphics.drawable.Drawable[]{
-            mDrawableLeft, mDrawableTop, mDrawableRight, mDrawableBottom };
+            rtl ? mDrawableRight : mDrawableLeft, mDrawableTop,
+            rtl ? mDrawableLeft : mDrawableRight, mDrawableBottom };
+    }
+
+    // ---- RELATIVE compound drawables (start / end) --------------------------
+    // AOSP keeps drawableStart / drawableEnd beside the absolute pair and
+    // RESOLVES them against the layout direction (TextView.resolveDrawables /
+    // Drawables.resolveWithLayoutDirection, android14 :1011-1060, re-run from
+    // onResolveDrawables on every RTL change): in an RTL view the START drawable
+    // shows on the RIGHT. Ours mapped start->left unconditionally, so in an
+    // RTL layout (a Hebrew or Arabic locale) every relative icon sat on the
+    // wrong side -- and MaterialButton, which publishes its icon with
+    // setCompoundDrawablesRelative and, for RTL, a NEGATIVE iconLeft offset
+    // meant for the right-hand slot, drew it entirely outside the button:
+    // Privacy Friendly Notes' FAB-menu close button was an empty pill.
+    private android.graphics.drawable.Drawable mDrawableStart, mDrawableEnd;
+    private boolean mMacapkRelativeDrawables;
+    /** True while start/end drawables are set (AOSP Drawables.mOverride): the
+     *  inflater uses it to let XML drawableStart/End win over drawableLeft/Right
+     *  whatever their attribute order, as AOSP's constructor does. */
+    public boolean macapkHasRelativeDrawables() { return mMacapkRelativeDrawables; }
+
+    private boolean macapkRtl() {
+        try { return isLayoutRtl(); } catch (Throwable t) { return false; }
+    }
+
+    private void macapkShowRelative() {
+        final boolean rtl = macapkRtl();
+        macapkSetShowing(rtl ? mDrawableEnd : mDrawableStart, mDrawableTop,
+                         rtl ? mDrawableStart : mDrawableEnd, mDrawableBottom);
+    }
+
+    @Override
+    public void onRtlPropertiesChanged(int layoutDirection) {
+        super.onRtlPropertiesChanged(layoutDirection);
+        if (mMacapkRelativeDrawables) macapkShowRelative();
     }
     public int  getTotalPaddingLeft() { return getCompoundPaddingLeft(); }
     public int  getTotalPaddingRight() { return getCompoundPaddingRight(); }
@@ -5530,6 +5770,17 @@ public class TextView extends View
                                        android.graphics.drawable.Drawable top,
                                        android.graphics.drawable.Drawable right,
                                        android.graphics.drawable.Drawable bottom) {
+        // AOSP: "We're switching to absolute, discard relative."
+        mMacapkRelativeDrawables = false;
+        mDrawableStart = null;
+        mDrawableEnd = null;
+        macapkSetShowing(left, top, right, bottom);
+    }
+    /** The drawables actually shown, absolute sides (AOSP mShowing[]). */
+    private void macapkSetShowing(android.graphics.drawable.Drawable left,
+                                  android.graphics.drawable.Drawable top,
+                                  android.graphics.drawable.Drawable right,
+                                  android.graphics.drawable.Drawable bottom) {
         mDrawableLeft = left; mDrawableTop = top;
         mDrawableRight = right; mDrawableBottom = bottom;
         // Bounds are the CALLER's to own -- AOSP's setCompoundDrawables only
@@ -5555,11 +5806,25 @@ public class TextView extends View
                                                android.graphics.drawable.Drawable top,
                                                android.graphics.drawable.Drawable end,
                                                android.graphics.drawable.Drawable bottom) {
-        // LTR mapping (no RTL tracking on TextView): start->left, end->right.
-        setCompoundDrawables(start, top, end, bottom);
+        // AOSP setCompoundDrawablesRelative (:3218-3290): store start/end and
+        // resolve them against the layout direction (see mDrawableStart).
+        mDrawableStart = start;
+        mDrawableEnd = end;
+        mDrawableTop = top;
+        mDrawableBottom = bottom;
+        mMacapkRelativeDrawables = start != null || end != null;
+        if (mMacapkRelativeDrawables) {
+            macapkShowRelative();
+        } else {
+            macapkSetShowing(null, top, null, bottom);
+        }
     }
     public void setCompoundDrawablesRelativeWithIntrinsicBounds(int start, int top, int end, int bottom) {
-        setCompoundDrawablesWithIntrinsicBounds(start, top, end, bottom);
+        android.content.res.Resources res = null;
+        try { res = getResources(); } catch (Throwable ignored) {}
+        setCompoundDrawablesRelativeWithIntrinsicBounds(
+            macapkDrawableFromRes(res, start), macapkDrawableFromRes(res, top),
+            macapkDrawableFromRes(res, end), macapkDrawableFromRes(res, bottom));
     }
     public void setCompoundDrawablesRelativeWithIntrinsicBounds(
         android.graphics.drawable.Drawable start, android.graphics.drawable.Drawable top,
@@ -5568,7 +5833,7 @@ public class TextView extends View
         // intrinsic bounds before storing (AOSP contract).
         macapkSetIntrinsicBounds(start); macapkSetIntrinsicBounds(top);
         macapkSetIntrinsicBounds(end);   macapkSetIntrinsicBounds(bottom);
-        setCompoundDrawables(start, top, end, bottom);
+        setCompoundDrawablesRelative(start, top, end, bottom);
     }
     public void setCompoundDrawablesWithIntrinsicBounds(
         android.graphics.drawable.Drawable left, android.graphics.drawable.Drawable top,

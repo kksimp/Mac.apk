@@ -91,7 +91,15 @@ mkdir -p "$LIB" "$TMP"
 echo "[java-only] Compiling Java sources..."
 JAVA_LIST="$BUILD/.java.list"
 find "$RT_DIR/java" -name '*.java' ! -path '* [2-9].java' | sort > "$JAVA_LIST"
-"$JAVAC" -d "$TMP" --release 21 -Xlint:-options @"$JAVA_LIST"
+# Android's org.apache.http.legacy (thirdparty/apache-http-legacy/README.md):
+# the REAL Apache HttpClient Android ships, pulled from an Android 14 system
+# image and converted with our DEX converter. On the javac classpath so the
+# framework's own boot-classpath slice of org.apache.http compiles against it,
+# then unpacked into the framework jar (never over a class we compiled).
+APACHE_LEGACY="$RT_DIR/../thirdparty/apache-http-legacy/org.apache.http.legacy.jvm.jar"
+APACHE_CP=(); [ -f "$APACHE_LEGACY" ] && APACHE_CP=(-cp "$APACHE_LEGACY")
+"$JAVAC" -d "$TMP" --release 21 -Xlint:-options "${APACHE_CP[@]}" @"$JAVA_LIST"
+[ -f "$APACHE_LEGACY" ] && ( cd "$TMP" && unzip -qn "$APACHE_LEGACY" -x 'META-INF/*' )
 
 echo "[java-only] Packaging android-framework.jar..."
 find "$TMP" -type f \( -regex '.* [2-9]\.class' -o -regex '.* [2-9]\.class\$.*' \) -delete 2>/dev/null || true

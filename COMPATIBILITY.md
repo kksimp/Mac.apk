@@ -1,8 +1,8 @@
 # Mac.apk App Compatibility
 
-Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-10-20.
+Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-11-04.
 
-**71 apps tested:** ✅ 58 work · ⚠️ 10 partly work · ❌ 3 don't work yet
+**76 apps tested:** ✅ 62 work · ⚠️ 9 partly work · ❌ 5 don't work yet
 
 **Legend:** ✅ yes · ⚠️ partly · ❌ not yet · ❔ not tested yet. **Works** means you can use the app or play the game; **Sound** means its audio plays. An app tested at more than one version has a row for each, newest first.
 
@@ -28,6 +28,7 @@ Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-10-20.
 | **Crossy Road** | 7.11.1 | ✅ | ✅ |  |
 | **Dumb Ways to Die** | 36.1.22 | ✅ | ✅ |  |
 | **Duolingo** | 6.82.3 | ⚠️ | ❔ | Can't make a new account or log in |
+| **Earn to Die 2** | 1.5.6 | ✅ | ✅ | Works (owner hand test, 2026-11-04). |
 | **Efteling** | 5.27.0 | ❌ | ❔ | Stuck on welcome screen. |
 | **Efteling** | 5.25.0 | ❌ | ❔ |  |
 | **Efteling** | 5.24.0 | ❌ | ❔ |  |
@@ -41,13 +42,18 @@ Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-10-20.
 | **Geometry Dash Lite** | 2.2.147 | ✅ | ✅ |  |
 | **Geometry Dash Lite** | 2.2.11 | ✅ | ✅ |  |
 | **Geometry Dash Meltdown** | 2.2.147 | ⚠️ | ✅ | Full-screen ads now play, but they still break the game afterwards. |
+| **Google Play services** | 26.41.31 (190400-1002748488) | ✅ | ❔ | Draws its screen: ❔. Google's real Play services running as an app (a background host with no window of its own). Works alongside the Play Store and the apps that use it. |
+| **Google Play Store** | 53.7.23-34 [0] [PR] 1001145691 | ✅ | ✅ | Google's real Play Store running as an app. Opens and draws its store screens, browses, installs and updates free apps and uninstalls them, signing in through the Mac.apk account. Play Billing and Play Integrity do not work. See the wiki's Google Play Store page. |
+| **Google Services Framework** | 14 | ✅ | ❔ | Draws its screen: ❔. Google's real Services Framework running as an app (a background host with no window of its own). Works alongside Play services and the Play Store. |
 | **Hill Climb Racing** | 1.72.2 | ✅ | ✅ | 1.72.2 works. 1.71.1 crashed at startup. |
 | **Hill Climb Racing** | 1.71.1 | ❌ | ✅ |  |
 | **Hill Climb Racing** | 1.68.1 | ✅ | ✅ |  |
 | **Hill Climb Racing** | 1.43.0 | ✅ | ✅ |  |
 | **Hill Climb Racing** | 1.8.1 | ✅ | ✅ |  |
+| **Hill Climb Racing 2** | 1.76.0 | ❌ | ❌ | Icon: ❌. Draws its screen: ❌. Does not start on v1.0.2366: boot ends in UnsatisfiedLinkError (wkdfd.F.a) because libfingersoft_hcr2 is import-protected and its init is skipped; with that skip off the library calls exit(101) after reading /proc/self/maps. Not a regression; not owner hand-tested, from a crash diagnosis. |
 | **iiSU** | 0.1.6.1 | ✅ | ❔ | Icon: ❔. Finds RetroArch and launches games in it. |
-| **Instagram** | 445.0.0.45.83 | ⚠️ | ❔ | Weird layout issues. Video choppy and sound inop |
+| **Instagram** | 452.1.0.53.64 | ❌ | ❔ | Draws its screen: ❌. Weird layout issues. Video choppy and sound inop 452.1.0.53.64 does not start (found by the update check); 445.0.0.45.83 worked. |
+| **Instagram** | 445.0.0.45.83 | ⚠️ | ❔ |  |
 | **Jetpack 2** | 0.1.60 | ❌ | ❔ | Stuck loading at 59% |
 | **Jetpack Joyride** | 1.3.5 | ✅ | ✅ |  |
 | **Lemuroid** | 1.17.0 | ✅ | ❔ | Icon: ❔. Retro game emulator (F-Droid). Super Mario Advance 2 (GBA) plays. Downloads each system's emulator core on first use. |
@@ -56,7 +62,8 @@ Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-10-20.
 | **mGrađani** | 1.0.18 | ✅ | ❔ | Icon: ❔. NIAS login page works since Mac.apk v1.0.1723 (it was blank before). |
 | **Mindustry** | 8-fdroid-160.5 | ✅ | ✅ | Online multiplayer currently inop |
 | **Mindustry** | 8-fdroid-158 | ✅ | ✅ |  |
-| **Minecraft** | 1.26.52.3 | ✅ | ❔ | Multiplayer works (joined a server). |
+| **Minecraft** | 1.26.60.4 | ✅ | ✅ | Works on v1.0.2377 (owner check, 2026-11-04). Multiplayer works (joined a server). On v1.0.2303 this version crashed at startup (10-29 update check). |
+| **Minecraft** | 1.26.52.3 | ✅ | ❔ |  |
 | **Minecraft** | 1.26.45.1 | ✅ | ✅ | Boots, renders and Xbox sign-in works. |
 | **NewPipe** | 0.29.0 | ⚠️ | ✅ | Some videos play with sound only and buffer constantly |
 | **Now in Android** | 0.1.2 | ✅ | ✅ |  |

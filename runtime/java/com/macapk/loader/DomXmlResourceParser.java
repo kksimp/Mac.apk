@@ -435,6 +435,12 @@ public final class DomXmlResourceParser
         if (e.type != START_TAG || e.node == null) return null;
         return e.node.getAttributes();
     }
+    /** BinaryXmlParser's alias / attr-id records: not document attributes. */
+    private static boolean macapkInternalAttr(Node n) {
+        String uri = n.getNamespaceURI();
+        return BinaryXmlParser.MACAPK_ALIAS_NS.equals(uri) || BinaryXmlParser.MACAPK_ATTRID_NS.equals(uri)
+            || BinaryXmlParser.MACAPK_DOCNAME_NS.equals(uri);
+    }
     @Override public int getAttributeCount() {
         NamedNodeMap a = currentAttrs();
         if (a == null) return -1;
@@ -442,8 +448,9 @@ public final class DomXmlResourceParser
         // among attributes.
         int n = 0;
         for (int i = 0; i < a.getLength(); ++i) {
-            String nm = a.item(i).getNodeName();
-            if (!nm.startsWith("xmlns")) ++n;
+            Node it = a.item(i);
+            String nm = it.getNodeName();
+            if (!nm.startsWith("xmlns") && !macapkInternalAttr(it)) ++n;
         }
         return n;
     }
@@ -451,7 +458,15 @@ public final class DomXmlResourceParser
         Node a = nthAttr(index);
         if (a == null) return null;
         String ln = a.getLocalName();
-        return ln != null ? ln : a.getNodeName();
+        if (ln == null) ln = a.getNodeName();
+        // The compiled file's own spelling, as XmlBlock.Parser answers
+        // (BinaryXmlParser.MACAPK_DOCNAME_NS).
+        if (a.getParentNode() == null && cursor >= 0 && cursor < events.size()
+                && events.get(cursor).node instanceof org.w3c.dom.Element el) {
+            String doc = el.getAttributeNS(BinaryXmlParser.MACAPK_DOCNAME_NS, ln);
+            if (doc != null && !doc.isEmpty()) return doc;
+        }
+        return ln;
     }
     @Override public String getAttributeNamespace(int index) {
         Node a = nthAttr(index);
@@ -512,6 +527,14 @@ public final class DomXmlResourceParser
                 }
             }
         }
+        // Pass 3: the attr under its resource-TABLE name (BinaryXmlParser's
+        // alias for a document that spells the attribute differently).
+        for (int i = 0; i < a.getLength(); ++i) {
+            Node n = a.item(i);
+            if (BinaryXmlParser.MACAPK_ALIAS_NS.equals(n.getNamespaceURI()) && name.equals(n.getLocalName())) {
+                return n.getNodeValue();
+            }
+        }
         return null;
     }
     private Node nthAttr(int index) {
@@ -521,6 +544,7 @@ public final class DomXmlResourceParser
         for (int i = 0; i < a.getLength(); ++i) {
             Node it = a.item(i);
             if (it.getNodeName().startsWith("xmlns")) continue;
+            if (macapkInternalAttr(it)) continue;
             if (n == index) return it;
             ++n;
         }
@@ -613,6 +637,14 @@ public final class DomXmlResourceParser
         String local = n.getLocalName();
         if (local == null || local.isEmpty()) local = n.getNodeName();
         if (local == null || local.isEmpty()) return 0;
+        // The compiled document's own resource-map id, when BinaryXmlParser kept it.
+        NamedNodeMap all = currentAttrs();
+        for (int i = 0; all != null && i < all.getLength(); ++i) {
+            Node it = all.item(i);
+            if (BinaryXmlParser.MACAPK_ATTRID_NS.equals(it.getNamespaceURI()) && local.equals(it.getLocalName())) {
+                try { return Integer.parseInt(it.getNodeValue()); } catch (NumberFormatException ignored) { }
+            }
+        }
         final String uri = n.getNamespaceURI();
         final boolean isAndroidNs = uri != null
             && uri.startsWith("http://schemas.android.com/apk/res/android");

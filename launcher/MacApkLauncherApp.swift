@@ -19,6 +19,7 @@
 // dozen files would hide the structure.
 
 import SwiftUI
+import ServiceManagement
 import AppKit
 import CoreServices
 import UniformTypeIdentifiers
@@ -31,6 +32,43 @@ import Combine
 // flag the compiler emits "'main' attribute cannot be used in a module that
 // contains top-level code". This file has no top-level code, only type
 // declarations, so -parse-as-library makes everything resolve correctly.
+
+/// The global Language override (Language menu). Absent = follow macOS's preferred
+/// languages. The runtime reads the same file in android.os.LocaleList, so every app
+/// launched afterwards starts in this language unless it has its own choice (the
+/// Language menu inside a running app, i.e. LocaleManager.setApplicationLocales).
+/// Layout stays in sync with LocaleList.readMacApkLanguageOverride.
+enum LanguageOverride {
+    static let choices: [(tag: String, name: String)] = [
+        ("en", "English"), ("es", "Español"), ("fr", "Français"), ("de", "Deutsch"),
+        ("it", "Italiano"), ("pt-BR", "Português (Brasil)"), ("nl", "Nederlands"),
+        ("sv", "Svenska"), ("pl", "Polski"), ("ru", "Русский"), ("tr", "Türkçe"),
+        ("ar", "العربية"), ("hi", "हिन्दी"), ("th", "ไทย"), ("vi", "Tiếng Việt"),
+        ("id", "Bahasa Indonesia"), ("ja", "日本語"), ("ko", "한국어"),
+        ("zh-Hans", "简体中文"), ("zh-Hant", "繁體中文"),
+    ]
+
+    static var fileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/MacApk/language")
+    }
+
+    static func current() -> String {
+        (try? String(contentsOf: fileURL, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    /// Empty tag restores "System Default" by removing the file.
+    static func set(_ tag: String) {
+        if tag.isEmpty {
+            try? FileManager.default.removeItem(at: fileURL)
+            return
+        }
+        try? FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? tag.write(to: fileURL, atomically: true, encoding: .utf8)
+    }
+}
 
 /// Takes the Help menu off the menu bar (owner, 2026-10-13). SwiftUI has no
 /// way to drop the menu itself: `CommandGroup(replacing: .help)` only empties
@@ -68,11 +106,28 @@ struct MacApkLauncherApp: App {
     // The shared LaunchModel holds APK path, verbose flag, run state, and
     // log feed. All views observe it.
     @StateObject private var model = LaunchModel()
+    @State private var languageTag = LanguageOverride.current()
     /// Shared with LauncherView's inline button, so the menu item and the
     /// button always agree about whether an update is waiting.
     @StateObject private var updates = UpdateChecker.shared
 
     init() {
+        // An app stub's request (AppStubMain SystemBrokerCheck): register the
+        // system broker's background item and quit, with no window. Only this
+        // bundle can, because SMAppService finds the agent plist in the CALLER's
+        // own bundle (Contents/Library/LaunchAgents/org.macapk.system.plist).
+        if CommandLine.arguments.contains("--ensure-system-broker") {
+            let gms = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/Mac.apk/use-google-gms")
+            if FileManager.default.fileExists(atPath: gms.path) {
+                let item = SMAppService.agent(plistName: "org.macapk.system.plist")
+                if item.status != .enabled && item.status != .requiresApproval {
+                    do { try item.register() }
+                    catch { FileHandle.standardError.write("register org.macapk.system failed: \(error)\n".data(using: .utf8)!) }
+                }
+            }
+            exit(0)
+        }
         // Harness-only settings never belong in the owner's control panel
         // (owner, 2026-10-19: "the mac.apk app still launches apps in the
         // background"). scripts/rebuild_and_run.sh ends with `open` on this
@@ -170,6 +225,24 @@ struct MacApkLauncherApp: App {
             // its only item opened a "Help isn't available" dialog. This empties
             // the menu; HelpMenuRemover takes the empty menu off the bar.
             CommandGroup(replacing: .help) { }
+            // Language: "System Default" follows macOS; a pick overrides it for apps
+            // launched afterwards. A running app's own Language menu overrides this.
+            CommandMenu("Language") {
+                Button(languageTag.isEmpty ? "✓ System Default" : "System Default") {
+                    LanguageOverride.set("")
+                    languageTag = ""
+                }
+                Divider()
+                ForEach(LanguageOverride.choices, id: \.tag) { choice in
+                    Button(languageTag == choice.tag
+                           ? "✓ \(choice.name)" : choice.name) {
+                        LanguageOverride.set(choice.tag)
+                        languageTag = choice.tag
+                    }
+                }
+                Divider()
+                Text("Applies to apps opened from now on")
+            }
         }
     }
 }
@@ -1005,8 +1078,13 @@ final class LaunchModel: ObservableObject {
     /// An INSTALLED app opened from this window runs as its own .app (see
     /// launchInstalledBundle): this is that app, the timer tailing its run
     /// log into the log panel, and the termination observer.
-    var runningApp: NSRunningApplication?
-    var runLogTimer: DispatchSourceTimer?
+    ///
+    /// Several installed apps can run at once (v1.0.2367), so these are keyed
+    /// by pid: `runningApps` is every app this window opened that is still
+    /// alive, `runLogTimers` one log tail per app, and ONE termination
+    /// observer serves all of them. `isRunning` means "at least one is".
+    var runningApps: [pid_t: (app: NSRunningApplication, label: String)] = [:]
+    var runLogTimers: [pid_t: DispatchSourceTimer] = [:]
     var terminationObserver: NSObjectProtocol?
 
     /// Resolve the runtime binary's absolute path. Lookup order:
@@ -2033,7 +2111,11 @@ struct LauncherView: View {
         // truth for "actually run" lives in this view; the tile just
         // signals intent.
         .onChange(of: model.pendingLaunch) { _, _ in
-            if !model.isRunning && !model.apkPath.isEmpty {
+            // An INSTALLED app opens as its own .app, so any number of them
+            // can run at once and a second launch is never refused. Only the
+            // direct-spawn path (a dropped, uninstalled APK) is one at a time:
+            // it owns the window's single child process.
+            if !model.apkPath.isEmpty && (!model.isRunning || installedBundleForLaunch() != nil) {
                 launch()
             }
         }
@@ -2053,7 +2135,7 @@ struct LauncherView: View {
         // with its window closed) gets the URL appended before this view's
         // onChange is watching, so that first value is never a "change".
         // Drain on appear too, or that install silently never starts.
-        .onAppear { drainPendingInstalls() }
+        .onAppear { drainPendingInstalls(); ensureSystemBrokerMatchesSwitch() }
         // Refresh on activation: re-READ the registry, then reconcile it
         // against the disk. The reconcile half catches a bundle or APK the
         // user deleted in Finder while the launcher sat in the background;
@@ -2758,6 +2840,49 @@ struct LauncherView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
+                // Owner, 2026-10-30: "a toggle inside the settings ... use google
+                // gms". The REAL Google Play services, Services Framework and Play
+                // Store, installed by the user, each run as their own app process
+                // and other apps reach them through the Mac.apk system broker
+                // (docs/cross-process-binder-over-mach_2026-10-30.md). The runtime
+                // reads this from a file (SystemClient.useGoogleGmsFile), like the
+                // folders switch above, because a Dock-launched app gets no
+                // environment from here. Default OFF: without it nothing changes.
+                Section("Google services") {
+                    Toggle("Use Google GMS", isOn: googleGmsBinding)
+                    Text("Lets your Android apps use the real Google Play services. You "
+                       + "install three Google apps in Mac.apk yourself, pulled from an "
+                       + "Android emulator: Google Play services, Google Services "
+                       + "Framework and the Google Play Store. Each runs as its own app "
+                       + "in the background, but only while an Android app is open: about "
+                       + "a minute after the last one closes they stop, and they start "
+                       + "again when you open one. While they are stopped, apps that are "
+                       + "closed get no push notifications (Google holds them until you "
+                       + "open an app), and Google's own background sync pauses. "
+                       + "Takes effect the next time each app opens. "
+                       + "See \"Google Play services\" in the Mac.apk wiki for the steps.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    HStack {
+                        Text(brokerStatusText).font(.caption).foregroundColor(.secondary)
+                        Spacer()
+                        if Self.systemBroker.status == .requiresApproval {
+                            Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+                        }
+                    }
+                    ForEach(Self.googlePackages, id: \.package) { g in
+                        HStack {
+                            Image(systemName: googleInstalled(g.package)
+                                  ? "checkmark.circle.fill" : "circle")
+                                .foregroundColor(googleInstalled(g.package) ? .green : .secondary)
+                            Text(g.label)
+                            Spacer()
+                            Text(googleInstalled(g.package) ? "Installed" : "Not installed")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
                 if model.devMenuRevealed {
                     Section("App files") {
                         // The path itself is deliberately NOT rendered here
@@ -2835,7 +2960,7 @@ struct LauncherView: View {
             }
             .formStyle(.grouped)
         }
-        .frame(width: 480, height: model.devMenuRevealed ? 760 : 340)
+        .frame(width: 480, height: model.devMenuRevealed ? 1520 : 816)
         .onAppear {
             defaultHandlerFeedback = nil
             refreshDefaultHandlerSummary()
@@ -3767,6 +3892,95 @@ struct LauncherView: View {
         })
     }
 
+    /// The "Use Google GMS" switch: ON when the file exists (default OFF). The
+    /// runtime reads the same file (SystemClient.useGoogleGmsFile).
+    private static var googleGmsFile: URL {
+        Paths.supportDir.appendingPathComponent("use-google-gms")
+    }
+    @State private var googleGmsOn: Bool =
+        FileManager.default.fileExists(atPath: googleGmsFile.path)
+    private var googleGmsBinding: Binding<Bool> {
+        Binding(get: { googleGmsOn }, set: { on in
+            let f = Self.googleGmsFile
+            if on {
+                try? FileManager.default.createDirectory(
+                    at: f.deletingLastPathComponent(), withIntermediateDirectories: true)
+                FileManager.default.createFile(atPath: f.path, contents: Data())
+            } else {
+                try? FileManager.default.removeItem(at: f)
+            }
+            googleGmsOn = FileManager.default.fileExists(atPath: f.path)
+            setSystemBroker(enabled: googleGmsOn)
+        })
+    }
+
+    /// The Mac.apk system broker, an SMAppService LaunchAgent inside this bundle
+    /// (Contents/Library/LaunchAgents/org.macapk.system.plist -> Helpers/
+    /// macapk-system). It exists only while "Use Google GMS" is on: registered
+    /// here when it is turned on, unregistered when it is turned off. macOS shows
+    /// it in System Settings > General > Login Items; launchd starts it on demand.
+    private static let systemBroker = SMAppService.agent(plistName: "org.macapk.system.plist")
+    @State private var brokerStatusText: String = Self.describeBroker()
+
+    private func setSystemBroker(enabled: Bool) {
+        do {
+            if enabled {
+                if Self.systemBroker.status != .enabled { try Self.systemBroker.register() }
+            } else if Self.systemBroker.status != .notRegistered {
+                try Self.systemBroker.unregister()
+            }
+        } catch {
+            model.appendLog("[settings] background item \(enabled ? "register" : "unregister") failed: \(error)")
+        }
+        brokerStatusText = Self.describeBroker()
+    }
+
+    /// The launch-time check behind the switch (owner, 2026-10-31: the apps an
+    /// app relies on, such as Play services, must be set up when it starts).
+    /// "Use Google GMS" ON means the background item must be registered: the
+    /// switch registers it only at the moment it is flipped, so a switch turned
+    /// on before the item existed, a reinstalled Mac.apk, or a failed register
+    /// left the file ON and launchd with no `org.macapk.system` -- every app then
+    /// logged "broker org.macapk.system not found" and saw no Play services.
+    /// Runs when the panel appears and before every app launch; registering an
+    /// already-enabled item is skipped, and a refusal is logged, not fatal.
+    private func ensureSystemBrokerMatchesSwitch() {
+        guard FileManager.default.fileExists(atPath: Self.googleGmsFile.path) else { return }
+        let status = Self.systemBroker.status
+        if status == .enabled || status == .requiresApproval || status == .notFound {
+            brokerStatusText = Self.describeBroker()
+            return
+        }
+        do {
+            try Self.systemBroker.register()
+            model.appendLog("[launcher] Use Google GMS is on: registered the background item (was \(status.rawValue))")
+        } catch {
+            model.appendLog("[launcher] Use Google GMS is on but the background item could not be registered: \(error)")
+        }
+        brokerStatusText = Self.describeBroker()
+    }
+
+    private static func describeBroker() -> String {
+        switch systemBroker.status {
+        case .enabled:          return "Background item: on"
+        case .requiresApproval: return "Background item: waiting for your approval in System Settings > Login Items"
+        case .notRegistered:    return "Background item: off"
+        case .notFound:         return "Background item: not found in this copy of Mac.apk"
+        @unknown default:       return "Background item: unknown"
+        }
+    }
+    /// The three Google packages the switch relies on, in the order the wiki
+    /// installs them.
+    private static let googlePackages: [(package: String, label: String)] = [
+        ("com.google.android.gsf", "Google Services Framework"),
+        ("com.google.android.gms", "Google Play services"),
+        ("com.android.vending", "Google Play Store"),
+    ]
+    private func googleInstalled(_ pkg: String) -> Bool {
+        guard let reg = try? RegistryStore.shared.load() else { return false }
+        return !reg.records(forPackage: pkg).isEmpty
+    }
+
     /// Opens ~/Library/Application Support/MacApk (AppDataLayout.root) itself,
     /// rather than selecting it in its parent, so the per-app folders are what
     /// Finder shows.
@@ -4410,7 +4624,9 @@ struct LauncherView: View {
         if let p = model.process, p.isRunning {
             p.terminate()
         }
-        if let app = model.runningApp, !app.isTerminated {
+        for (_, entry) in model.runningApps {
+            let app = entry.app
+            guard !app.isTerminated else { continue }
             app.terminate()
             // A runtime that does not honour Quit within a few seconds is
             // stopped the way the old child process was.
@@ -4448,14 +4664,20 @@ struct LauncherView: View {
         let app = library.apps.first(where: { $0.id == model.selectedAppId })
         let label = model.appLabel.isEmpty ? bundle.deletingPathExtension().lastPathComponent
                                            : model.appLabel
+        let othersRunning = !model.runningApps.isEmpty
         model.isRunning = true
         model.status = ""
-        model.resetPhase(to: .preparing)
         model.unsupportedAbiWarning = nil
-        model.logLines.removeAll()
-        model.nonPinnedCount = 0
-        model.pinnedCount = 0
-        model.resetLiveLog()
+        if !othersRunning {
+            // The log panel and step label belong to the first app of a
+            // session; a second launch keeps them so the first app's output
+            // is not wiped, and its lines are prefixed with the app name.
+            model.resetPhase(to: .preparing)
+            model.logLines.removeAll()
+            model.nonPinnedCount = 0
+            model.pinnedCount = 0
+            model.resetLiveLog()
+        }
 
         // What only this window can add: the dev-menu toggles and the
         // environment typed into Settings or the app's Get Info sheet.
@@ -4476,6 +4698,11 @@ struct LauncherView: View {
             for (k, v) in app.env { env[k] = v }
             library.noteLaunched(app)
         }
+        // The services this app may bind (Play services, Services Framework)
+        // run in their own processes, started by the background item on
+        // demand -- so it has to be registered before the app asks for them.
+        ensureSystemBrokerMatchesSwitch()
+
         let cfg = NSWorkspace.OpenConfiguration()
         cfg.environment = env
         cfg.activates = true
@@ -4486,17 +4713,21 @@ struct LauncherView: View {
         NSWorkspace.shared.openApplication(at: bundle, configuration: cfg) { running, error in
             DispatchQueue.main.async {
                 guard let running, error == nil else {
-                    self.model.isRunning = false
-                    self.model.resetPhase(to: .idle)
+                    if self.model.runningApps.isEmpty {
+                        self.model.isRunning = false
+                        self.model.resetPhase(to: .idle)
+                    }
                     self.model.status = "Couldn't open \(label): "
                         + (error?.localizedDescription ?? "no app was started")
                     self.model.statusKind = .error
                     return
                 }
-                self.model.runningApp = running
+                self.model.runningApps[running.processIdentifier] = (running, label)
                 if let dirName = app?.dirName ?? (NSDictionary(contentsOf:
                         bundle.appendingPathComponent("Contents/Info.plist"))?["MacapkDirName"] as? String) {
-                    self.tailRunLog(dirName: dirName, since: started)
+                    self.tailRunLog(dirName: dirName, since: started,
+                                    pid: running.processIdentifier,
+                                    prefix: self.model.runningApps.count > 1 ? "[\(label)] " : "")
                 }
                 self.watchTermination(of: running, label: label)
             }
@@ -4505,8 +4736,8 @@ struct LauncherView: View {
 
     /// Stream the app's own run log (written by its stub; MacApkLogDir) into
     /// the log panel, so the window still shows what the runtime prints.
-    private func tailRunLog(dirName: String, since started: Date) {
-        model.runLogTimer?.cancel()
+    private func tailRunLog(dirName: String, since started: Date, pid: pid_t, prefix: String) {
+        model.runLogTimers[pid]?.cancel()
         let url = MacApkLogDir.url().appendingPathComponent("app_\(dirName).log")
         var offset: UInt64 = 0
         var opened = false
@@ -4533,44 +4764,50 @@ struct LauncherView: View {
             while let nl = partial.firstIndex(of: 0x0A) {
                 let line = String(decoding: partial[partial.startIndex..<nl], as: UTF8.self)
                 partial.removeSubrange(partial.startIndex...nl)
-                model.appendLog(line)
+                model.appendLog(prefix + line)
             }
         }
-        model.runLogTimer = timer
+        model.runLogTimers[pid] = timer
         timer.resume()
     }
 
     private func watchTermination(of running: NSRunningApplication, label: String) {
-        if let old = model.terminationObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(old)
-        }
-        let pid = running.processIdentifier
-        model.terminationObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main
-        ) { note in
-            guard let gone = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                  gone.processIdentifier == pid else { return }
-            // One last read so the final lines land, then stop tailing.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
-                self.model.runLogTimer?.cancel()
-                self.model.runLogTimer = nil
+        // One observer for every app this window opened; a second launch
+        // must not replace the first one's (it would never see it close).
+        if model.terminationObserver == nil {
+            model.terminationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main
+            ) { note in
+                guard let gone = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                      let entry = self.model.runningApps[gone.processIdentifier] else { return }
+                self.appDidTerminate(pid: gone.processIdentifier, label: entry.label)
             }
-            if let o = self.model.terminationObserver {
-                NSWorkspace.shared.notificationCenter.removeObserver(o)
-                self.model.terminationObserver = nil
-            }
-            self.model.runningApp = nil
-            self.model.isRunning = false
-            self.model.resetPhase(to: .idle)
-            Task { @MainActor in self.library.refresh() }
-            self.model.status = "\(label) closed."
-            self.model.statusKind = .success
         }
         if running.isTerminated {
             // It quit before the observer was in place.
-            model.runningApp = nil
+            appDidTerminate(pid: running.processIdentifier, label: label, announce: false)
+        }
+    }
+
+    private func appDidTerminate(pid: pid_t, label: String, announce: Bool = true) {
+        // One last read so the final lines land, then stop tailing.
+        let timer = model.runLogTimers.removeValue(forKey: pid)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { timer?.cancel() }
+        model.runningApps.removeValue(forKey: pid)
+        if model.runningApps.isEmpty {
+            if let o = model.terminationObserver {
+                NSWorkspace.shared.notificationCenter.removeObserver(o)
+                model.terminationObserver = nil
+            }
             model.isRunning = false
             model.resetPhase(to: .idle)
+        }
+        Task { @MainActor in self.library.refresh() }
+        if announce {
+            let left = model.runningApps.count
+            model.status = left == 0 ? "\(label) closed."
+                                     : "\(label) closed. \(left) other app\(left == 1 ? "" : "s") still running."
+            model.statusKind = .success
         }
     }
 
@@ -5566,7 +5803,12 @@ final class InstalledLibrary: ObservableObject {
                     var bundleError: String? = nil
                     if let pkg = peek.package, !pkg.isEmpty {
                         let ver = peek.versionName ?? ""
-                        let dirName = ver.isEmpty ? pkg : "\(pkg)_\(ver)"
+                        // Dot-free spelling (GitHub #82); a version already installed
+                        // under its dotted name keeps that name until the stub migrates it.
+                        let knownDirs = (try? RegistryStore.shared.loadReadOnly())?.apps
+                            .filter { $0.package == pkg }.map(\.dirName) ?? []
+                        let dirName = DirNaming.dirName(package: pkg, versionName: ver,
+                                                        adopting: knownDirs)
                         do {
                             let url = try BundleGenerator.generate(
                                 BundleSpec(package: pkg,
@@ -5859,7 +6101,10 @@ final class InstalledLibrary: ObservableObject {
             return nil
         }()
         return InstalledApp(package: pkg, label: label,
-                            version: versionFromDirName(dirName, package: pkg),
+                            // The folder name folds the version's dots (DirNaming); the
+                            // recorded versionName is the faithful display string.
+                            version: (meta["versionName"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                                ?? versionFromDirName(dirName, package: pkg),
                             apkPath: apkPath, dirName: dirName,
                             versionCode: code,
                             originalApkPath: apkPath,
@@ -5954,6 +6199,7 @@ struct AppDetailSheet: View {
                 identitySection
                 storageSection
                 macAppSection
+                optionsSection
                 Section("Environment overrides") {
                     EnvEditor(env: Binding(
                         get: { library.current(app).env },
@@ -6063,6 +6309,24 @@ struct AppDetailSheet: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
+        }
+    }
+
+    private var optionsSection: some View {
+        Section("App options") {
+            Toggle("Run in Android TV mode", isOn: Binding(
+                get: { library.current(app).env["MACAPK_TV_MODE"] == "1" },
+                set: { enabled in
+                    var env = library.current(app).env
+                    if enabled {
+                        env["MACAPK_TV_MODE"] = "1"
+                    } else {
+                        env.removeValue(forKey: "MACAPK_TV_MODE")
+                    }
+                    library.setEnv(env, for: library.current(app))
+                }
+            ))
+            .help("Presents this app with an Android TV instead of a phone: UI mode television plus the Leanback and television device features. For apps that ship a TV (Leanback) interface alongside the phone one.")
         }
     }
 

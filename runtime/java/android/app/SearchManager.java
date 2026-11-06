@@ -104,8 +104,10 @@ public class SearchManager
     private OnDismissListener mDismissListener;
     private OnCancelListener mCancelListener;
 
+    private Context mContext;
+
     public SearchManager() {}
-    public SearchManager(Context context) {}
+    public SearchManager(Context context) { mContext = context; }
 
     /** AOSP startSearch(...): shows the system search dialog over the calling
      *  activity. There is no search dialog on Mac.apk, so nothing is displayed
@@ -149,9 +151,54 @@ public class SearchManager
     }
 
     /** AOSP getSearchableInfo(): the searchable metadata for an activity, or
-     *  null if it declares none. We have no searchable.xml parsing, so null. */
+     *  null if it declares none. AOSP's Searchables.getSearchableInfo
+     *  (services/core/.../search/Searchables.java, android14-release :120-196):
+     *    1. the activity's own `android.app.searchable` meta-data;
+     *    2. else an `android.app.default_searchable` meta-data naming another
+     *       activity, on the activity, then on the application ("*" is the
+     *       deprecated system search: null), resolved against the package
+     *       (a leading '.' is relative) and answered by THAT activity's
+     *       `android.app.searchable`.
+     *  The XML is parsed by SearchableInfo.macapkParse. Answered null before,
+     *  which left every SearchView without a search activity (see
+     *  SearchableInfo's header). */
     public android.app.SearchableInfo getSearchableInfo(ComponentName componentName) {
-        return null;
+        if (componentName == null || mContext == null) return null;
+        try {
+            final android.content.pm.PackageManager pm = mContext.getPackageManager();
+            if (pm == null) return null;
+            final android.content.pm.ActivityInfo ai = pm.getActivityInfo(
+                    componentName, android.content.pm.PackageManager.GET_META_DATA);
+            SearchableInfo own = macapkSearchableOf(pm, ai);
+            if (own != null) return own;
+            String ref = null;
+            if (ai != null && ai.metaData != null) ref = ai.metaData.getString(MD_LABEL_DEFAULT_SEARCHABLE);
+            if (ref == null && ai != null && ai.applicationInfo != null
+                    && ai.applicationInfo.metaData != null) {
+                ref = ai.applicationInfo.metaData.getString(MD_LABEL_DEFAULT_SEARCHABLE);
+            }
+            if (ref == null || ref.isEmpty() || "*".equals(ref)) return null;
+            final String pkg = componentName.getPackageName();
+            final ComponentName referred = new ComponentName(pkg,
+                    ref.charAt(0) == '.' ? pkg + ref : ref);
+            return macapkSearchableOf(pm, pm.getActivityInfo(referred,
+                    android.content.pm.PackageManager.GET_META_DATA));
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static final String MD_LABEL_SEARCHABLE = "android.app.searchable";
+    private static final String MD_LABEL_DEFAULT_SEARCHABLE = "android.app.default_searchable";
+
+    /** AOSP SearchableInfo.getActivityMetaData(Context, ActivityInfo, int). */
+    private SearchableInfo macapkSearchableOf(android.content.pm.PackageManager pm,
+                                              android.content.pm.ActivityInfo ai) {
+        if (ai == null) return null;
+        android.content.res.XmlResourceParser xml = ai.loadXmlMetaData(pm, MD_LABEL_SEARCHABLE);
+        if (xml == null) return null;
+        return SearchableInfo.macapkParse(mContext, xml,
+                new ComponentName(ai.packageName, ai.name));
     }
 
     /** AOSP getSearchablesInGlobalSearch(): "a list containing searchable

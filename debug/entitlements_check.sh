@@ -20,6 +20,7 @@ REQUIRED=(
   com.apple.security.device.audio-input
   com.apple.security.device.camera
   com.apple.security.personal-information.location
+  com.apple.security.device.bluetooth
 )
 GOT=$(codesign -d --entitlements - "$BIN" 2>/dev/null)
 rc=0

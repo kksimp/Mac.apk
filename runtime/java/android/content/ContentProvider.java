@@ -698,7 +698,11 @@ public abstract class ContentProvider implements ContentInterface, ComponentCall
     }
 
     public android.net.Uri canonicalize(android.net.Uri url) { return null; }
-    public final android.net.Uri uncanonicalize(android.net.Uri url) { return url; }
+    // AOSP ContentProvider.uncanonicalize is a PLAIN overridable method (default
+    // returns the input url); it is NOT final. Marking it final made any app whose
+    // provider overrides it fail class-linking with IncompatibleClassChangeError
+    // (Google Play services' providers override it). Match AOSP: overridable.
+    public android.net.Uri uncanonicalize(android.net.Uri url) { return url; }
 
     /** AOSP ContentProvider.shutdown: lifecycle hook called when the
      *  provider host is torn down. Default no-op. */

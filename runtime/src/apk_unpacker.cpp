@@ -480,6 +480,52 @@ struct BinaryManifestInfo {
 //   RES_TABLE_TYPE_SPEC_TYPE 0x0202.
 // A resource id is 0xPPTTEEEE: package id, 1-based type id, entry index.
 
+// UTF-16LE -> UTF-8 for an AXML / resources.arsc string-pool entry: `clen`
+// code units starting at byte offset `p` of `b[0..n)`. Surrogate pairs are
+// combined. A LONE surrogate becomes U+FFFD, as Java's String-to-UTF-8
+// conversion does (it substitutes '?'; U+FFFD keeps the text visibly broken
+// without emitting an invalid UTF-8 sequence): the result is written into
+// meta.json and the --peek-manifest JSON, and a strict UTF-8 JSON parser on the
+// Swift side would reject the whole document over one bad label.
+static std::string Utf16PoolToUtf8(const uint8_t* b, size_t n, size_t p,
+                                   uint32_t clen) {
+    auto u16 = [&](size_t o) -> uint32_t {
+        return (o + 1 < n) ? (b[o] | (uint32_t(b[o + 1]) << 8)) : 0;
+    };
+    std::string out;
+    out.reserve(clen);
+    for (uint32_t i = 0; i < clen && p + 1 < n; ++i, p += 2) {
+        uint32_t cp = u16(p);
+        if (cp >= 0xd800 && cp <= 0xdbff) {
+            uint32_t lo = (i + 1 < clen && p + 3 < n) ? u16(p + 2) : 0;
+            if (lo >= 0xdc00 && lo <= 0xdfff) {
+                cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+                p += 2; ++i;
+            } else {
+                cp = 0xfffd;
+            }
+        } else if (cp >= 0xdc00 && cp <= 0xdfff) {
+            cp = 0xfffd;
+        }
+        if (cp < 0x80) {
+            out.push_back(char(cp));
+        } else if (cp < 0x800) {
+            out.push_back(char(0xc0 | (cp >> 6)));
+            out.push_back(char(0x80 | (cp & 0x3f)));
+        } else if (cp < 0x10000) {
+            out.push_back(char(0xe0 | (cp >> 12)));
+            out.push_back(char(0x80 | ((cp >> 6) & 0x3f)));
+            out.push_back(char(0x80 | (cp & 0x3f)));
+        } else {
+            out.push_back(char(0xf0 | (cp >> 18)));
+            out.push_back(char(0x80 | ((cp >> 12) & 0x3f)));
+            out.push_back(char(0x80 | ((cp >> 6) & 0x3f)));
+            out.push_back(char(0x80 | (cp & 0x3f)));
+        }
+    }
+    return out;
+}
+
 // One string out of a ResStringPool, as UTF-8. `pool_off` is the offset of the
 // pool CHUNK. Decoding one string on demand (rather than the whole pool) is
 // deliberate: a real resources.arsc pool holds tens of thousands of strings
@@ -520,36 +566,9 @@ static std::string ArscPoolString(const uint8_t* b, size_t n, size_t pool_off,
     size_t p = so;
     uint32_t clen = u16(p); p += 2;
     if (clen & 0x8000) { clen = ((clen & 0x7fff) << 16) | u16(p); p += 2; }
-    // UTF-16 -> UTF-8, surrogate pairs included. A label is user-visible text
-    // and routinely non-ASCII, so it is encoded properly rather than degraded.
-    std::string out;
-    out.reserve(clen);
-    for (uint32_t i = 0; i < clen && p + 1 < n; ++i, p += 2) {
-        uint32_t cp = u16(p);
-        if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < clen && p + 3 < n) {
-            uint32_t lo = u16(p + 2);
-            if (lo >= 0xdc00 && lo <= 0xdfff) {
-                cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
-                p += 2; ++i;
-            }
-        }
-        if (cp < 0x80) {
-            out.push_back(char(cp));
-        } else if (cp < 0x800) {
-            out.push_back(char(0xc0 | (cp >> 6)));
-            out.push_back(char(0x80 | (cp & 0x3f)));
-        } else if (cp < 0x10000) {
-            out.push_back(char(0xe0 | (cp >> 12)));
-            out.push_back(char(0x80 | ((cp >> 6) & 0x3f)));
-            out.push_back(char(0x80 | (cp & 0x3f)));
-        } else {
-            out.push_back(char(0xf0 | (cp >> 18)));
-            out.push_back(char(0x80 | ((cp >> 12) & 0x3f)));
-            out.push_back(char(0x80 | ((cp >> 6) & 0x3f)));
-            out.push_back(char(0x80 | (cp & 0x3f)));
-        }
-    }
-    return out;
+    // A label is user-visible text and routinely non-ASCII, so it is encoded
+    // properly rather than degraded.
+    return Utf16PoolToUtf8(b, n, p, clen);
 }
 
 // Resolve `resid` to a string. Returns "" when the id is absent, is not a
@@ -976,15 +995,13 @@ BinaryManifestInfo ParseBinaryManifest(const std::string& d) {
                     size_t p = so;
                     uint32_t clen = u16(p); p += 2;
                     if (clen & 0x8000) { clen = ((clen & 0x7fff) << 16) | u16(p); p += 2; }
-                    std::string s; s.reserve(clen);
-                    for (uint32_t c = 0; c < clen && p + 1 < n; ++c, p += 2) {
-                        uint32_t ch = u16(p);
-                        // Keep 7-bit chars verbatim (package ids, version
-                        // strings); wider chars degrade to '?' -- labels
-                        // that need them come from the Java side later.
-                        if (ch < 0x80) s.push_back(char(ch));
-                        else s.push_back('?');
-                    }
+                    // Same decode the arsc pool uses. This USED to keep 7-bit
+                    // chars verbatim and degrade everything wider to '?', so a
+                    // literal <application android:label> (read straight from
+                    // this pool and handed to the installer for the bundle name
+                    // and meta.json) became "????" -- e.g. a CJK store title.
+                    // An @string-ref label goes through the arsc resolver.
+                    std::string s = Utf16PoolToUtf8(b, n, p, clen);
                     pool[i] = s;
                 }
             }
@@ -4215,6 +4232,46 @@ UnpackedApp UnpackApk(const std::string& apk_path,
         // reporting is preserved.
         cmd.append(" > '").append(conv_tmp_jar.string()).append(".log' 2>&1");
         // ===== MACAPK_CONVERTER_RECIPE_END ==============================
+        // OUTSIDE the recipe markers on purpose (QoS never changes the bytes, and an
+        // edit inside them would re-convert every cached app once). The utility clamp
+        // above is right for an INSTALL, where the conversion is background work behind
+        // the merge and apktool. At a LAUNCH the app is waiting on this jar, and the
+        // clamp is a loss whenever the box is not idle: Play services converted in
+        // 30.4 s clamped against 17.4 s unclamped (2 interleaved runs each, load average
+        // 7-12, 8 cores), and a cold Play launch converts Play and Play services at the
+        // same time. MACAPK_CONVERT_CLAMP=1 keeps the clamp at launch.
+        bool conv_clamped = true;
+        if (!std::getenv("MACAPK_EXTRACT_ONLY") && !(std::getenv("MACAPK_CONVERT_CLAMP") && std::strcmp(std::getenv("MACAPK_CONVERT_CLAMP"), "1") == 0)) {
+            const std::string clamp = "exec /usr/sbin/taskpolicy -c utility /usr/bin/nice -n 20 '";
+            const size_t at = cmd.find(clamp);
+            if (at != std::string::npos) { cmd.replace(at, clamp.size(), "exec '"); conv_clamped = false; }
+        }
+        // Also outside the markers: ONE warm converter JVM for every conversion that
+        // runs at the same time (Main --server). A cold Play launch converts Play,
+        // Play services and Services Framework together, and so does a batch install:
+        // three JVMs that each pay the JIT warm-up (C2 burns more CPU than the
+        // conversion's own wall time on a cold JVM) and fight over the cores with
+        // three worker pools. With --server they queue on one shared process, which
+        // converts them one at a time on the full pool, smallest first. This process
+        // still sees exactly the old contract: the child parses the input itself
+        // (exit 1/3 and .parsed arrive as before), then waits for the shared JVM and
+        // exits with that conversion's exit code, its output replayed into .log, so
+        // conv_pid, the sidecar and the await below are unchanged. If the shared JVM
+        // cannot start or dies, the child converts in-process. Output is the same
+        // bytes either way. The spool is per user, not per app root, so apps with
+        // different roots share one JVM; installs (utility clamp) and launches
+        // (unclamped) get separate servers so a launch never queues behind a
+        // clamped one. MACAPK_DEXCONV_SHARED=0 runs every conversion in its own JVM.
+        const char* shared_env = std::getenv("MACAPK_DEXCONV_SHARED");
+        const char* home = std::getenv("HOME");
+        if (!(shared_env && std::strcmp(shared_env, "0") == 0) && home && *home) {
+            const std::string spool = std::string(home) + "/Library/Caches/MacApk/dexconv/"
+                + (conv_clamped ? "utility" : "default");
+            const std::string main_cls = " com.macapk.dex.Main ";
+            const size_t at = cmd.find(main_cls);
+            if (at != std::string::npos)
+                cmd.insert(at + main_cls.size(), "--server " + ShellQuote(spool) + " ");
+        }
         conv_pid = SpawnShell(cmd);
         if (conv_pid < 0) {
             // Handled at the await site exactly as a failed std::system was:

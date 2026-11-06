@@ -100,6 +100,26 @@ public class StorageManager {
         }
     }
 
+    /** AOSP @AllocateFlags constants (hidden in core StorageManager). Finsky's
+     *  InstallerV2 passes these to the flagged allocateBytes / getAllocatableBytes
+     *  overloads; in AOSP they only relax how much of the volume's RESERVE the
+     *  allocation may consume. Mac.apk holds no reserve back (getAllocatableBytes
+     *  reports raw usable space), so the flags never change our answer -- we
+     *  declare them for signature/field parity so Finsky's calls resolve instead
+     *  of throwing NoSuchFieldError. Values mirror AOSP. */
+    public static final int FLAG_ALLOCATE_AGGRESSIVE = 1 << 0;
+    public static final int FLAG_ALLOCATE_DEFY_ALL_RESERVE = 1 << 1;
+    public static final int FLAG_ALLOCATE_DEFY_HALF_RESERVE = 1 << 2;
+    public static final int FLAG_ALLOCATE_NON_AGGRESSIVE = 1 << 3;
+    public static final int FLAG_ALLOCATE_CACHE_ONLY = 1 << 4;
+
+    /** AOSP getAllocatableBytes(UUID, @AllocateFlags int) -- the flagged variant
+     *  privileged callers (the Play Store) use. The flags only relax the reserve
+     *  AOSP withholds; we withhold none, so the answer matches the 1-arg form. */
+    public long getAllocatableBytes(java.util.UUID storageUuid, int flags) {
+        return getAllocatableBytes(storageUuid);
+    }
+
     /** AOSP: "Allocate the requested number of bytes for your application to
      *  use", clearing cached data as needed, and throwing IOException when it
      *  cannot be satisfied. We have no cache-eviction model, so this succeeds
@@ -107,6 +127,18 @@ public class StorageManager {
      *  rather than silently succeeding and letting the write fail later, which
      *  is the harder failure to diagnose. */
     public void allocateBytes(java.util.UUID storageUuid, long bytes)
+            throws java.io.IOException {
+        allocateBytes(storageUuid, bytes, 0);
+    }
+
+    /** AOSP allocateBytes(UUID, @BytesLong long, @AllocateFlags int) -- the hidden
+     *  SystemApi overload Finsky's InstallerV2 reserve-space step calls. Its
+     *  absence is why every Play Store install died with NoSuchMethodError ->
+     *  InstallerException Status 6400 ("Can't install app"): the reserve step
+     *  threw before any download. Same behavior as the 2-arg form (succeed when
+     *  the space genuinely exists, else IOException); flags only relax AOSP's
+     *  reserve, which we do not hold, so they do not change our answer. */
+    public void allocateBytes(java.util.UUID storageUuid, long bytes, int flags)
             throws java.io.IOException {
         if (bytes <= 0L) return;
         long avail = getAllocatableBytes(storageUuid);

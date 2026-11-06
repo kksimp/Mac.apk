@@ -74,13 +74,46 @@ public final class ConstantPool {
      * whole class with size optimizations enabled; the DEX front end can do
      * the same rather than failing the class outright.
      *
-     * <p>Not final: {@link CodeWriter.CodeLengthExceeded} refines it, because
-     * the code_length case is the one a front end can act on (by outlining)
-     * while a full constant pool is not.
+     * <p>Not final: {@link CodeWriter.CodeLengthExceeded} and
+     * {@link PoolFullException} refine it, because those are the two cases a
+     * front end can act on: an oversize method by outlining or splitting it, a
+     * full pool by dropping the constant readings nothing observes.
      */
     public static class LimitExceededException extends RuntimeException {
         private static final long serialVersionUID = 1L;
         public LimitExceededException(String msg) { super(msg); }
+    }
+
+    /**
+     * The constant_pool_count case of {@link LimitExceededException}, as its own
+     * type so a front end can tell it apart from the other limits and retry the
+     * class with a pool-saving strategy (DexConverter.rescueWithElision, see
+     * ConstReadingElision), exactly as {@link CodeWriter.CodeLengthExceeded}
+     * lets it retry an oversize method.
+     */
+    public static final class PoolFullException extends LimitExceededException {
+        private static final long serialVersionUID = 1L;
+        public PoolFullException(String msg) { super(msg); }
+    }
+
+    /** "Utf8=..., Long=..." -- what the pool is spent on, for the overflow message. */
+    public String census() {
+        int[] n = new int[19];
+        int end = (mode == Mode.SPLIT) ? MAX_ENTRIES : bot;
+        for (int i = 1; i < end; i++) {
+            int t = tags[i] & 0xFF;
+            if (t < n.length) n[t]++;
+        }
+        String[] names = { null, "Utf8", null, "Integer", "Float", "Long", "Double", "Class",
+                "String", "Fieldref", "Methodref", "InterfaceMethodref", "NameAndType", null,
+                null, "MethodHandle", "MethodType", "Dynamic", "InvokeDynamic" };
+        StringBuilder sb = new StringBuilder();
+        for (int t = 0; t < n.length; t++) {
+            if (n[t] == 0 || names[t] == null) continue;
+            if (sb.length() > 0) sb.append(", ");
+            sb.append(names[t]).append('=').append(n[t]);
+        }
+        return sb.toString();
     }
 
     /**
@@ -263,7 +296,7 @@ public final class ConstantPool {
      */
     private int alloc(int tag, boolean low, int width) {
         if (space() < width) {
-            throw new LimitExceededException("constant pool full (65534 entries)");
+            throw new PoolFullException("constant pool full (65534 entries; " + census() + ")");
         }
         int index;
         if (mode == Mode.SPLIT && !low) {
@@ -529,6 +562,34 @@ public final class ConstantPool {
     }
 
     public int tagAt(int index) { return tags[index] & 0xFF; }
+
+    /**
+     * The member a CONSTANT_Fieldref names, as {@link #memberKey} would spell
+     * it, or null when {@code index} is not a Fieldref. Read only: it never
+     * allocates an entry, so asking cannot change the class file.
+     */
+    String fieldRefKey(int index) {
+        if (index <= 0 || index >= tags.length || (tags[index] & 0xFF) != CONSTANT_Fieldref) {
+            return null;
+        }
+        int nat = y[index];
+        return utf8Key(x[x[index]]) + '\0' + utf8Key(x[nat]) + '\0' + utf8Key(y[nat]);
+    }
+
+    /**
+     * owner, name and descriptor joined by NUL, each as its modified-UTF-8
+     * bytes read as ISO-8859-1. That is a lossless view of the exact bytes
+     * (the JVM compares names byte for byte), and NUL never occurs inside
+     * modified UTF-8 (JVMS 4.4.7), so the key is unambiguous.
+     */
+    static String memberKey(String owner, String name, String descriptor) {
+        return latin1(toModifiedUtf8(owner)) + '\0' + latin1(toModifiedUtf8(name))
+                + '\0' + latin1(toModifiedUtf8(descriptor));
+    }
+
+    private String utf8Key(int utf8Index) { return latin1(utf8Table[x[utf8Index]]); }
+
+    private static String latin1(byte[] b) { return new String(b, StandardCharsets.ISO_8859_1); }
 
     // ---- serialization ---------------------------------------------------
 

@@ -227,7 +227,7 @@ static const std::unordered_set<std::string> kPointerAwareImports = {
     "__assert2", "__ctype_get_mb_cur_max", "__fgets_chk", "__open_2",
     "__read_chk", "__write_chk", "__strncpy_chk2", "__system_property_get",
     "android_set_abort_message",
-    "epoll_create1", "eventfd", "gettid", "prctl", "sched_getscheduler",
+    "epoll_create1", "eventfd", "gettid", "prctl", "sched_getscheduler", "syscall",
     "newlocale", "uselocale", "freelocale",
     "strcoll_l", "strxfrm_l", "wcscoll_l", "wcsxfrm_l",
     "strftime_l", "strtoll_l", "strtoull_l", "strtold_l",
@@ -331,6 +331,9 @@ static const std::unordered_set<std::string> kPointerAwareImports = {
     // load -> blank cocos2d-x v2 menus). __macapk_shim_dlsym returns guest
     // trampolines; non-libandroid requests keep the prior libSystem behavior.
     "dlopen", "dlsym", "dlclose",
+    // #105: getauxval + dl_iterate_phdr for the ARM32 xDL/shadowhook module lookup (see
+    // macapk_arm32_synth_modules in bionic_shim.cpp).
+    "getauxval", "dl_iterate_phdr",
     "gzopen", "gzclose",
     // setjmp/longjmp -- libpng uses these for error handling. Bionic's
     // arm jmp_buf is 64 WORDS (256 bytes, _JBLEN 64 in libc/include/
@@ -794,6 +797,32 @@ static bool is_arm32_env_writer_import(const std::string& nm) {
 static bool arm32_gap_gate_on(const char* name) {
     const char* e = std::getenv(name);
     return !(e && *e == '0');
+}
+// MACAPK_ARM32_RWLOCK_SHIM (v1.0.2374, default ON; =0 binds exactly as before, i.e. libSystem's bare
+// names). pthread_rwlock_* / pthread_rwlockattr_* / flock-family had no ARM32 pointer-aware twin, so a
+// guest rwlock (a 40-byte Bionic object in the arena) or FILE* token reached libSystem raw and SEGV'd
+// (Douyin libmetasec_ml: pthread_rwlock_init inside a function-local static initialiser; the recovered
+// fault left the __cxa_guard "in progress" and the process deadlocked under dyld's loader lock).
+// A separate set, like the setenv family, so =0 is a real escape.
+static bool arm32_rwlock_shim_on() {
+    static const bool on = arm32_gap_gate_on("MACAPK_ARM32_RWLOCK_SHIM");
+    return on;
+}
+static bool is_arm32_rwlock_import(const std::string& nm) {
+    if (!arm32_rwlock_shim_on()) return false;
+    static const std::set<std::string> k = {
+        "pthread_rwlock_init", "pthread_rwlock_destroy", "pthread_rwlock_rdlock",
+        "pthread_rwlock_tryrdlock", "pthread_rwlock_wrlock", "pthread_rwlock_trywrlock",
+        "pthread_rwlock_unlock", "pthread_rwlock_timedrdlock", "pthread_rwlock_timedwrlock",
+        "pthread_rwlock_timedrdlock_monotonic_np", "pthread_rwlock_timedwrlock_monotonic_np",
+        "pthread_rwlock_clockrdlock", "pthread_rwlock_clockwrlock",
+        "pthread_rwlockattr_init", "pthread_rwlockattr_destroy", "pthread_rwlockattr_getpshared",
+        "pthread_rwlockattr_setpshared", "pthread_rwlockattr_getkind_np", "pthread_rwlockattr_setkind_np",
+        "flockfile", "funlockfile", "ftrylockfile",
+        "fseeko", "ftello", "popen", "pclose", "asprintf", "vasprintf",
+        "eglGetProcAddress", "fscanf", "vfscanf", "tmpfile",
+    };
+    return k.count(nm) != 0;
 }
 // MACAPK_ARM32_SIGJMP: the whole Bionic setjmp family. Bionic arm
 // (libc/arch-arm/bionic/setjmp.S) has ONE jmp_buf format: `setjmp` is
@@ -9237,6 +9266,7 @@ int run_pipeline(const std::string& in_path,
                 if (!gap.empty() ||
                     kPointerAwareImports.count(nm) ||
                     is_arm32_env_writer_import(nm) ||
+                    is_arm32_rwlock_import(nm) ||
                     is_softfloat_double_import(nm) ||
                     kSoftFloatFloatImports.count(nm)) {
                     // MACAPK_ARM32_SOFTFP_ATOF: atof/strtod bind their

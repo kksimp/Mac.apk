@@ -122,7 +122,7 @@ public class SystemProperties {
         // DIAGNOSTIC (MACAPK_PAIRIP_DEVICE_IDENTITY, default OFF): the pairip integrity
         // VM reads ~40 ro.* properties AND the /proc/self/maps + dl_iterate_phdr module
         // set. Our module set is transcribed from a genuine Google API34 emulator, but
-        // these properties describe "Mac.apk / Voltare / apple_silicon" -- an incoherent
+        // these properties describe "Apple Mac / macapk / apple_silicon" -- an incoherent
         // Frankendevice a real Android never is, and every non-Android token is folded
         // into pairip's per-record accumulator (mod 186 -> bracket test), tipping it into
         // the poison bracket. This gate makes the DEVICE IDENTITY coherent with the module

@@ -140,6 +140,21 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
     static final boolean MACAPK_DIM_FROM_THEME_ACTIVE =
         MACAPK_DIALOG_DIM_FROM_THEME && MACAPK_DIALOG_THEME_WRAPPER;
 
+    /** MACAPK_DIALOG_FLOATING_FROM_THEME (default ON; =0 keeps every dialog
+     *  window at the WRAP_CONTENT seeded in initWindow, the pre-change
+     *  behaviour). PhoneWindow.generateLayout only wraps a FLOATING window
+     *  (`if (mIsFloating) setLayout(WRAP_CONTENT, WRAP_CONTENT)`); any other
+     *  window keeps WindowManager.LayoutParams' MATCH_PARENT default. So a
+     *  Dialog built on a theme with windowIsFloating=false is full screen on a
+     *  device. MEASURED (2026-10-26): ejoysdk's login BrowserDialogFragment
+     *  (theme WebView.Dialog.FullScreen, windowIsFloating=false) got a 20x20px
+     *  window here and its WebView never showed. Needs the wrapper for the same
+     *  reason as the dim: only then is the context's theme the dialog's. */
+    static final boolean MACAPK_DIALOG_FLOATING_FROM_THEME =
+        !"0".equals(System.getenv("MACAPK_DIALOG_FLOATING_FROM_THEME"));
+    static final boolean MACAPK_FLOATING_FROM_THEME_ACTIVE =
+        MACAPK_DIALOG_FLOATING_FROM_THEME && MACAPK_DIALOG_THEME_WRAPPER;
+
     /** MACAPK_DIALOG_WINDOW_ELEVATION (default ON; =0 leaves the dialog decor
      *  at elevation 0 and Window.setElevation a no-op, the pre-change
      *  behaviour). The dialog window takes its theme's windowElevation onto its
@@ -287,6 +302,12 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
      *  below is the hook LayoutInflater.from uses to hand back THIS clone
      *  (debug/dialogtheme_verify/inflater-from-own.patch, LayoutInflater +
      *  ContextThemeWrapper, not this file's owner's). */
+    /** True when `c` is a ContextThemeWrapper that names a theme resource. */
+    static boolean macapkHasThemeOverlay(Context c) {
+        return c instanceof android.view.ContextThemeWrapper
+                && ((android.view.ContextThemeWrapper) c).getThemeResId() != 0;
+    }
+
     static final class MacapkDialogContext extends android.view.ContextThemeWrapper {
         private android.view.LayoutInflater mInflater;
         MacapkDialogContext(Context base, int themeResId) { super(base, themeResId); }
@@ -434,6 +455,14 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
             super.setDimAmount(amount);
             mMacapkHaveDimAmount = true;
         }
+        /** An app's own setLayout before the decor is installed wins over the
+         *  theme's non-floating MATCH_PARENT (AOSP never resizes a
+         *  non-floating window in generateLayout). */
+        private boolean mMacapkAppSetLayout;
+        @Override public void setLayout(int width, int height) {
+            super.setLayout(width, height);
+            mMacapkAppSetLayout = true;
+        }
 
         /** The Window-styleable attributes macapkGenerateLayout reads, in
          *  ascending id order (the order AOSP's styleable arrays use). */
@@ -486,10 +515,8 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
          *  app-wins rules, rather than silently losing its scrim.
          *
          *  NOT PORTED from generateLayout (listed, deliberately; see the lane
-         *  report and docs/dialog-window-theme_2026-09-26.md): the
-         *  windowIsFloating layout (a NON-floating dialog theme is
-         *  MATCH_PARENT on AOSP; ours stays WRAP_CONTENT), Window.isFloating()
-         *  itself, windowCloseOnTouchOutside, windowSoftInputMode,
+         *  report and docs/dialog-window-theme_2026-09-26.md):
+         *  Window.isFloating() itself, windowCloseOnTouchOutside, windowSoftInputMode,
          *  windowAnimationStyle, windowNoTitle, the VALUE of windowMinWidth* and
          *  windowFixed* from the theme (Dialog uses a size-class table for the
          *  value, see MACAPK_DIALOG_WIDTH_AOSP; whether the theme binds one at
@@ -499,7 +526,7 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
          *  window background from windowBackground (Dialog paints its own
          *  panel, macapkApplyDialogBackground). */
         void macapkGenerateLayout() {
-            if (!MACAPK_DIM_FROM_THEME_ACTIVE) return;
+            if (!MACAPK_DIM_FROM_THEME_ACTIVE && !MACAPK_FLOATING_FROM_THEME_ACTIVE) return;
             final android.view.WindowManager.LayoutParams params = getAttributes();
             if (params == null) return;
             boolean modelled = false, floating = false, dimEnabled = false;
@@ -518,6 +545,17 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
             } finally {
                 if (a != null) try { a.recycle(); } catch (Throwable ignored) {}
             }
+            // Only when the dialog context carries a real theme overlay. AOSP always
+            // resolves ?dialogTheme / ?alertDialogTheme (the framework base theme
+            // defines both), so an unresolved one (themeResId 0 on a context with no
+            // framework theme) is a state a device cannot have; there the window keeps
+            // the WRAP_CONTENT seeded in initWindow instead of becoming full screen.
+            if (MACAPK_FLOATING_FROM_THEME_ACTIVE && modelled && !floating
+                    && !mMacapkAppSetLayout && macapkHasThemeOverlay(mContext)) {
+                params.width  = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+                params.height = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+            }
+            if (!MACAPK_DIM_FROM_THEME_ACTIVE) return;
             if (!modelled) {
                 dimEnabled = true;
                 dimAmount = 0.6f;
@@ -1040,6 +1078,13 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
         } catch (Throwable ignored) {}
     }
     public void show()      {
+        // AOSP Dialog.show(): an already-shown dialog (possibly hide()n) only
+        // has its decor made VISIBLE again -- it is not re-created or re-added.
+        // DialogFragment relies on this: onStop() hides, onStart() shows.
+        if (mShowing) {
+            if (mDecorAdded != null) mDecorAdded.setVisibility(android.view.View.VISIBLE);
+            return;
+        }
         mShowing = true;
         // AOSP dispatchOnCreate: onCreate(savedInstanceState) runs exactly once,
         // guarded, BEFORE onStart(). The standard idiom is a Dialog subclass that
@@ -1469,7 +1514,13 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
     }
     private boolean mCanceled;
     private android.os.Message mCancelMessage;
-    public void hide() { mShowing = false; }
+    /** AOSP Dialog.hide(): hides the decor but leaves the dialog showing, so a
+     *  later show() makes it visible again and dismiss() still removes it.
+     *  (Clearing mShowing here made dismiss() return early and leave the
+     *  decor in the overlay stack.) */
+    public void hide() {
+        if (mDecorAdded != null) mDecorAdded.setVisibility(android.view.View.GONE);
+    }
 
     public void setTitle(CharSequence title) { this.mTitle = title; }
     public void setTitle(int resId) {}
@@ -1494,6 +1545,8 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
         return v;
     }
 
+    /** AOSP Dialog.isShowing(): "return mShowing". A hide()n dialog is still
+     *  showing; only dismiss() clears it. */
     public boolean isShowing() { return mShowing; }
     public Context getContext() { return mContext; }
     public android.view.Window getWindow() { return mWindow; }

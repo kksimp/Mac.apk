@@ -56,12 +56,12 @@
 //
 //     _apkt/lib/<abi>/libpuzzlesgen.so                   <- a copy of THIS
 //                                                           binary, mode 0755
-//     _apkt/lib/<abi>/.macapk-elfexec/libpuzzlesgen.so   <- the guest ELF
+//     _apkt/lib/.macapk-elfexec/<abi>/libpuzzlesgen.so   <- the guest ELF
 //
 // Nothing in the app's path changes: the file it stats, `canExecute()`s and
 // execs is at exactly the path Android would use, and it really is executable.
 // This helper recovers the guest ELF purely from its own executable path --
-// same basename, under the sibling `.macapk-elfexec/` directory -- so it needs
+// same basename, under `../.macapk-elfexec/<abi>/` -- so it needs
 // no env var, no data-dir knowledge and no per-app configuration.
 //
 // ZERO per-APK code: the trigger is an ELF-header property (PT_INTERP /
@@ -429,8 +429,9 @@ int main(int argc, char** argv, char** envp) {
     std::string self = self_path();
     if (self.empty()) die("cannot determine my own path");
     const std::string dir     = dir_of(self);
-    const std::string sidecar = dir + "/" + kSidecarDir;
-    const std::string elf     = sidecar + "/" + base_of(self);
+    std::string sidecar = dir_of(dir) + "/" + kSidecarDir + "/" + base_of(dir);
+    if (!is_file(sidecar + "/" + base_of(self))) sidecar = dir + "/" + kSidecarDir;
+    const std::string elf = sidecar + "/" + base_of(self);
 
     if (!is_file(elf)) {
         // Hand-run diagnostic: dump what needed_of() sees in an ELF, so the

@@ -226,6 +226,36 @@ codesign --force --sign - --options runtime \
     --entitlements "$PROJECT_DIR/runtime/scripts/jit-entitlements.plist" \
     --identifier org.macapk.location "$LOC_APP"
 
+# The Mac.apk SYSTEM BROKER (launcher/SystemBrokerMain.c; design:
+# docs/cross-process-binder-over-mach_2026-10-30.md): a native host for the
+# bundled JVM running com.macapk.loader.SystemServer, started on demand by
+# launchd through the SMAppService agent below, which Settings > "Use Google
+# GMS" registers. Same entitlements as the runtime (the JIT needs them under
+# the hardened runtime).
+echo "[3c/5] Building the Mac.apk system broker (macapk-system)..."
+BROKER_JDK="$(macapk_jdk_home 2>/dev/null || echo "${JAVA_HOME:-/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home}")"
+clang -O2 -mmacosx-version-min=26.4 -I"$BROKER_JDK/include" -I"$BROKER_JDK/include/darwin" \
+    -o "$CONTENTS/Helpers/macapk-system" "$LAUNCHER_DIR/SystemBrokerMain.c"
+codesign --force --sign - --options runtime \
+    --entitlements "$PROJECT_DIR/runtime/scripts/jit-entitlements.plist" \
+    --identifier org.macapk.system "$CONTENTS/Helpers/macapk-system"
+mkdir -p "$CONTENTS/Library/LaunchAgents"
+cat > "$CONTENTS/Library/LaunchAgents/org.macapk.system.plist" <<'AGENTPLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>org.macapk.system</string>
+    <key>BundleProgram</key><string>Contents/Helpers/macapk-system</string>
+    <key>MachServices</key><dict><key>org.macapk.system</key><true/></dict>
+    <key>AssociatedBundleIdentifiers</key><array><string>org.macapk.launcher</string></array>
+    <key>ThrottleInterval</key><integer>1</integer>
+    <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+AGENTPLIST
+plutil -lint "$CONTENTS/Library/LaunchAgents/org.macapk.system.plist" >/dev/null
+
 echo "[4/5] Copying Info.plist and bundling runtime binary..."
 cp "$LAUNCHER_DIR/Info.plist" "$CONTENTS/Info.plist"
 
@@ -338,7 +368,7 @@ if [ -x "$RUNTIME_BIN" ]; then
     #   libMoltenVK       the Vulkan ICD (Vulkan-over-Metal); the loader
     #                     dlopens it via MoltenVK_icd.json (see below).
     # The last two are optional so a Metal-only ANGLE build still bundles.
-    for libname in libGLESv2.dylib libEGL.dylib libvulkan.dylib libMoltenVK.dylib libskiko-macos-arm64.dylib libmacapk-skia-metal.dylib; do
+    for libname in libGLESv2.dylib libEGL.dylib libvulkan.dylib libMoltenVK.dylib libskiko-macos-arm64.dylib libmacapk-skia-metal.dylib libmacapk-binder.dylib; do
         if [ -f "$RUNTIME_BIN_DIR/$libname" ]; then
             cp "$RUNTIME_BIN_DIR/$libname" "$RESOURCES_DIR/$libname"
             echo "  Bundled Resources/$libname: $(du -h "$RESOURCES_DIR/$libname" | cut -f1)"
@@ -559,6 +589,27 @@ fi
 echo "[5/5] Setting bundle metadata..."
 # PkgInfo file is legacy but some macOS tools still expect it.
 printf "APPL????" > "$CONTENTS/PkgInfo"
+
+# Seal the bundle (ad-hoc), LAST, after every file is in place. Each nested
+# Mach-O is signed where it is built, but the bundle itself never was, so
+# `codesign --verify --deep --strict` failed with "code has no resources but
+# signature indicates they must be present" -- and SMAppService refuses to load
+# an agent plist from an unsealed bundle: "Codesigning failure loading plist:
+# org.macapk.system.plist code: -67056". So on a dev install the "Use Google
+# GMS" background item could never register, launchd never knew
+# org.macapk.system, and every app logged "broker org.macapk.system not found"
+# (measured on the owner's Mac, 2026-10-31). Same flags as build_dist.sh's
+# final `sign "$APP" --entitlements "$ENT"` minus the identity, so a dev
+# bundle carries the release seal's shape. Non-fatal: a seal that fails leaves
+# a usable dev build, but says so.
+codesign --force --sign - --options runtime \
+    --entitlements "$PROJECT_DIR/runtime/scripts/jit-entitlements.plist" "$APP_DIR"
+if codesign --verify --deep --strict "$APP_DIR" 2>/dev/null; then
+    echo "  Sealed (ad-hoc): codesign --verify --deep --strict passes"
+else
+    echo "  WARN: the bundle seal does not verify; the Google services background item cannot register:"
+    codesign --verify --deep --strict --verbose=2 "$APP_DIR" 2>&1 | sed 's/^/    /' | head -5
+fi
 
 # Touch the bundle so Finder recognizes the changes if you open it.
 touch "$APP_DIR"

@@ -42,7 +42,13 @@ public class Process {
 
     public static int  myPid()  { return (int) ProcessHandle.current().pid(); }
     public static int  myTid()  { return (int) Thread.currentThread().getId(); }
-    public static int  myUid()  { return FIRST_APPLICATION_UID; }
+    /** This app's uid. With the Mac.apk system broker on, each package has its
+     *  own (com.macapk.loader.AppUids, as PMS assigns them) so another process
+     *  can tell callers apart; otherwise the one app uid, as before. */
+    public static int  myUid()  {
+        int u = com.macapk.loader.AppUids.selfUid();
+        return u > 0 ? u : FIRST_APPLICATION_UID;
+    }
     public static UserHandle myUserHandle() { return UserHandle.CURRENT; }
     // AOSP Process.isApplicationUid(uid) delegates to UserHandle.isApp(uid):
     // true if the uid's app-id falls in [FIRST_APPLICATION_UID, LAST_APPLICATION_UID]
@@ -304,7 +310,10 @@ public class Process {
      *  sandbox. Mac.apk loads SDKs in-process, so false. */
     public static boolean isSdkSandbox() { return false; }
 
-    public static String myProcessName() { return "com.macapk.app"; }
+    /** AOSP Process.myProcessName (API 33): ActivityThread.currentProcessName(),
+     *  i.e. the package name in a package's default process and the real
+     *  `<pkg>:name` in one the broker spawned for another android:process. */
+    public static String myProcessName() { return android.app.ActivityThread.currentProcessName(); }
 }
 
 

@@ -6,6 +6,7 @@
 // the JNI shims in native_methods.cpp.
 
 #import "macapk/cocoa_bridge.h"
+#include "macapk/proxy_settings.h"
 
 #import <AppKit/AppKit.h>
 #import <MetalKit/MetalKit.h>
@@ -69,6 +70,23 @@
 // view's mouseDown:/mouseDragged:/mouseUp: directly instead of posting through
 // NSApplication, which would treat the tap as an activating click. Changes
 // nothing an app can observe; =0/unset is the shipped path.
+// MACAPK_SERVICE_HOST=1 (cross-process Binder phase 3, 2026-10-30): this
+// process was started by the Mac.apk system broker to answer another app's
+// bindService (e.g. Google Play services serving the Play Store), not by the
+// user opening it. On a device that is a background process with no UI, so
+// here: the PROHIBITED activation policy (no Dock icon, no menu bar, never
+// activates) and no window is ever ordered on screen. The window objects still
+// exist, so the AppKit run loop, the main looper and the frame clock run
+// exactly as in a normal launch -- only visibility differs. Boot skips the
+// launcher activity for the same reason (com.macapk.loader.SystemClient).
+static bool MacApkServiceHost() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_SERVICE_HOST");
+        return e && std::strcmp(e, "1") == 0;
+    }();
+    return on;
+}
+
 static bool MacApkHarnessNoActivate() {
     static const bool on = [] {
         const char* e = std::getenv("MACAPK_NO_ACTIVATE");
@@ -108,7 +126,10 @@ static void MacApkFocusLogAfterShow(const char* where) {
 #include <ptrauth.h>       // MACAPK_MAIN_STALL_MS: strip PAC from saved return addresses
 #include <thread>          // MACAPK_MAIN_STALL_MS: the watchdog thread
 #include <arm_neon.h>      // macapk_premultiply_argb's 16-pixel opaque/clear block test
+
 #endif
+
+extern "C" void MacApkWebViewCheckpointStores(void);   // webview_bridge.mm: checkpoint WebKit WALs before _exit
 
 // MACAPK_SWAPPY_BRIDGE (2026-09-27): is bionic_shim.cpp's Swappy present bridge
 // (__macapk_arm64_swappy_present_tick) installed? This MUST give the same answer
@@ -845,7 +866,8 @@ static void macapk_kick_render_views(const char* why) {
         // TASK STAYS HIDDEN" above.
         const bool visible = w.isVisible;
         const bool mini = w.isMiniaturized;
-        if (macapk_wake_kick_should_order_front(visible, mini, app_hidden, respect_bg)) {
+        if (!MacApkServiceHost()
+                && macapk_wake_kick_should_order_front(visible, mini, app_hidden, respect_bg)) {
             std::fprintf(stderr, "[I] cocoa: wake-kick: render window=%p was NOT "
                          "visible -- ordering front\n", (void*)w);
             [w orderFront:nil];
@@ -3666,6 +3688,7 @@ static void macapk_terminate_now(int code) {
         for (pid_t p : v) std::fprintf(stderr, " %d", (int) p);
         std::fprintf(stderr, "\n");
     }
+    MacApkWebViewCheckpointStores();
     std::fprintf(stderr, "[quit] +%lldms _exit(%d)\n", macapk_wall_ms() - t0, code);
     std::fflush(nullptr);
     ::_exit(code);
@@ -3736,6 +3759,7 @@ void CocoaQuitBackstopExit() {
         for (pid_t p : v) std::fprintf(stderr, " %d", (int) p);
         std::fprintf(stderr, "\n");
     }
+    MacApkWebViewCheckpointStores();
     std::fprintf(stderr, "[quit] +%lldms _exit(%d)\n", macapk_wall_ms() - t0, code);
     std::fflush(nullptr);
     ::_exit(code);
@@ -4030,7 +4054,16 @@ bool CocoaInit() {
             }
         }
         const char* hideDock = std::getenv("MACAPK_HIDE_DOCK_ICON");
-        if (dockIcon && dockIcon.isValid) {
+        if (MacApkServiceHost()) {
+            // A process exec'd out of an app bundle is already registered as a
+            // foreground app (Dock tile) before this runs, and AppKit refuses
+            // the switch to Prohibited from there (setActivationPolicy returns
+            // NO). Accessory is always reachable and also drops the Dock tile
+            // and menu bar, so a service host falls back to it.
+            if (![g_app setActivationPolicy:NSApplicationActivationPolicyProhibited]) {
+                [g_app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+            }
+        } else if (dockIcon && dockIcon.isValid) {
             [g_app setActivationPolicy:NSApplicationActivationPolicyRegular];
             [g_app setApplicationIconImage:dockIcon];
         } else if (hideDock && std::strcmp(hideDock, "1") == 0) {
@@ -4166,7 +4199,8 @@ bool CocoaInit() {
                 screenVis.origin.y + (screenVis.size.height - fr0.size.height) / 2.0)];
             --g_own_frame_change;
         }
-        if (MacApkHarnessNoActivate()) [g_placeholder_window orderBack:nil];
+        if (MacApkServiceHost()) { /* background service process: never shown */ }
+        else if (MacApkHarnessNoActivate()) [g_placeholder_window orderBack:nil];
         else {
             [g_placeholder_window makeKeyAndOrderFront:nil];
             [g_app activateIgnoringOtherApps:YES];
@@ -5056,13 +5090,21 @@ static bool fs_policy_on() {
 // of HCR 1.8.1 / GD Lite / OpenGD on the installed stubs, plus Crossy with
 // debug/drag_freeze_watch.sh) is run and notated in Current_State; then flip
 // the default and keep =0 as the bisect switch.
+// v1.0.2308: unset = ON for an app whose window resize reaches it (the Java side
+// replays AOSP's onConfigurationChanged decision, DisplayConfig
+// .wouldReportWindowResize, and pushes it as bit 30 of the top activity's
+// configChanges); an app that would hear nothing (Geometry Jump Lite: "resources
+// only") keeps the aspect lock, since it latches its layout at launch.
+// MACAPK_WINDOW_FREE_RESIZE=1 forces it on for every app, =0 forces it off.
+static std::atomic<bool> g_top_hears_resize{false};
 static bool free_resize_on() {
-    static const bool on = [] {
+    static const int forced = [] {
         const char* e = std::getenv("MACAPK_WINDOW_FREE_RESIZE");
-        return e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "on") == 0
-                     || std::strcmp(e, "true") == 0);
+        if (!e || !*e) return -1;
+        if (std::strcmp(e, "1") == 0 || std::strcmp(e, "on") == 0 || std::strcmp(e, "true") == 0) return 1;
+        return 0;
     }();
-    return on;
+    return forced < 0 ? g_top_hears_resize.load() : forced == 1;
 }
 
 // Split View tiles are fullscreen windows too (NSWindowStyleMaskFullScreen).
@@ -5727,7 +5769,14 @@ static void window_did_resize_main(NSWindow* w) {
 // bitten by. Any thread.
 void CocoaSetTopActivityConfigChanges(int real_config_changes) {
     const bool handles = winpolicy::HandlesSideChange(real_config_changes);
+    const bool hears = (real_config_changes & 0x40000000) != 0;
     dispatch_main_async_void(^{
+        if (g_top_hears_resize.exchange(hears) != hears) {
+            std::fprintf(stderr, "[I] cocoa: top activity %s a window resize: free resize %s (default; "
+                         "MACAPK_WINDOW_FREE_RESIZE overrides)\n",
+                         hears ? "hears" : "does not hear", hears ? "on" : "off");
+            if (g_placeholder_window && g_win_w > 0) relock_window_for_live_main(g_win_w, g_win_h);
+        }
         if (g_wp.live.handles_side_change == handles) return;
         g_wp.live.handles_side_change = handles;
         if (g_wp.active)
@@ -9460,6 +9509,87 @@ static void keybind_set_active(NSString* name) {
     if (attached) vm->DetachCurrentThread();
 }
 
+// ---- Language menu: per-app locale override --------------------------------
+//
+// com.macapk.loader.AppLanguages is the Java half (LocaleManager.setApplicationLocales,
+// the same call Android's Settings > App languages makes). "System Default" is
+// the empty selection: the effective locales fall back to the global Mac.apk
+// override and then to macOS's preferred languages. Called lazily when the menu
+// opens, because the menu is built before the VM handle exists.
+static bool lang_with_env(void (^body)(JNIEnv*, jclass)) {
+    JavaVM* vm = g_touch_vm;
+    if (!vm) return false;
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    jint r = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_21);
+    if (r == JNI_EDETACHED) {
+        if (vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK) return false;
+        attached = true;
+    } else if (r != JNI_OK) {
+        return false;
+    }
+    jclass cls = env->FindClass("com/macapk/loader/AppLanguages");
+    if (!cls) {
+        env->ExceptionClear();
+    } else {
+        body(env, cls);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(cls);
+    }
+    if (attached) vm->DetachCurrentThread();
+    return cls != nullptr;
+}
+
+static NSString* lang_jstring(JNIEnv* env, jstring s) {
+    if (!s) return @"";
+    const char* c = env->GetStringUTFChars(s, nullptr);
+    NSString* out = c ? [NSString stringWithUTF8String:c] : @"";
+    if (c) env->ReleaseStringUTFChars(s, c);
+    return out ?: @"";
+}
+
+static NSArray<NSString*>* lang_supported_tags(void) {
+    NSMutableArray<NSString*>* out = [NSMutableArray array];
+    lang_with_env(^(JNIEnv* env, jclass cls) {
+        jmethodID mid = env->GetStaticMethodID(cls, "supportedTags", "()[Ljava/lang/String;");
+        if (!mid) { env->ExceptionClear(); return; }
+        jobjectArray arr = (jobjectArray) env->CallStaticObjectMethod(cls, mid);
+        if (env->ExceptionCheck() || !arr) { env->ExceptionClear(); return; }
+        jsize n = env->GetArrayLength(arr);
+        for (jsize i = 0; i < n; i++) {
+            jstring s = (jstring) env->GetObjectArrayElement(arr, i);
+            NSString* tag = lang_jstring(env, s);
+            if (tag.length) [out addObject:tag];
+            if (s) env->DeleteLocalRef(s);
+        }
+        env->DeleteLocalRef(arr);
+    });
+    return out;
+}
+
+static NSString* lang_selected_tag(void) {
+    __block NSString* out = @"";
+    lang_with_env(^(JNIEnv* env, jclass cls) {
+        jmethodID mid = env->GetStaticMethodID(cls, "selectedTag", "()Ljava/lang/String;");
+        if (!mid) { env->ExceptionClear(); return; }
+        jstring s = (jstring) env->CallStaticObjectMethod(cls, mid);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); return; }
+        out = lang_jstring(env, s);
+        if (s) env->DeleteLocalRef(s);
+    });
+    return out;
+}
+
+static void lang_select_tag(NSString* tag) {
+    lang_with_env(^(JNIEnv* env, jclass cls) {
+        jmethodID mid = env->GetStaticMethodID(cls, "select", "(Ljava/lang/String;)V");
+        if (!mid) { env->ExceptionClear(); return; }
+        jstring s = env->NewStringUTF(tag ? [tag UTF8String] : "");
+        env->CallStaticVoidMethod(cls, mid, s);
+        if (s) env->DeleteLocalRef(s);
+    });
+}
+
 static NSString* keybind_active_name(void) {
     JavaVM* vm = g_touch_vm;
     if (!vm) return nil;
@@ -9605,6 +9735,9 @@ static MacApkAppearanceObserver* g_appearance_observer = nil;
 @interface MacApkControlsTarget : NSObject <NSMenuDelegate>
 @end
 @implementation MacApkControlsTarget
+- (void)macapkProxySettings:(id)sender {
+    macapk::ShowProxySettings();
+}
 // The Controls menu is ONE radio group of input modes: None, Arrow Keys as
 // D-pad, Tilt Control, Space Bar Taps Center, then each key-binding profile
 // (owner, 2026-10-02: more than one checked "cannot be so"; order per owner,
@@ -9679,6 +9812,45 @@ static MacApkAppearanceObserver* g_appearance_observer = nil;
 }
 - (void)menuNeedsUpdate:(NSMenu*)menu {
     [self macapkRefreshArrowItems:menu];
+}
+@end
+
+// Language menu target: rebuilt every time the menu opens (the supported list and the
+// checkmark come from Java, which is not up when the menu bar is constructed).
+@interface MacApkLanguageTarget : NSObject <NSMenuDelegate>
+@end
+@implementation MacApkLanguageTarget
+- (void)macapkPickLanguage:(NSMenuItem*)item {
+    NSString* tag = (NSString*) [item representedObject];   // nil = System Default
+    macapk::lang_select_tag(tag);
+}
+- (void)menuNeedsUpdate:(NSMenu*)menu {
+    [menu removeAllItems];
+    NSString* sel = macapk::lang_selected_tag();
+    NSMenuItem* sys = [[NSMenuItem alloc] initWithTitle:@"System Default"
+                                                 action:@selector(macapkPickLanguage:)
+                                          keyEquivalent:@""];
+    [sys setTarget:self];
+    [sys setState:sel.length == 0 ? NSControlStateValueOn : NSControlStateValueOff];
+    [menu addItem:sys];
+    NSArray<NSString*>* tags = macapk::lang_supported_tags();
+    if (tags.count) [menu addItem:[NSMenuItem separatorItem]];
+    for (NSString* tag in tags) {
+        NSLocale* own = [NSLocale localeWithLocaleIdentifier:tag];
+        NSString* native = [own displayNameForKey:NSLocaleIdentifier value:tag];
+        NSString* english = [[NSLocale localeWithLocaleIdentifier:@"en"]
+                             displayNameForKey:NSLocaleIdentifier value:tag];
+        NSString* title = native.length ? native : tag;
+        if (english.length && ![english isEqualToString:title])
+            title = [NSString stringWithFormat:@"%@ \u2013 %@", title, english];
+        NSMenuItem* mi = [[NSMenuItem alloc] initWithTitle:title
+                                                    action:@selector(macapkPickLanguage:)
+                                             keyEquivalent:@""];
+        [mi setTarget:self];
+        [mi setRepresentedObject:tag];
+        [mi setState:[sel isEqualToString:tag] ? NSControlStateValueOn : NSControlStateValueOff];
+        [menu addItem:mi];
+    }
 }
 @end
 
@@ -9872,6 +10044,16 @@ static void InstallBackTitlebarAccessory(NSWindow* w) {
     [w addTitlebarAccessoryViewController:acc];        // window retains acc
 }
 
+static MacApkLanguageTarget* g_language_target = nil;
+static void install_language_menu(NSMenu* mainMenu) {
+    NSMenuItem* item = [[NSMenuItem alloc] init];
+    [mainMenu addItem:item];
+    NSMenu* menu = [[NSMenu alloc] initWithTitle:@"Language"];
+    if (!g_language_target) g_language_target = [[MacApkLanguageTarget alloc] init];
+    [menu setDelegate:g_language_target];
+    [item setSubmenu:menu];
+}
+
 static void install_menu_bar(NSString* appTitle) {
     NSMenu* mainMenu = [[NSMenu alloc] init];
 
@@ -9886,6 +10068,10 @@ static void install_menu_bar(NSString* appTitle) {
     // would reach exit(0) and re-open the __cxa_finalize deadlock. See
     // -[MacApkControlsTarget macapkQuit:] and macapk_terminate_now.
     if (!g_controls_target) g_controls_target = [[MacApkControlsTarget alloc] init];
+    NSMenuItem* proxyItem = [appMenu addItemWithTitle:@"Network Proxy…"
+        action:@selector(macapkProxySettings:) keyEquivalent:@","];
+    [proxyItem setTarget:g_controls_target];
+    [appMenu addItem:[NSMenuItem separatorItem]];
     NSMenuItem* quitItem =
         [appMenu addItemWithTitle:[NSString stringWithFormat:@"Quit %@", appTitle]
                            action:@selector(macapkQuit:) keyEquivalent:@"q"];
@@ -9907,6 +10093,9 @@ static void install_menu_bar(NSString* appTitle) {
 
     // Controls menu: pick the keyboard-binding profile.
     install_controls_menu(mainMenu);
+
+    // Language menu: per-app override of the macOS language (System Default).
+    install_language_menu(mainMenu);
 
     [g_app setMainMenu:mainMenu];
 }
@@ -10349,7 +10538,8 @@ void CocoaShowWindow(void* window) {
     if (!window) return;
     NSWindow* w = (__bridge NSWindow*)window;
     dispatch_main_async_void(^{
-        if (MacApkHarnessNoActivate()) [w orderBack:nil];
+        if (MacApkServiceHost()) { /* background service process: never shown */ }
+        else if (MacApkHarnessNoActivate()) [w orderBack:nil];
         else {
             [w makeKeyAndOrderFront:nil];
             [g_app activateIgnoringOtherApps:YES];

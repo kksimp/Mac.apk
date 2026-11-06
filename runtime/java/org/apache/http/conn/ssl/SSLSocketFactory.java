@@ -76,6 +76,23 @@ public class SSLSocketFactory implements LayeredSocketFactory {
         this.nameResolver = null;
     }
 
+    /** The JSSE factory to use as is, when constructed around one. */
+    private javax.net.ssl.SSLSocketFactory wrapped;
+
+    /** Android's @hide constructor in its apache-http fork ("Constructs an
+     *  HttpClient SSLSocketFactory backed by the given JSSE SSLSocketFactory"):
+     *  no SSLContext, no name resolver, the given factory makes the sockets.
+     *  The Play Store builds its Phenotype HTTP client this way; without it,
+     *  registering with Phenotype failed with NoSuchMethodException. Written
+     *  from the known AOSP shape -- the source fetch from googlesource did not
+     *  resolve this module's path on 2026-10-30, so recheck against AOSP if
+     *  the semantics ever matter beyond "use this factory". */
+    public SSLSocketFactory(javax.net.ssl.SSLSocketFactory socketfactory) {
+        this.sslcontext = null;
+        this.nameResolver = null;
+        this.wrapped = socketfactory;
+    }
+
     public SSLSocketFactory(KeyStore truststore)
             throws KeyManagementException, KeyStoreException, NoSuchAlgorithmException,
                    UnrecoverableKeyException {
@@ -130,6 +147,7 @@ public class SSLSocketFactory implements LayeredSocketFactory {
     }
 
     private javax.net.ssl.SSLSocketFactory factory() {
+        if (wrapped != null) return wrapped;
         return sslcontext != null
                 ? sslcontext.getSocketFactory()
                 : (javax.net.ssl.SSLSocketFactory) javax.net.ssl.SSLSocketFactory.getDefault();

@@ -445,7 +445,9 @@ public final class DisplayConfig {
         final int changes = filterDiff(sdk, serverDiff, lastReported, next, buckets, true);
         if ((changes & ~handled) != 0) {
             a.macapkSetLastReportedConfig(next);
-            if (RELAUNCH_ON && ActivityHost.macapkRecreate(a)) {
+            boolean localeChanged = (changes & (Configuration.CONFIG_LOCALE
+                | Configuration.CONFIG_LAYOUT_DIRECTION)) != 0;
+            if ((RELAUNCH_ON || localeChanged) && ActivityHost.macapkRecreate(a)) {
                 NativeLog.i(TAG, "relaunching " + a.getClass().getName() + " (changed 0x"
                     + Integer.toHexString(changes) + " not declared in configChanges 0x"
                     + Integer.toHexString(handled) + ")");
@@ -539,6 +541,35 @@ public final class DisplayConfig {
             NativeLog.w(TAG, "reveal config re-check threw: " + t);
         }
         return false;
+    }
+
+    /** v1.0.2308: would a user window resize reach this activity as
+     *  onConfigurationChanged? Replays the deliverToActivity decision on a
+     *  synthetic half-width display (a window-manager tile is that big a change),
+     *  with no side effects. An activity that would be relaunched, or that gets
+     *  "resources only" (android12 bucket filtering drops screenSize for an app
+     *  with no size qualifiers), is never told its window changed, so a free
+     *  resize leaves it drawing a layout it latched at launch (Geometry Jump
+     *  Lite). The native window keeps the aspect lock for those. */
+    public static boolean wouldReportWindowResize(android.app.Activity a) {
+        if (a == null) return false;
+        final Configuration cur = a.macapkCurrentConfig();
+        if (cur == null) return false;
+        final Configuration next = new Configuration(cur);
+        next.screenWidthDp = Math.max(1, cur.screenWidthDp / 2);
+        next.smallestScreenWidthDp = Math.min(next.screenWidthDp, cur.screenHeightDp);
+        final int sdk = PresentedSdk.get();
+        final int publicDiff = cur.diff(next);
+        final int handled = a.macapkRealConfigChanged();
+        final int[][] buckets = appBuckets();
+        final int changes = filterDiff(sdk, publicDiff, cur, next, buckets, true);
+        if ((changes & ~handled) != 0) return false;        // would relaunch
+        if (sdk <= 30) return publicDiff != 0 && (~handled & publicDiff) == 0;
+        final int f = filterDiff(sdk, publicDiff, cur, next, buckets, false);
+        if (sdk <= 32) return f != 0 && (~handled & f) == 0;
+        final int d = (f != 0) ? f : publicDiff;
+        if (sdk >= 34) return true;                         // bounds changed: always reported
+        return publicDiff != 0 && (~handled & d) == 0;
     }
 
     // ---- AOSP SizeConfigurationBuckets, per presented SDK ------------------------

@@ -165,4 +165,26 @@ public class ContextWrapper extends Context {
     @Override public Resources.Theme getTheme() {
         return baseContext != null ? baseContext.getTheme() : super.getTheme();
     }
+
+    // ---- AOSP ContextWrapper: device-/credential-protected storage flavor is
+    // the base context's. A ContextWrapper owns no storage of its own, so it
+    // delegates all four to mBase (android14-release ContextWrapper.java). This
+    // matters so a ContextThemeWrapper / createConfigurationContext wrapper
+    // around a device-protected StorageContext still reports DE and still
+    // resolves file APIs to the DE area, rather than inheriting Context's
+    // credential-protected defaults.
+    @Override public boolean isDeviceProtectedStorage() {
+        return baseContext != null ? baseContext.isDeviceProtectedStorage() : super.isDeviceProtectedStorage();
+    }
+    @Override public boolean isCredentialProtectedStorage() {
+        return baseContext != null ? baseContext.isCredentialProtectedStorage() : super.isCredentialProtectedStorage();
+    }
+    @Override public Context createDeviceProtectedStorageContext() {
+        return baseContext != null ? baseContext.createDeviceProtectedStorageContext()
+                                   : super.createDeviceProtectedStorageContext();
+    }
+    @Override public Context createCredentialProtectedStorageContext() {
+        return baseContext != null ? baseContext.createCredentialProtectedStorageContext()
+                                   : super.createCredentialProtectedStorageContext();
+    }
 }

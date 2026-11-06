@@ -2,9 +2,7 @@
 //
 // AOSP's high-level entry point to the Bluetooth subsystem. Apps obtain it via
 // getSystemService(BLUETOOTH_SERVICE) and immediately call getAdapter(). Mac.apk
-// has no Bluetooth backend, so getAdapter() returns the (null-capable) default
-// adapter and the connected-device queries return empty lists -- the honest
-// "no Bluetooth hardware" result rather than a null service that NPEs the cast.
+// exposes its opt-in CoreBluetooth backend through the default adapter.
 // Mirrors frameworks/base/core/java/android/bluetooth/BluetoothManager.java.
 package android.bluetooth;
 
@@ -15,38 +13,41 @@ public final class BluetoothManager {
     public BluetoothManager() {}
     public BluetoothManager(Context context) {}
 
-    /** AOSP getAdapter(): the singleton BluetoothAdapter (may be null when no
-     *  Bluetooth hardware is present, which is our case). */
+    /** The singleton adapter, or null when the bridge/hardware is absent. */
     public BluetoothAdapter getAdapter() {
         return BluetoothAdapter.getDefaultAdapter();
     }
 
-    /** AOSP getConnectionState(device, profile): STATE_DISCONNECTED (0) since
-     *  nothing can be connected without a radio. */
+    /** Connection state from the live BLE client and server sessions. */
     public int getConnectionState(BluetoothDevice device, int profile) {
-        return 0; // BluetoothProfile.STATE_DISCONNECTED
+        if (profile != BluetoothProfile.GATT && profile != BluetoothProfile.GATT_SERVER) return 0;
+        int client = BluetoothGatt.macapkConnectionState(device);
+        int server = com.macapk.loader.BluetoothPeripheralBridge.connectionState(device);
+        return server == BluetoothProfile.STATE_CONNECTED ? server : client;
     }
 
-    /** AOSP getConnectedDevices(profile): no devices. */
+    /** GATT devices share the same controller across both roles. */
     public java.util.List<BluetoothDevice> getConnectedDevices(int profile) {
-        return new java.util.ArrayList<>();
+        return getDevicesMatchingConnectionStates(profile, new int[]{BluetoothProfile.STATE_CONNECTED});
     }
 
     /**
      * AOSP openGattServer(): opens a GATT SERVER (this device acting as a BLE
-     * peripheral) and returns null if it could not be opened. There is no
-     * Bluetooth bridge, so null -- which is AOSP's own documented failure
-     * return, and the only answer that does not hand the app a server object
-     * whose addService() would silently never advertise anything.
+     * peripheral) and returns null if access, hardware or the bridge is absent.
      */
     public BluetoothGattServer openGattServer(Context context,
             BluetoothGattServerCallback callback) {
-        return null;
+        return com.macapk.loader.BluetoothPeripheralBridge.openServer(callback);
     }
 
-    /** AOSP getDevicesMatchingConnectionStates: no devices. */
+    /** Unsupported Classic profiles have no sessions in the BLE bridge. */
     public java.util.List<BluetoothDevice> getDevicesMatchingConnectionStates(
             int profile, int[] states) {
-        return new java.util.ArrayList<>();
+        if (profile != BluetoothProfile.GATT && profile != BluetoothProfile.GATT_SERVER)
+            return new java.util.ArrayList<>();
+        java.util.LinkedHashSet<BluetoothDevice> result = new java.util.LinkedHashSet<>(
+            BluetoothGatt.macapkDevicesMatchingConnectionStates(states));
+        result.addAll(com.macapk.loader.BluetoothPeripheralBridge.devicesMatchingConnectionStates(states));
+        return new java.util.ArrayList<>(result);
     }
 }

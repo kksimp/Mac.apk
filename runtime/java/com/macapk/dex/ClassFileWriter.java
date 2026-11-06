@@ -116,6 +116,7 @@ public final class ClassFileWriter {
     public static class Member {
         final ClassFileWriter owner;
         /** Not final only so {@link ClassFileWriter#unfinalFieldsWrittenByInitializerHelpers}
+         *  and {@link ClassFileWriter#unfinalFieldsWrittenOutsideInitializers}
          *  can clear ACC_FINAL once the class's version is known. */
         int access;
         final String name;
@@ -223,9 +224,27 @@ public final class ClassFileWriter {
     /** method_info (JVMS 4.6). */
     public static final class MethodWriter extends Member {
         private CodeWriter code;
+        /** "&lt;clinit&gt;" or "&lt;init&gt;" when this is a synthetic helper holding
+         *  code split or outlined out of that initializer, else null. */
+        private String initializerOf;
 
         MethodWriter(ClassFileWriter owner, int access, String name, String desc) {
             super(owner, access, name, desc);
+        }
+
+        /**
+         * Marks this synthetic method as holding code that the converter moved
+         * out of {@code initializer} ("&lt;clinit&gt;" or "&lt;init&gt;"). The
+         * writes it makes to its class's own fields of that initializer's kind
+         * (putstatic for &lt;clinit&gt;, putfield for &lt;init&gt;) were initializer
+         * writes in the DEX, so they are left to
+         * {@link ClassFileWriter#unfinalFieldsWrittenByInitializerHelpers}
+         * (DEX2JVM_INITIALIZER_HELPER_FINALS) and not counted as foreign writes
+         * by {@link ClassFileWriter#unfinalFieldsWrittenOutsideInitializers}.
+         */
+        public MethodWriter markInitializerHelper(String initializer) {
+            this.initializerOf = initializer;
+            return this;
         }
 
         /**
@@ -388,6 +407,103 @@ public final class ClassFileWriter {
             n++;
         }
         return n;
+    }
+
+    /** See {@link #setUnfinalForeignWrites}. */
+    private boolean unfinalForeignWrites;
+    /** "name:descriptor" of each field toByteArray cleared ACC_FINAL on under
+     *  that rule, in field order, for the converter's log. */
+    private List<String> foreignWriteUnfinals = java.util.Collections.emptyList();
+
+    /**
+     * Have toByteArray apply {@link #unfinalFieldsWrittenOutsideInitializers}
+     * once the class is complete. It runs there, rather than when the caller
+     * thinks the class is done, so it sees every method whoever added it: the
+     * forwarding constructors, a precomputed initializer's helpers, any rescue
+     * that adds a method late.
+     */
+    public void setUnfinalForeignWrites(boolean on) { this.unfinalForeignWrites = on; }
+
+    /** The fields (as "name:descriptor") that rule cleared ACC_FINAL on in the
+     *  last toByteArray; empty when it did not fire. */
+    public List<String> foreignWriteUnfinals() { return foreignWriteUnfinals; }
+
+    /**
+     * Clear ACC_FINAL on every own field the bytecode of this class writes from
+     * a method that may not write it, when the class is emitted at
+     * major_version 53 or above. Returns how many fields.
+     *
+     * A static final may then be written only by a putstatic in &lt;clinit&gt;, an
+     * instance final only by a putfield in &lt;init&gt; (JVMS SE21 6.5; HotSpot
+     * checks it at resolution, so turning bytecode verification off does not skip it; see
+     * {@link #unfinalFieldsWrittenByInitializerHelpers} for the source). ART has
+     * no such rule. Its verifier refuses a put to a final field only from
+     * ANOTHER class, so DEX code may write its own static final from any of its
+     * methods, and obfuscators do: a static {@code init$0} that &lt;clinit&gt;
+     * calls to fill a {@code private static final} table, say. On the JVM that
+     * write is an IllegalAccessError ("Update to static final field ...
+     * attempted from a different method (init$0) than the initializer method
+     * &lt;clinit&gt;"), and the class never initializes. An instance final
+     * written from outside a constructor (or from &lt;clinit&gt;) fails the same
+     * way.
+     *
+     * The rule reads the emitted instructions (CodeWriter.fieldPuts), not
+     * the DEX: a put counts when its Fieldref names this class, a field
+     * declared here and final, of the kind the opcode writes (static for
+     * putstatic, instance for putfield), and the method is not the initializer
+     * of that kind. A synthetic method marked with
+     * {@link MethodWriter#markInitializerHelper} counts as the initializer it
+     * came from, because those writes were initializer writes in the DEX and
+     * DEX2JVM_INITIALIZER_HELPER_FINALS governs them. Other synthetic methods
+     * are counted like any other method. Below 53 HotSpot lets any method of
+     * the class write the field, so nothing changes there.
+     *
+     * A ConstantValue attribute stays. JVMS 4.7.2 assigns it to every field
+     * with ACC_STATIC set, final or not, before &lt;clinit&gt; runs, and HotSpot
+     * parses it for any static field. The converter already emits ConstantValue
+     * on non-final statics, because DEX static_values cover them as well.
+     *
+     * Not for an INTERFACE: JVMS 4.5 requires its fields to be public static
+     * final (see unfinalFieldsWrittenByInitializerHelpers).
+     *
+     * Only access_flags change, and the constant pool is only read, so a class
+     * this does not touch is byte for byte what it was.
+     */
+    public int unfinalFieldsWrittenOutsideInitializers() {
+        if (effectiveMajorVersion() < 53 || (access & ACC_INTERFACE) != 0) return 0;
+        java.util.Map<String, FieldWriter> finals = null;
+        for (FieldWriter f : fields) {
+            if ((f.access & ACC_FINAL) == 0) continue;
+            if (finals == null) finals = new java.util.HashMap<>();
+            finals.put(ConstantPool.memberKey(thisName, f.name, f.desc), f);
+        }
+        if (finals == null) return 0;
+        java.util.Set<FieldWriter> hit = null;
+        for (MethodWriter m : methods) {
+            if (m.code == null) continue;
+            String as = (m.initializerOf != null) ? m.initializerOf : m.name;
+            int[] puts = m.code.fieldPuts();
+            for (int i = 0; i < puts.length; i += 2) {
+                boolean isStatic = puts[i] == CodeWriter.PUTSTATIC;
+                if (as.equals(isStatic ? "<clinit>" : "<init>")) continue;
+                FieldWriter f = finals.get(m.code.pool().fieldRefKey(puts[i + 1]));
+                if (f == null || (f.access & ACC_FINAL) == 0) continue;
+                // A putstatic of an instance field (or the reverse) fails
+                // resolution with IncompatibleClassChangeError whatever the flag.
+                if (((f.access & ACC_STATIC) != 0) != isStatic) continue;
+                f.access &= ~ACC_FINAL;
+                if (hit == null) hit = new java.util.HashSet<>();
+                hit.add(f);
+            }
+        }
+        if (hit == null) return 0;
+        // Declaration order, so the log line is stable.
+        List<String> cleared = new ArrayList<>(hit.size());
+        for (FieldWriter f : fields) {
+            if (hit.contains(f)) cleared.add(f.name + ":" + f.desc);
+        }
+        foreignWriteUnfinals = cleared;
+        return cleared.size();
     }
 
     public void setVersion(int major, int minor) {
@@ -645,6 +761,11 @@ public final class ClassFileWriter {
         if (!hasEnclosingMethod && anonymousEnclosingClass != null) {
             setEnclosingMethod(anonymousEnclosingClass, null, null);
         }
+
+        // Before any field is serialized, while every method still holds its
+        // CodeWriter (MethodWriter.write drops it).
+        foreignWriteUnfinals = java.util.Collections.emptyList();
+        if (unfinalForeignWrites) unfinalFieldsWrittenOutsideInitializers();
 
         // Reserve this_class / super_class early so they land in the low pool
         // slots, purely for readability of javap output.

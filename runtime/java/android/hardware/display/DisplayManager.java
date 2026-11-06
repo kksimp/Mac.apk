@@ -29,6 +29,16 @@ public class DisplayManager {
 
     /** Return the display for the given id; we only have the default. */
     public Display getDisplay(int displayId) { return DEFAULT; }
+    // @hide DisplayManager.getStableDisplaySize(): the stable (physical) display
+    // size in pixels -- on a device the largest-ever dimensions, so wallpaper /
+    // launcher sizing does not churn across display changes. Mac.apk's display is
+    // fixed, so the real size IS the stable size. The Play Store's device-config
+    // init (usa.aG -> wyi.<init>) calls this and NoSuchMethodError'd without it.
+    public android.graphics.Point getStableDisplaySize() {
+        android.graphics.Point p = new android.graphics.Point();
+        getDisplay(android.view.Display.DEFAULT_DISPLAY).getRealSize(p);
+        return p;
+    }
 
     /** Return all displays (just the one). */
     public Display[] getDisplays() { return new Display[] { DEFAULT }; }

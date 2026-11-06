@@ -146,7 +146,7 @@ public final class GmsHttp {
                                     Map<String, String> headers, boolean gzipBody,
                                     int connectMs, int readMs)
             throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        HttpURLConnection c = (HttpURLConnection) com.macapk.loader.HostProxy.openConnection(new URL(url));
         try {
             if (c instanceof HttpsURLConnection tls) HostCrypto.configureServiceHttps(tls);
             c.setRequestMethod(method);

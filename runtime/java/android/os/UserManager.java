@@ -36,6 +36,12 @@ public class UserManager {
     // and cannot observe them missing -- but a REFLECTIVE read
     // (UserManager.class.getField("DISALLOW_SMS")) can, and DevicePolicy /
     // MDM-aware libraries do exactly that when enumerating restriction keys.
+    public static final String USER_TYPE_FULL_SYSTEM = "android.os.usertype.full.SYSTEM";
+    public static final String USER_TYPE_FULL_SECONDARY = "android.os.usertype.full.SECONDARY";
+    public static final String USER_TYPE_FULL_GUEST = "android.os.usertype.full.GUEST";
+    public static final String USER_TYPE_FULL_DEMO = "android.os.usertype.full.DEMO";
+    public static final String USER_TYPE_FULL_RESTRICTED = "android.os.usertype.full.RESTRICTED";
+    public static final String USER_TYPE_SYSTEM_HEADLESS = "android.os.usertype.system.HEADLESS";
     public static final String USER_TYPE_PROFILE_MANAGED = "android.os.usertype.profile.MANAGED";
     public static final String USER_TYPE_PROFILE_CLONE = "android.os.usertype.profile.CLONE";
     public static final String USER_TYPE_PROFILE_PRIVATE = "android.os.usertype.profile.PRIVATE";
@@ -160,6 +166,14 @@ public class UserManager {
     public boolean isAdminUser()   { return true; }
     public boolean isPrimaryUser() { return true; }
     public boolean isProfile()     { return false; }
+    /** API 34: the user that owns the device (non-headless system user here). */
+    public boolean isMainUser()    { return true; }
+    /** API 35. */
+    public boolean isPrivateProfile() { return false; }
+    /** @SystemApi: this process's user type -- the one full system user. */
+    public String getUserType()    { return USER_TYPE_FULL_SYSTEM; }
+    /** @SystemApi (API 30): whether the calling user is of the given type. */
+    public boolean isUserOfType(String userType) { return getUserType().equals(userType); }
 
     public int getUserCount() { return 1; }
 
@@ -229,6 +243,21 @@ public class UserManager {
      *  context user", which always includes the user itself. */
     public List<UserHandle> getUserProfiles() {
         return Collections.singletonList(getUserHandle());
+    }
+
+    /** AOSP android14 :5084 (@hide) -- the profile's parent user, or null when
+     *  the user is not a profile. This device's only user is the system user,
+     *  which is not a profile, so null (UserManagerService.getProfileParent). */
+    public android.content.pm.UserInfo getProfileParent(int userId) { return null; }
+    /** API 31 public form: same answer as a UserHandle. */
+    public UserHandle getProfileParent(UserHandle user) { return null; }
+
+    /** AOSP android14 :4558 (@SystemApi) -- every user's handle, from getUsers.
+     *  This device has exactly one user, the system user 0 (the same answer
+     *  getUserProfiles gives), and nobody is dying, so the flag changes
+     *  nothing. Google Play services' bound-service entry asks it. */
+    public List<UserHandle> getUserHandles(boolean excludeDying) {
+        return new java.util.ArrayList<>(Collections.singletonList(UserHandle.SYSTEM));
     }
 
     /** AOSP :4387 -- `getUserSerialNumber(user.getIdentifier())`, documented

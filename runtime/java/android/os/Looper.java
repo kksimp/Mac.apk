@@ -468,6 +468,16 @@ public final class Looper {
         return mainThreads.contains(Thread.currentThread()) ? MAIN : null;
     }
 
+    /** The Looper this thread's own Looper.prepare() created, or null when it
+     *  never called prepare() (or is a main thread / the GL renderer thread,
+     *  whose Loopers are not made that way). Unlike myLooper() it never falls
+     *  back to MAIN, so Handler's implicit constructors can bind a prepared
+     *  worker's own queue and still keep their MAIN fallback for the threads
+     *  that carry no AOSP Looper identity yet. */
+    public static Looper macapkPreparedLooper() {
+        return sThreadLocal.get();
+    }
+
     public static MessageQueue myQueue() {
         Looper me = myLooper();
         return me != null ? me.queue : null;

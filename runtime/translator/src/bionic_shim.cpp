@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "vk_window_surface_policy.h"  // MACAPK_VK_WINDOW_SURFACE decision (egl window-surface bridge)
+#include "macapk/linker_namespaces.h"  // Android linker namespaces (android_create_namespace & co)
 #include <climits>         // INT_MAX for the __ppoll_chk timeout clamp
 #include <exception>
 #include <cmath>             // std::fabs, std::isnan, std::isinf
@@ -100,6 +101,10 @@
 #include <mach/thread_act.h>  // task_threads / thread_info -- the real /proc/self/task
 #include <mach/thread_status.h> // arm_debug_state64_t for the MACAPK_PAIRIP_WP watchpoint
 #include <mach-o/dyld.h>   // _NSGetExecutablePath for /proc/self/exe
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <vector>
+#include <utility>
 #include <mach-o/loader.h> // mach_header_64 / segment_command_64 -- host-exec-range guard for guest mprotect
 #include <zlib.h>          // libpng IDAT decompression
 #include <png.h>           // host libpng for cocos2d-x PNG decode override
@@ -3193,6 +3198,9 @@ static void macapk_fatal_reraise(int sig) {
     raise(sig);
 }
 
+#include "guest_rwx.h"
+#include "guest_jit_pages.h"
+
 static void macapk_segv_handler(int sig, siginfo_t* info, void* ucontext) {
 #if defined(__APPLE__) && defined(__aarch64__)
     // pairip resolver guard (FIRST -- cheapest, and a fault here is expected): a fault
@@ -3237,6 +3245,8 @@ static void macapk_segv_handler(int sig, siginfo_t* info, void* ucontext) {
     if (ucontext && macapk_syscall_guard_fault(static_cast<ucontext_t*>(ucontext),
             (uintptr_t)static_cast<ucontext_t*>(ucontext)->uc_mcontext->__ss.__pc)) return;
 
+    if (info && ucontext && macapk::jitpages::handle_fault(info, static_cast<ucontext_t*>(ucontext))) return;
+    if (info && ucontext && macapk::rwx::fault(info, static_cast<ucontext_t*>(ucontext))) return;
     if (info && arena_wx_heal_fault(info->si_addr, ucontext)) return;
 
     // MACAPK_PAIRIP_PG page-guard (DIAGNOSTIC, default OFF). Distinct from the
@@ -15218,6 +15228,28 @@ void __macapk_register_segment(uint32_t vaddr,
             "memory range; skipped\n", vaddr, mem_size);
         return;
     }
+    // #105 diagnostic (MACAPK_TRACE_SEGMENTS=1): who registers which guest range, and which
+    // earlier image a new range overlaps (images share one arena; a duplicate bias makes the
+    // later image overwrite the earlier one's bytes).
+    {
+        static const bool on = [] { const char* e = std::getenv("MACAPK_TRACE_SEGMENTS"); return e && *e && *e != '0'; }();
+        if (on) {
+            struct Seg { uint32_t a, b; std::string who; };
+            static std::vector<Seg> segs;
+            static std::mutex mu;
+            Dl_info di{};
+            std::string who = (dladdr(__builtin_return_address(0), &di) && di.dli_fname) ? di.dli_fname : "?";
+            const size_t sl = who.rfind('/'); if (sl != std::string::npos) who = who.substr(sl + 1);
+            std::lock_guard<std::mutex> g(mu);
+            const uint32_t end = vaddr + mem_size;
+            std::fprintf(stderr, "[seg] %s registers [0x%x,0x%x) file=%u\n", who.c_str(), vaddr, end, n_bytes);
+            for (const Seg& p : segs)
+                if (vaddr < p.b && p.a < end && p.who != who)
+                    std::fprintf(stderr, "[seg-overlap] %s [0x%x,0x%x) overlaps %s [0x%x,0x%x)\n",
+                                 who.c_str(), vaddr, end, p.who.c_str(), p.a, p.b);
+            segs.push_back({vaddr, end, who});
+        }
+    }
     if (bytes && n_bytes) {
         // Re-open the target pages first: a previously-loaded dylib's
         // seal may already cover them (all lifted images share one
@@ -15334,6 +15366,21 @@ constexpr uint32_t kMaxThreads       = 32;
 
 static std::atomic<uint32_t> g_next_thread_slot{0};
 static thread_local uint32_t  t_thread_slot_idx = static_cast<uint32_t>(-1);
+static std::mutex                 g_free_slots_mu;
+static std::vector<uint32_t>      g_free_slots;
+static thread_local bool          t_slot_releaser_armed = false;
+// Returns this thread's stack slot to the pool when the thread exits.
+// Slot 0 is the shared overflow slot too, so it is only released if no
+// other thread was put on it (never pushed twice).
+struct SlotReleaser {
+    ~SlotReleaser() {
+        uint32_t idx = t_thread_slot_idx;
+        if (idx == static_cast<uint32_t>(-1)) return;
+        std::lock_guard<std::mutex> g(g_free_slots_mu);
+        for (uint32_t f : g_free_slots) if (f == idx) return;
+        g_free_slots.push_back(idx);
+    }
+};
 
 // Re-entrant guest execution carves a fresh sub-region of the thread's
 // guest stack so a NESTED host->guest entry does not overlap the live
@@ -15365,14 +15412,36 @@ static thread_local uint32_t  t_thread_slot_idx = static_cast<uint32_t>(-1);
 uint32_t __macapk_alloc_thread_stack(void) {
     std::call_once(g_guest_base_once, allocate_guest_memory);
     if (t_thread_slot_idx == static_cast<uint32_t>(-1)) {
-        uint32_t idx = g_next_thread_slot.fetch_add(1);
-        if (idx >= kMaxThreads) {
-            std::fprintf(stderr,
-                "[macapk-shim] WARN: thread stack pool exhausted "
-                "(%u threads); recycling slot 0\n", kMaxThreads);
-            idx = 0;
+        // Slots are handed back when their thread exits (SlotReleaser), so
+        // the pool bounds LIVE guest threads rather than every thread that
+        // ever ran guest code. Without that, an app with a churning thread
+        // pool (#105 AI Douyin) hit the 32-thread ceiling and the fallback
+        // below handed slot 0 to a second thread while the first was still
+        // executing on it, which clobbers a live frame (a JNI_OnLoad stack
+        // canary then failed).
+        uint32_t idx = static_cast<uint32_t>(-1);
+        {
+            std::lock_guard<std::mutex> g(g_free_slots_mu);
+            if (!g_free_slots.empty()) {
+                idx = g_free_slots.back();
+                g_free_slots.pop_back();
+            }
+        }
+        if (idx == static_cast<uint32_t>(-1)) {
+            idx = g_next_thread_slot.fetch_add(1);
+            if (idx >= kMaxThreads) {
+                std::fprintf(stderr,
+                    "[macapk-shim] WARN: thread stack pool exhausted "
+                    "(%u live threads); recycling slot 0\n", kMaxThreads);
+                idx = 0;
+            }
         }
         t_thread_slot_idx = idx;
+        if (!t_slot_releaser_armed) {
+            t_slot_releaser_armed = true;
+            static thread_local SlotReleaser releaser;
+            (void)releaser;
+        }
     }
     // Top-of-stack: top of the slot, minus a 16-byte safety margin
     // for any caller that pre-decrements SP and writes before the
@@ -17460,7 +17529,15 @@ uint32_t __macapk_jni_env_handle(JNIEnv* real_env) {
         (void*)real_env);
     // Each env occupies 8 bytes in guest memory: just a pointer to
     // the shared vtable. We carve from the proxy region.
-    static std::atomic<uint32_t> next_env{kProxyEnvBase + 0x400};   // skip vtable region
+    // The shared vtable occupies [kProxyEnvBase+0x100, kProxyEnvBase+0x500)
+    // (0x400 bytes of 4-byte slots, see install_jni_vtable_in_guest_memory).
+    // This cursor used to start at +0x400, INSIDE that range, so the
+    // 18th env minted overwrote vtable slot 228 (ExceptionCheck, offset
+    // 0x390) with the vtable address, and later envs clobbered the slots
+    // after it (GetObjectRefType, ...). Guest code then "called" the table
+    // base as a function (#105 AI Douyin: libsoloader's env->ExceptionCheck()
+    // logged as an indirect call to 0x38000100). Start past the vtable.
+    static std::atomic<uint32_t> next_env{kProxyEnvBase + 0x500};
     uint32_t addr = next_env.fetch_add(8);
     // Lifted code reads `*env` as a 4-byte vtable pointer; we plant
     // the address of the shared vtable installed by
@@ -30690,6 +30767,242 @@ extern "C" int __macapk_arm64_pthread_rwlockattr_setkind_np(long* attr,
     return 0;
 }
 
+// ARM32 pthread_rwlock_* / pthread_rwlockattr_* (#105, Douyin libmetasec_ml: its function-local
+// static initialiser called pthread_rwlock_init on a guest object; with no shim the guest pointer
+// reached libSystem's pthread_rwlock_init raw and SEGV'd, and the recovered fault left the
+// __cxa_guard "in progress" forever -- see macapk_segv_handler).
+//
+// Bionic's 32-bit pthread_rwlock_t is `int32_t __private[10]` (40 bytes) and its
+// pthread_rwlockattr_t a 4-byte `long`; both from bionic/libc/include/bits/pthread_types.h:
+//     typedef struct { #if defined(__LP64__) int32_t __private[14]; #else int32_t __private[10]; #endif } pthread_rwlock_t;
+//     typedef long pthread_rwlockattr_t;
+// The 64-bit family above keeps ALL its state in rw[0..7] (see its layout table), which fits the
+// 40-byte ILP32 object, so the guest object is operated on IN PLACE through the arena mapping --
+// the only differences are init (zero 10 words, not 14, so it never writes past the object),
+// the 4-byte attr, and the 8-byte guest timespec of the timed variants.
+static int32_t* arm32_rw(uint32_t g) { return g ? reinterpret_cast<int32_t*>(gptr(g)) : nullptr; }
+static bool arm32_abstime(uint32_t g, struct timespec* out) {
+    if (!g) return false;
+    int32_t v[2];
+    std::memcpy(v, gptr(g), sizeof v);          // ILP32 struct timespec { time_t(int32); long(int32); }
+    out->tv_sec = v[0];
+    out->tv_nsec = v[1];
+    return true;
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlock_init(uint32_t rwl, uint32_t attr, uint32_t, uint32_t) {
+    int32_t* rw = arm32_rw(rwl);
+    if (!rw) return kBionicEINVAL;
+    for (int i = 0; i < 10; ++i) rw[i] = 0;
+    if (attr) {
+        int32_t a = 0;
+        std::memcpy(&a, gptr(attr), sizeof a);
+        if ((a & ~3) != 0) return kBionicEINVAL;   // bionic: only PSHARED(1) and KIND(2) bits
+        rw[2] = (a & 2) ? 1 : 0;
+    }
+    return 0;
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlock_destroy(uint32_t rwl, uint32_t, uint32_t, uint32_t) {
+    int32_t* rw = arm32_rw(rwl);
+    return rw ? static_cast<uint32_t>(__macapk_arm64_pthread_rwlock_destroy(rw)) : kBionicEINVAL;
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlock_rdlock(uint32_t rwl, uint32_t, uint32_t, uint32_t) {
+    int32_t* rw = arm32_rw(rwl);
+    return rw ? static_cast<uint32_t>(__macapk_arm64_pthread_rwlock_rdlock(rw)) : kBionicEINVAL;
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlock_tryrdlock(uint32_t rwl, uint32_t, uint32_t, uint32_t) {
+    int32_t* rw = arm32_rw(rwl);
+    return rw ? static_cast<uint32_t>(__macapk_arm64_pthread_rwlock_tryrdlock(rw)) : kBionicEINVAL;
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlock_wrlock(uint32_t rwl, uint32_t, uint32_t, uint32_t) {
+    int32_t* rw = arm32_rw(rwl);
+    return rw ? static_cast<uint32_t>(__macapk_arm64_pthread_rwlock_wrlock(rw)) : kBionicEINVAL;
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlock_trywrlock(uint32_t rwl, uint32_t, uint32_t, uint32_t) {
+    int32_t* rw = arm32_rw(rwl);
+    return rw ? static_cast<uint32_t>(__macapk_arm64_pthread_rwlock_trywrlock(rw)) : kBionicEINVAL;
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlock_unlock(uint32_t rwl, uint32_t, uint32_t, uint32_t) {
+    int32_t* rw = arm32_rw(rwl);
+    return rw ? static_cast<uint32_t>(__macapk_arm64_pthread_rwlock_unlock(rw)) : kBionicEINVAL;
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlock_timedrdlock(uint32_t rwl, uint32_t abstime, uint32_t, uint32_t) {
+    int32_t* rw = arm32_rw(rwl);
+    struct timespec ts;
+    if (!rw || !arm32_abstime(abstime, &ts)) return kBionicEINVAL;
+    return static_cast<uint32_t>(__macapk_arm64_pthread_rwlock_timedrdlock(rw, &ts));
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlock_timedwrlock(uint32_t rwl, uint32_t abstime, uint32_t, uint32_t) {
+    int32_t* rw = arm32_rw(rwl);
+    struct timespec ts;
+    if (!rw || !arm32_abstime(abstime, &ts)) return kBionicEINVAL;
+    return static_cast<uint32_t>(__macapk_arm64_pthread_rwlock_timedwrlock(rw, &ts));
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlock_timedrdlock_monotonic_np(uint32_t rwl, uint32_t abstime, uint32_t, uint32_t) {
+    int32_t* rw = arm32_rw(rwl);
+    struct timespec ts;
+    if (!rw || !arm32_abstime(abstime, &ts)) return kBionicEINVAL;
+    return static_cast<uint32_t>(__macapk_arm64_pthread_rwlock_timedrdlock_monotonic_np(rw, &ts));
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlock_timedwrlock_monotonic_np(uint32_t rwl, uint32_t abstime, uint32_t, uint32_t) {
+    int32_t* rw = arm32_rw(rwl);
+    struct timespec ts;
+    if (!rw || !arm32_abstime(abstime, &ts)) return kBionicEINVAL;
+    return static_cast<uint32_t>(__macapk_arm64_pthread_rwlock_timedwrlock_monotonic_np(rw, &ts));
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlock_clockrdlock(uint32_t rwl, uint32_t clock, uint32_t abstime, uint32_t) {
+    int32_t* rw = arm32_rw(rwl);
+    struct timespec ts;
+    if (!rw || !arm32_abstime(abstime, &ts)) return kBionicEINVAL;
+    return static_cast<uint32_t>(__macapk_arm64_pthread_rwlock_clockrdlock(rw, static_cast<int>(clock), &ts));
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlock_clockwrlock(uint32_t rwl, uint32_t clock, uint32_t abstime, uint32_t) {
+    int32_t* rw = arm32_rw(rwl);
+    struct timespec ts;
+    if (!rw || !arm32_abstime(abstime, &ts)) return kBionicEINVAL;
+    return static_cast<uint32_t>(__macapk_arm64_pthread_rwlock_clockwrlock(rw, static_cast<int>(clock), &ts));
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlockattr_init(uint32_t attr, uint32_t, uint32_t, uint32_t) {
+    if (!attr) return kBionicEINVAL;
+    const int32_t z = 0;
+    std::memcpy(gptr(attr), &z, sizeof z);
+    return 0;
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlockattr_destroy(uint32_t attr, uint32_t, uint32_t, uint32_t) {
+    if (!attr) return kBionicEINVAL;
+    const int32_t m = -1;                         // bionic stamps -1 so reuse-after-destroy EINVALs
+    std::memcpy(gptr(attr), &m, sizeof m);
+    return 0;
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlockattr_getpshared(uint32_t attr, uint32_t out, uint32_t, uint32_t) {
+    if (!attr || !out) return kBionicEINVAL;
+    int32_t a = 0;
+    std::memcpy(&a, gptr(attr), sizeof a);
+    const int32_t v = (a & 1) ? 1 : 0;
+    std::memcpy(gptr(out), &v, sizeof v);
+    return 0;
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlockattr_setpshared(uint32_t attr, uint32_t pshared, uint32_t, uint32_t) {
+    if (!attr) return kBionicEINVAL;
+    if (pshared != 0 && pshared != 1) return kBionicEINVAL;
+    int32_t a = 0;
+    std::memcpy(&a, gptr(attr), sizeof a);
+    a = (a & ~1) | static_cast<int32_t>(pshared);
+    std::memcpy(gptr(attr), &a, sizeof a);
+    return 0;
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlockattr_getkind_np(uint32_t attr, uint32_t out, uint32_t, uint32_t) {
+    if (!attr || !out) return kBionicEINVAL;
+    int32_t a = 0;
+    std::memcpy(&a, gptr(attr), sizeof a);
+    const int32_t v = (a & 2) ? 1 : 0;
+    std::memcpy(gptr(out), &v, sizeof v);
+    return 0;
+}
+extern "C" uint32_t __macapk_shim_pthread_rwlockattr_setkind_np(uint32_t attr, uint32_t pref, uint32_t, uint32_t) {
+    if (!attr) return kBionicEINVAL;
+    if (pref != 0 && pref != 1) return kBionicEINVAL;
+    int32_t a = 0;
+    std::memcpy(&a, gptr(attr), sizeof a);
+    a = (a & ~2) | (static_cast<int32_t>(pref) << 1);
+    std::memcpy(gptr(attr), &a, sizeof a);
+    return 0;
+}
+
+// ARM32 flockfile/funlockfile/ftrylockfile: the guest FILE* is a handle token, not a host pointer
+// (see __macapk_shim_fclose). libSystem's flockfile dereferenced the raw token at +0x1c and SEGV'd
+// (Douyin run: fault_addr=0x30002b90). Resolve the token; an unresolvable one is a no-op, not a fault.
+extern "C" uint32_t __macapk_shim_flockfile(uint32_t fp, uint32_t, uint32_t, uint32_t) {
+    FILE* f = static_cast<FILE*>(__macapk_jni_resolve_handle(fp));
+    if (f) ::flockfile(f);
+    return 0;
+}
+extern "C" uint32_t __macapk_shim_funlockfile(uint32_t fp, uint32_t, uint32_t, uint32_t) {
+    FILE* f = static_cast<FILE*>(__macapk_jni_resolve_handle(fp));
+    if (f) ::funlockfile(f);
+    return 0;
+}
+extern "C" uint32_t __macapk_shim_ftrylockfile(uint32_t fp, uint32_t, uint32_t, uint32_t) {
+    FILE* f = static_cast<FILE*>(__macapk_jni_resolve_handle(fp));
+    return f ? static_cast<uint32_t>(::ftrylockfile(f)) : 0u;
+}
+
+// ARM32 stdio imports that take a FILE* token or a guest out-pointer and had no twin (libmetasec_ml
+// imports fseeko/ftello/popen/pclose/asprintf/vasprintf; Douyin run: SEGV in libSystem flockfile on the
+// FILE token 0x30003420 during its constructor). Bionic ARM32 off_t is 32-bit (no _FILE_OFFSET_BITS=64).
+extern "C" uint32_t __macapk_shim_fseek(uint32_t, uint32_t, uint32_t, uint32_t);
+extern "C" uint32_t __macapk_shim_ftell(uint32_t, uint32_t, uint32_t, uint32_t);
+extern "C" uint32_t __macapk_shim_fseeko(uint32_t fp, uint32_t offset, uint32_t whence, uint32_t) {
+    return __macapk_shim_fseek(fp, offset, whence, 0);
+}
+extern "C" uint32_t __macapk_shim_ftello(uint32_t fp, uint32_t, uint32_t, uint32_t) {
+    return __macapk_shim_ftell(fp, 0, 0, 0);
+}
+// There is no Android shell on this machine to run a command in: report failure the way a missing
+// /system/bin/sh would (NULL) rather than hand libSystem a guest pointer. pclose of a token we never
+// issued is EBADF-style -1.
+extern "C" uint32_t __macapk_shim_popen(uint32_t, uint32_t, uint32_t, uint32_t) { return 0; }
+extern "C" uint32_t __macapk_shim_pclose(uint32_t fp, uint32_t, uint32_t, uint32_t) {
+    FILE* f = static_cast<FILE*>(__macapk_jni_resolve_handle(fp));
+    if (!f) return static_cast<uint32_t>(-1);
+    const int r = ::pclose(f);
+    __macapk_jni_release_handle(fp);
+    return static_cast<uint32_t>(r);
+}
+// asprintf(char** strp, fmt, ...) / vasprintf(char** strp, fmt, va_list): format, then hand back a
+// guest-heap string (guest free() releases it) through the 4-byte guest out-pointer.
+static uint32_t macapk_arm32_asprintf_out(uint32_t strp, const std::string& s) {
+    const uint32_t g = __macapk_shim_malloc(static_cast<uint32_t>(s.size() + 1), 0, 0, 0, 0);
+    if (!g) return static_cast<uint32_t>(-1);
+    std::memcpy(gptr(g), s.c_str(), s.size() + 1);
+    std::memcpy(gptr(strp), &g, 4);
+    return static_cast<uint32_t>(s.size());
+}
+extern "C" uint32_t __macapk_shim_asprintf(uint32_t strp, uint32_t fmt, uint32_t a0, uint32_t a1, uint32_t sp) {
+    if (!strp || !fmt) return static_cast<uint32_t>(-1);
+    std::vector<char> buf(65536);
+    int n;
+    if (arm32_printf_aapcs_on()) {
+        Arm32VarArgs va = Arm32VarArgs::regs(strp, fmt, a0, a1, 2, sp);
+        n = macapk_format_aapcs(buf.data(), buf.size(), gptr(fmt), va);
+    } else {
+        n = macapk_format_into(buf.data(), buf.size(), gptr(fmt), a0, a1, 0, 0, 0);
+    }
+    if (n < 0) return static_cast<uint32_t>(-1);
+    buf[buf.size() - 1] = '\0';
+    return macapk_arm32_asprintf_out(strp, std::string(buf.data()));
+}
+extern "C" uint32_t __macapk_shim_vasprintf(uint32_t strp, uint32_t fmt, uint32_t ap, uint32_t) {
+    if (!strp || !fmt) return static_cast<uint32_t>(-1);
+    std::vector<char> buf(65536);
+    const int n = macapk_vformat_into(buf.data(), buf.size(), gptr(fmt), ap);
+    if (n < 0) return static_cast<uint32_t>(-1);
+    buf[buf.size() - 1] = '\0';
+    return macapk_arm32_asprintf_out(strp, std::string(buf.data()));
+}
+
+// fscanf / vfscanf on a FILE token: libSystem's fscanf locks the FILE (flockfile) and walked the raw token
+// (Douyin run: SEGV in flockfile via fscanf during a library constructor, which abandoned the whole
+// constructor chain). Formatted input needs a real guest-pointer scanf over a stream; until there is one the
+// honest answer is EOF -- "input failure before the first conversion" -- which every caller already handles.
+// tmpfile() would hand a HOST FILE* back to a 32-bit caller; report failure.
+extern "C" uint32_t __macapk_shim_fscanf(uint32_t, uint32_t, uint32_t, uint32_t) { return static_cast<uint32_t>(-1); }
+extern "C" uint32_t __macapk_shim_vfscanf(uint32_t, uint32_t, uint32_t, uint32_t) { return static_cast<uint32_t>(-1); }
+extern "C" uint32_t __macapk_shim_tmpfile(uint32_t, uint32_t, uint32_t, uint32_t) { return 0; }
+
+// eglGetProcAddress(const char*) for ARM32 guests. The import used to bind ANGLE's own symbol, so the
+// guest's 32-bit string pointer reached ANGLE's strcmp raw; the SEGV then happened INSIDE
+// egl::GetProcAddress while it held ANGLE's global EGL mutex, the fault handler "returned 0" past the
+// scoped unlock, and the next EGL call on the macOS main thread (cocoa_bridge AngleInit) blocked for ever
+// (Douyin libttmplayer JNI_OnLoad). A guest cannot call a host function pointer anyway -- the answer has to
+// be a guest-callable address -- so the extension is reported as unavailable (NULL), which is what a
+// device without it returns and what probing callers (optional EGL/GL extension loaders) handle.
+extern "C" uint32_t __macapk_shim_eglGetProcAddress(uint32_t name, uint32_t, uint32_t, uint32_t) {
+    static std::atomic<int> n{0};
+    if (name && n.fetch_add(1) < 32)
+        std::fprintf(stderr, "[egl32] eglGetProcAddress(\"%s\") -> NULL (no guest-callable twin)\n", gptr(name));
+    return 0;
+}
+
 // pthread_barrier_t / pthread_spinlock_t (bionic pthread.h, API 24+). Darwin
 // declares NEITHER the types nor the functions -- POSIX makes both optional and
 // Apple never implemented them -- so an unshimmed guest call is a hard,
@@ -31386,6 +31699,74 @@ extern "C" int __macapk_arm64_pthread_kill(unsigned long thread, int sig) {
 }
 extern "C" void __macapk_arm64_pthread_exit(void* retval) {
     pthread_exit(retval);
+}
+
+// struct passwd: Bionic (bionic/libc/include/pwd.h, LP64) is 48 bytes:
+//   pw_name@0 pw_passwd@8 pw_uid@16 pw_gid@20 pw_gecos@24 pw_dir@32 pw_shell@40
+// macOS (sys/_types + pwd.h) is 72 bytes:
+//   pw_name@0 pw_passwd@8 pw_uid@16 pw_gid@20 pw_change@24 pw_class@32
+//   pw_gecos@40 pw_dir@48 pw_shell@56 pw_expire@64
+// Left to bind to libSystem, a guest getpwuid_r/getpwnam_r writes 24 bytes past
+// its 48-byte struct (CPython's pwd module keeps it on the stack, so the saved
+// fp/lr are overwritten and the function returns to 0) and the dir/shell/gecos
+// fields it does read are the wrong ones. The strings stay in the caller's
+// buffer (reentrant forms) or in libSystem's per-thread storage (the others).
+struct BionicPasswd {
+    char* pw_name;
+    char* pw_passwd;
+    uint32_t pw_uid;
+    uint32_t pw_gid;
+    char* pw_gecos;
+    char* pw_dir;
+    char* pw_shell;
+};
+static_assert(sizeof(BionicPasswd) == 48, "Bionic LP64 struct passwd is 48 bytes");
+static void macapk_passwd_to_bionic(const struct passwd& m, BionicPasswd* b) {
+    b->pw_name   = m.pw_name;
+    b->pw_passwd = m.pw_passwd;
+    b->pw_uid    = static_cast<uint32_t>(m.pw_uid);
+    b->pw_gid    = static_cast<uint32_t>(m.pw_gid);
+    b->pw_gecos  = m.pw_gecos;
+    b->pw_dir    = m.pw_dir;
+    b->pw_shell  = m.pw_shell;
+}
+extern "C" int __macapk_arm64_getpwuid_r(uint32_t uid, BionicPasswd* pwd, char* buf,
+                                          size_t buflen, BionicPasswd** result) {
+    struct passwd host, *hres = nullptr;
+    int rc = ::getpwuid_r(static_cast<uid_t>(uid), &host, buf, buflen, &hres);
+    if (rc == 0 && hres) {
+        macapk_passwd_to_bionic(host, pwd);
+        *result = pwd;
+    } else {
+        *result = nullptr;
+    }
+    return rc;
+}
+extern "C" int __macapk_arm64_getpwnam_r(const char* name, BionicPasswd* pwd, char* buf,
+                                          size_t buflen, BionicPasswd** result) {
+    struct passwd host, *hres = nullptr;
+    int rc = ::getpwnam_r(name, &host, buf, buflen, &hres);
+    if (rc == 0 && hres) {
+        macapk_passwd_to_bionic(host, pwd);
+        *result = pwd;
+    } else {
+        *result = nullptr;
+    }
+    return rc;
+}
+extern "C" BionicPasswd* __macapk_arm64_getpwuid(uint32_t uid) {
+    static thread_local BionicPasswd tl;
+    const struct passwd* m = ::getpwuid(static_cast<uid_t>(uid));
+    if (!m) return nullptr;
+    macapk_passwd_to_bionic(*m, &tl);
+    return &tl;
+}
+extern "C" BionicPasswd* __macapk_arm64_getpwnam(const char* name) {
+    static thread_local BionicPasswd tl;
+    const struct passwd* m = ::getpwnam(name);
+    if (!m) return nullptr;
+    macapk_passwd_to_bionic(*m, &tl);
+    return &tl;
 }
 
 // tgkill(tgid, tid, sig) -- Bionic declares it in libc/include/signal.h:148 as
@@ -35867,7 +36248,12 @@ extern "C" int __macapk_elfexec_guest_dlclose(void* handle);
 extern "C" int __macapk_runtime_guest_dlopen(const char* path, int bionic_flag, void** out);
 static std::string macapk_arm64_remap_path(const char* p);
 static void macapk_note_wrapper_handle(void* h, const std::string& dylib_path);  // MACAPK_WRAPPER_DATA_DLSYM
+static void* macapk_dlopen_core(const char* path, int flag);
+static void* macapk_dlopen_in_ns(const char* path, int flag, macapk::ldns::Namespace* ns, const void* caller);
 extern "C" void* __macapk_arm64_dlopen(const char* path, int flag) {
+    return macapk_dlopen_in_ns(path, flag, nullptr, __builtin_return_address(0));
+}
+static void* macapk_dlopen_core(const char* path, int flag) {
     // Stage-6 guests are LP64.
     const int mac_flag = macapk_bionic_to_mac_rtld(flag, /*lp64=*/true);
     if (path) {
@@ -43043,8 +43429,17 @@ static int macapk_macos_to_bionic_fflags(int m) {
 // returned EACCES, and no native state survived a reboot. Named params place
 // mode in x2 exactly where the caller put it (same fix idiom as __macapk_arm64_
 // syscall above). mode is only honored when O_CREAT is set, matching open(2).
+extern "C" int __macapk_arm64_memfd_create(const char* name, unsigned int flags);
 extern "C" int __macapk_arm64_open(const char* path, int flags, mode_t mode) {
     if (!path) return -1;
+    // Android's ashmem device. AOSP CursorWindow (and the copies Alipay/mPaaS
+    // bundle) open /dev/ashmem, then size and map it with ioctls; Android 8+
+    // apps may also use ASharedMemory. macOS has no such device, so hand back an
+    // unlinked temp file (the same backing ASharedMemory_create uses); the ioctl
+    // shim below answers the ASHMEM_* requests on it.
+    if (std::strcmp(path, "/dev/ashmem") == 0) {
+        return __macapk_arm64_memfd_create("ashmem", 0x0001U /*MFD_CLOEXEC*/);
+    }
     std::string remapped;
     {
         const MacapkPathWriteScope wi(macapk_linux_oflags_write(flags));   // .apk fallback is read-only
@@ -50948,6 +51343,46 @@ uint32_t __macapk_shim_prctl(uint32_t op, uint32_t a2, uint32_t a3,
         static_cast<unsigned long>(a4), 0));
 }
 
+// syscall -- Bionic's `long syscall(long number, ...)` on the ARM32 tier.
+// An ARM32 guest's `syscall` import used to have no __macapk_shim_ twin, so it
+// bound to macOS libSystem's syscall(2) and handed a Linux ARM EABI number to a
+// kernel that numbers things differently (AQ's mpaas_cppbase calls
+// syscall(350 = timerfd_create) from BaseLibrary.native_init and the process
+// died with SIGTRAP on the first one).
+//
+// The numbers here are the ARM EABI table, NOT aarch64's (which
+// __macapk_arm64_syscall takes): linux arch/arm/tools/syscall.tbl, fetched
+// 2026-11-02: getpid 20, gettid 224, timerfd_create 350, timerfd_settime 353,
+// eventfd2 356, epoll_create1 357. Only calls whose arguments are scalars (or,
+// for timerfd_settime, a 32-bit __kernel_old_itimerspec we widen) are
+// serviced, by the same host code a direct libc call reaches. Any other
+// number fails the way a kernel without that syscall does: -1 with ENOSYS(38).
+// Four register arguments only: the number plus a1..a3; a syscall needing a
+// fourth argument (timerfd_settime's old_value, normally NULL) has it ignored.
+extern "C" long __macapk_arm64_syscall(long, long, long, long, long, long, long);
+uint32_t __macapk_shim_syscall(uint32_t nr, uint32_t a1, uint32_t a2,
+                               uint32_t a3) {
+    long ret;
+    switch (nr) {
+        case 20:  ret = __macapk_arm64_syscall(172, 0, 0, 0, 0, 0, 0); break;  // getpid
+        case 224: ret = __macapk_arm64_syscall(178, 0, 0, 0, 0, 0, 0); break;  // gettid
+        case 350: ret = __macapk_arm64_syscall(85, a1, a2, 0, 0, 0, 0); break; // timerfd_create
+        case 353: {  // timerfd_settime(fd, flags, const itimerspec32*, old)
+            if (!a3) { errno = 14; return static_cast<uint32_t>(-1); }  // EFAULT
+            const int32_t* g = reinterpret_cast<const int32_t*>(gptr(a3));
+            struct { struct timespec i, v; } nv;
+            nv.i.tv_sec = g[0]; nv.i.tv_nsec = g[1];
+            nv.v.tv_sec = g[2]; nv.v.tv_nsec = g[3];
+            ret = __macapk_arm64_syscall(86, a1, a2, reinterpret_cast<long>(&nv), 0, 0, 0);
+            break;
+        }
+        case 356: ret = __macapk_arm64_syscall(19, a1, a2, 0, 0, 0, 0); break; // eventfd2
+        case 357: ret = __macapk_arm64_syscall(20, a1, 0, 0, 0, 0, 0); break;  // epoll_create1
+        default:  errno = 38; ret = -1; break;                                 // ENOSYS
+    }
+    return static_cast<uint32_t>(ret);
+}
+
 // stat / lstat / fstat on the ARM32 path: the guest hands us a pointer to a
 // Bionic 32-bit `struct stat` and reads fields at Bionic's offsets, so the
 // host `struct stat` (144 bytes, a different layout) is translated field by
@@ -51521,7 +51956,38 @@ uint32_t __macapk_shim_ioctl(uint32_t fd, uint32_t op, uint32_t argp,
 // ("Connection error 1-3-5-16"). Bionic: `int ioctl(int fd, int op, ...)`; the
 // one variadic argument arrives in x2 under AAPCS64, which is where this
 // non-variadic signature reads it.
+// ASHMEM_* requests, from AOSP bionic/libc/kernel/uapi/linux/ashmem.h
+// (__ASHMEMIOC 0x77, ASHMEM_NAME_LEN 256, struct ashmem_pin = {u32 offset, len}):
+//   SET_NAME      _IOW(0x77,1,char[256]) 0x41007701   GET_NAME  _IOR(0x77,2,..) 0x81007702
+//   SET_SIZE      _IOW(0x77,3,size_t)    0x40087703   GET_SIZE  _IO(0x77,4)     0x00007704
+//   SET_PROT_MASK _IOW(0x77,5,ulong)     0x40087705   GET_PROT_MASK _IO(0x77,6) 0x00007706
+//   PIN           _IOW(0x77,7,pin)       0x40087707   UNPIN     _IOW(0x77,8,pin) 0x40087708
+//   GET_PIN_STATUS _IO(0x77,9)           0x00007709   PURGE_ALL_CACHES _IO(0x77,10) 0x0000770a
+// The fd is a plain unlinked temp file (see open("/dev/ashmem")), so SET_SIZE is
+// ftruncate and nothing is ever purged: PIN reports ASHMEM_NOT_PURGED (0).
+// Only regular files are touched, so a stray 0x77xx request on another fd falls
+// through to the ENOTTY path.
+static bool macapk_ashmem_ioctl(int fd, uint32_t op, void* argp, int* rc) {
+    if (((op >> 8) & 0xff) != 0x77) return false;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    switch (op) {
+        case 0x41007701: case 0x81007702: case 0x40087705:
+        case 0x40087707: case 0x40087708: case 0x0000770a:
+            *rc = 0; return true;                     // name/prot/pin: accepted
+        case 0x40087703: {                             // SET_SIZE
+            size_t sz = (size_t)(uintptr_t)argp;
+            *rc = (::ftruncate(fd, (off_t)sz) == 0) ? 0 : (errno = errno_mac2lin(errno), -1);
+            return true;
+        }
+        case 0x00007704: *rc = (int)st.st_size; return true;   // GET_SIZE
+        case 0x00007706: *rc = 7; return true;                 // GET_PROT_MASK: rwx
+        case 0x00007709: *rc = 0; return true;                 // GET_PIN_STATUS: not purged
+    }
+    return false;
+}
 extern "C" int __macapk_arm64_ioctl(int fd, int op, void* argp) {
+    { int arc = 0; if (macapk_ashmem_ioctl(fd, static_cast<uint32_t>(op), argp, &arc)) return arc; }
     unsigned long host_op = 0;
     switch (static_cast<uint32_t>(op)) {
         case kLinuxFIONREAD:   host_op = FIONREAD;   break;
@@ -54658,11 +55124,30 @@ enum DlsymFn : uint32_t {
     // __macapk_shim_dlsym's DLF_getauxval check, which runs regardless of
     // the dlsym handle. See docs/arm32-getauxval-cpufeatures_2026-07-28.md.
     DLF_getauxval,
+    // #105 (AI Douyin, ARM32): the exports of the synthetic libnativeloader.so /
+    // libdl_android.so ELF32 images that shadowhook_dlopen/dlsym (xDL) finds through
+    // dl_iterate_phdr -- see macapk_arm32_synth_modules below. Dispatched by
+    // __macapk_dlsym_tramp_dispatch_ns (these take up to 8 args).
+    DLF_NS_FIRST,
+    DLF_nl_CreateClassLoaderNamespace = DLF_NS_FIRST,
+    DLF_nl_FindNamespaceByClassLoader,
+    DLF_dl_android_create_namespace,
+    DLF_dl_android_link_namespaces,
+    DLF_dl_android_link_namespaces_all_libs,
+    DLF_dl_android_get_exported_namespace,
+    DLF_dl_android_init_anonymous_namespace,
+    // #105: exports of the synthetic libart.so (libsoloader's SoClassLoader::CommonInit).
+    DLF_art_CurrentFromGdb,
+    DLF_art_DecodeJObject,
+    DLF_art_GetOrCreateAllocator,
+    DLF_art_nullstub,
     DLF_COUNT
 };
 constexpr uint32_t kDlsymTrampCount = DLF_COUNT;
 extern "C" int32_t __macapk_dlsym_tramp_dispatch(uint32_t idx, uint32_t r0,
                                                  uint32_t r1, uint32_t r2);
+extern "C" int32_t __macapk_dlsym_tramp_dispatch_ns(uint32_t idx, uint32_t r0, uint32_t r1,
+                                                    uint32_t r2, uint32_t r3, uint32_t sp);
 
 int32_t __macapk_indirect_call(uint32_t target,
                                 uint32_t r0, uint32_t r1,
@@ -54694,6 +55179,9 @@ int32_t __macapk_indirect_call(uint32_t target,
         target <  kDlsymTrampBase + kDlsymTrampCount * 4) {
         // dlsym'd NDK AAsset* function called by lifted code (see the bridge
         // comment above). Route to the guest-memory AAsset wrapper by index.
+        if ((target - kDlsymTrampBase) / 4 >= DLF_NS_FIRST)
+            return __macapk_dlsym_tramp_dispatch_ns(
+                (target - kDlsymTrampBase) / 4, r0, r1, r2, r3, sp);
         return __macapk_dlsym_tramp_dispatch(
             (target - kDlsymTrampBase) / 4, r0, r1, r2);
     }
@@ -55011,6 +55499,30 @@ int32_t __macapk_indirect_call(uint32_t target,
     // bails. This macapk-wide change keeps render chains alive when
     // a single vtable-resolve fails, at the cost of less accurate
     // diagnostics for actually-NULL-returning calls.
+    //
+    // EXCEPTION (#105, AI Douyin / ByteDance libflipped): when the target is
+    // itself inside our JNI-proxy / trampoline-marker bands
+    // [kProxyEnvBase, kThreadStackBase) the guest is "calling" the JNIEnv
+    // function table as if it were code. That is what native code does when it
+    // reaches for an ART-internal function (libflipped's hidden-API bypass
+    // calls art::mirror::Class::GetDeclaredMethodInternal with the JNIEnv as
+    // its `this`). There is no ART here to answer, and r0 IS the JNIEnv proxy,
+    // so the return-r0 policy above handed the caller a JNIEnv where it
+    // expected a jobject; Java then dereferenced it and HotSpot crashed in
+    // LinkResolver. A plain NULL is the honest "that lookup produced nothing"
+    // answer: the caller either handles null or raises a Java exception the
+    // app can catch, instead of a VM crash. Keyed on the target's address
+    // band, not on any library or app.
+    if (target >= 0x38000000u && target < 0x3E000000u) {
+        static std::atomic<int> g_env_call_logged{0};
+        if (g_env_call_logged.fetch_add(1) < 4) {
+            std::fprintf(stderr,
+                "[macapk-shim] guest called into the JNI proxy band (0x%x) as code "
+                "(an ART-internal call?); returning NULL instead of the JNIEnv\n",
+                target);
+        }
+        return 0;
+    }
     return r0;
 }
 
@@ -57372,7 +57884,19 @@ static inline int macapk_bionic_to_mac_mmap_flags(int lin) {
 extern "C" void* __macapk_arm64_mmap(void* addr, size_t length, int prot,
                                         int flags, int fd, off_t offset) {
     int mac_flags = macapk_bionic_to_mac_mmap_flags(flags);
-    void* p = mmap(addr, length, prot, mac_flags, fd, offset);
+    // Android lets anonymous memory be writable and executable at once; macOS arm64 refuses it.
+    // Map it RW and let guest_jit_pages.h move pages between RW and RX on fault (Mono's code
+    // manager is the common caller).
+    const bool jit_rwx = (flags & 0x20) && fd < 0
+        && (prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC);
+    void* p = mmap(addr, length, jit_rwx ? (prot & ~PROT_EXEC) : prot, mac_flags, fd, offset);
+    if (jit_rwx && p != MAP_FAILED) {
+        if (!macapk::jitpages::add((uintptr_t)p, (uintptr_t)p + length)) {
+            munmap(p, length);
+            errno = ENOMEM;
+            p = MAP_FAILED;
+        }
+    }
     // Low-volume diagnostic: first calls + every failure. The GC grows
     // its heap with many mmaps; logging the result address also lets us
     // confirm whether il2cpp tolerates the (possibly high) addresses
@@ -57706,7 +58230,14 @@ bool macapk_range_hits_host_exec(uintptr_t lo, uintptr_t hi) {
 }
 } // namespace
 
+extern "C" int __macapk_arm64_munmap(void* addr, size_t len) {
+    if (addr && len) macapk::jitpages::forget((uintptr_t)addr, (uintptr_t)addr + len);
+    return munmap(addr, len);
+}
+
 extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot) {
+    if (addr && len && !(prot & PROT_READ))
+        macapk::jitpages::forget((uintptr_t)addr, (uintptr_t)addr + len);
     // Guard: the guest must never re-protect OUR host code. If the requested
     // range overlaps a host executable segment we refuse it (report success,
     // change nothing) so our .text stays r-x and callable. On a real device the
@@ -57739,6 +58270,8 @@ extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot) {
             if (!guard_off) { errno = EACCES; return -1; }
         }
     }
+    int guest_rwx_result = 0;
+    if (macapk::rwx::protect(addr, len, prot, guest_rwx_result)) return guest_rwx_result;
     // Detect the JIT toggle edges. make_writable = the guest asks for R+W+X (V8's
     // "unprotect this code page to write it"). close_window = a reprotect that
     // drops WRITE while keeping EXEC (V8's "done writing, make it runnable" = RX).
@@ -57769,7 +58302,12 @@ extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot) {
                               && std::getenv("MACAPK_JIT_RWX_TO_RW")[0] == '0';
         if (!off) {
             int rc2 = ::mprotect(addr, len, prot & ~PROT_EXEC);   // RWX -> RW
-            if (rc2 == 0) rc = 0;
+            if (rc2 == 0) {
+                rc = 0;
+                // Remember the pages so a later instruction fetch (a JIT that never reprotects
+                // to RX, such as Mono) is served by guest_jit_pages.h.
+                macapk::jitpages::add((uintptr_t)addr, (uintptr_t)addr + len);
+            }
         }
     }
     if (std::getenv("MACAPK_MPROTECT_TRACE") &&
@@ -57844,23 +58382,554 @@ extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot) {
 // load address, library fd, linker namespace) is Bionic-linker-specific with no
 // macOS analogue, so we drop it and behave as plain dlopen -- which is what the
 // callers (SoLoader / superpack opening a .so by path) actually want.
-extern "C" void* __macapk_arm64_android_dlopen_ext(const char* path, int flags,
-                                                   const void* /*extinfo*/) {
-    return __macapk_arm64_dlopen(path, flags);
-}
+// (android_dlopen_ext now lives in the linker-namespace section below.)
+
 // __loader_dlopen(filename, flags, caller_addr): Bionic's dynamic linker exposes
 // the raw dlopen under this name -- libdl.so's public dlopen is a thin forwarder
 // that passes the caller's return address so the linker resolves the lookup in
 // the caller's linker namespace. Facebook's Lacrima crash reporter looks it up by
 // name (dlsym(dlopen("libdl.so"), "__loader_dlopen")) to install its self-sigkill
-// handlers and HARD-EXITS the app (System.exit(10)) when it is null. We have a
-// single linker namespace, so the caller address is irrelevant: forward to our
-// dlopen. Reached via the g_bionic_pub_marker dlsym path (dlopen("libdl.so")),
-// whose step 1 probes __macapk_arm64_<name>.
+// handlers and HARD-EXITS the app (System.exit(10)) when it is null. The caller address
+// picks the namespace the lookup runs in (linker-namespace layer, below). Reached via the
+// g_bionic_pub_marker dlsym path (dlopen("libdl.so")), whose step 1 probes
+// __macapk_arm64_<name>.
 extern "C" void* __macapk_arm64___loader_dlopen(const char* filename, int flags,
-                                                const void* /*caller_addr*/) {
-    return __macapk_arm64_dlopen(filename, flags);
+                                                const void* caller_addr) {
+    return macapk_dlopen_in_ns(filename, flags, nullptr, caller_addr);
 }
+// ===========================================================================
+// Android linker namespaces (v1.0.2359; docs/linker-namespaces_2026-11-03.md)
+//
+// The model and lookup rules are runtime/include/macapk/linker_namespaces.h (a port of
+// bionic linker/linker_namespaces.cpp + linker.cpp, unit-tested off-device). This section
+// is the bridge: it owns the process-wide Registry, builds the namespaces libnativeloader
+// would (default, system, and the app classloader namespace "clns-1" that doubles as the
+// anonymous namespace), exports the libdl_android entry points guests import
+// (android_create_namespace, android_link_namespaces, android_get_exported_namespace,
+// android_init_anonymous_namespace, android_get_/update_LD_LIBRARY_PATH,
+// android_set_application_target_sdk_version, and the __loader_ spellings), honours
+// ANDROID_DLEXT_USE_NAMESPACE in android_dlopen_ext, and gates every guest dlopen on the
+// caller's namespace.
+//
+// What the gate does: it resolves the request in the caller's namespace. A library that is
+// present but NOT accessible there (an absolute path outside the library dir, /data and
+// /mnt/expand, e.g. /vendor/lib64/libGLES_mali.so, whose soname is not a public library)
+// is refused with bionic's own dlerror text. A request the model cannot find at all falls
+// through to the pre-existing host loader unchanged, because that loader also resolves
+// things the model has no directory for (translated wrappers, host frameworks).
+// MACAPK_LINKER_NAMESPACES=0 disables the gate (the API still works), =warn logs a refusal and lets
+// the load proceed.
+//
+// Single-image limit: the host loader keeps one image per library, so two namespaces that
+// load the same soname share it where bionic maps two. Membership is still per namespace.
+// ===========================================================================
+namespace {
+struct MacapkNsState {
+    std::mutex mu;
+    macapk::ldns::Registry reg;
+    macapk::ldns::Namespace* system = nullptr;
+    macapk::ldns::Namespace* app = nullptr;
+    std::string app_dir;           // the guest lib dir the app namespace was built for
+    int clns_serial = 0;
+    std::atomic<int> target_sdk{10000};   // __ANDROID_API_FUTURE__ until the app sets it
+    std::atomic<int> logged{0};
+};
+MacapkNsState& macapk_ns() {
+    static MacapkNsState* s = new MacapkNsState();   // never destroyed: guests outlive atexit
+    return *s;
+}
+thread_local std::string t_ns_err_pending;
+thread_local std::string t_ns_err_last;
+// Namespace of the library whose load is in progress on this thread (null outside one). A
+// library's own DT_NEEDED loads and any dlopen from its initialisers run inside it, before the
+// registry has recorded the library: bionic's soinfo carries its namespace from the start.
+thread_local macapk::ldns::Namespace* t_ns_loading = nullptr;
+
+// /system/etc/public.libraries.txt (system/core/rootdir/etc/public.libraries.android.txt) plus
+// the sonames macapk_dlopen_core answers with its own markers. This is what libnativeloader
+// links an unbundled app's classloader namespace to.
+const char* const kMacapkSystemLibs[] = {
+    "libandroid.so", "libaaudio.so", "libamidi.so", "libbinder_ndk.so", "libc.so",
+    "libcamera2ndk.so", "libdl.so", "libEGL.so", "libGLESv1_CM.so", "libGLESv2.so",
+    "libGLESv3.so", "libicu.so", "libicui18n.so", "libicuuc.so", "libjnigraphics.so",
+    "liblog.so", "libm.so", "libmediandk.so", "libnativehelper.so", "libnativewindow.so",
+    "libneuralnetworks.so", "libOpenMAXAL.so", "libOpenSLES.so", "libRS.so",
+    "libstdc++.so", "libsync.so", "libvulkan.so", "libwebviewchromium_plat_support.so",
+    "libz.so", nullptr};
+bool macapk_ns_is_system_lib(const std::string& so) {
+    for (const char* const* p = kMacapkSystemLibs; *p; ++p) if (so == *p) return true;
+    return false;
+}
+std::string macapk_ns_system_exposed() {
+    std::string r;
+    for (const char* const* p = kMacapkSystemLibs; *p; ++p) { if (!r.empty()) r += ':'; r += *p; }
+    return r;
+}
+bool macapk_ns_is_system_dir(const std::string& d) {
+    return d.compare(0, 11, "/system/lib") == 0 || d.compare(0, 6, "/apex/") == 0 ||
+           d.compare(0, 13, "/vendor/lib64") == 0 || d.compare(0, 11, "/vendor/lib") == 0;
+}
+// <app_dir>/lib_native/<libX>.dylib: the translated wrapper that stands in for a bare libX.so.
+bool macapk_ns_wrapper_exists(const std::string& so) {
+    if (so.size() < 4 || so.compare(so.size() - 3, 3, ".so") != 0) return false;
+    const char* ad = __macapk_get_apkt_dir();
+    if (!ad) return false;
+    std::string app_dir(ad);
+    static const char kSuffix[] = "/_apkt";
+    const size_t sl = sizeof(kSuffix) - 1;
+    if (app_dir.size() > sl && app_dir.compare(app_dir.size() - sl, sl, kSuffix) == 0)
+        app_dir.resize(app_dir.size() - sl);
+    struct stat st;
+    return ::stat((app_dir + "/lib_native/" + so.substr(0, so.size() - 3) + ".dylib").c_str(), &st) == 0 &&
+           S_ISREG(st.st_mode);
+}
+// DT_SONAME of an ELF64 file (little endian), or "" (also for ELF32 and unreadable files).
+std::string macapk_ns_dt_soname(const std::string& guest_or_host_path) {
+    std::string out;
+    FILE* f = std::fopen(guest_or_host_path.c_str(), "rb");
+    if (!f) f = std::fopen(macapk_arm64_remap_path(guest_or_host_path.c_str()).c_str(), "rb");
+    if (!f) return out;
+    struct Ph { uint32_t type, flags; uint64_t off, va, pa, fsz, msz, al; };
+    unsigned char eh[64];
+    if (std::fread(eh, 1, 64, f) == 64 && std::memcmp(eh, "\177ELF", 4) == 0 && eh[4] == 2) {
+        uint64_t phoff; uint16_t phentsize, phnum;
+        std::memcpy(&phoff, eh + 32, 8); std::memcpy(&phentsize, eh + 54, 2); std::memcpy(&phnum, eh + 56, 2);
+        std::vector<Ph> ph;
+        for (unsigned i = 0; i < phnum && i < 64 && phentsize >= sizeof(Ph); ++i) {
+            Ph p;
+            if (std::fseek(f, (long)(phoff + (uint64_t)i * phentsize), SEEK_SET) != 0 ||
+                std::fread(&p, sizeof p, 1, f) != 1) break;
+            ph.push_back(p);
+        }
+        auto v2o = [&](uint64_t va, uint64_t* off) {
+            for (const auto& p : ph) if (p.type == 1 && va >= p.va && va < p.va + p.fsz) { *off = p.off + (va - p.va); return true; }
+            return false;
+        };
+        for (const auto& p : ph) {
+            if (p.type != 2 || p.fsz > (1u << 20)) continue;   // PT_DYNAMIC
+            std::vector<uint64_t> dyn(p.fsz / 8);
+            if (std::fseek(f, (long)p.off, SEEK_SET) != 0 || std::fread(dyn.data(), 8, dyn.size(), f) != dyn.size()) break;
+            uint64_t strtab = 0, soname = 0; bool have = false;
+            for (size_t i = 0; i + 1 < dyn.size() && dyn[i] != 0; i += 2) {
+                if (dyn[i] == 5) strtab = dyn[i + 1];
+                if (dyn[i] == 14) { soname = dyn[i + 1]; have = true; }
+            }
+            uint64_t so_off;
+            if (have && strtab && v2o(strtab, &so_off) && std::fseek(f, (long)(so_off + soname), SEEK_SET) == 0) {
+                char b[256] = {0};
+                size_t n = std::fread(b, 1, sizeof b - 1, f);
+                b[n] = 0;
+                out = b;
+            }
+            break;
+        }
+    }
+    std::fclose(f);
+    return out;
+}
+bool macapk_ns_dir_has(const std::string& dir, const std::string& so) {
+    if (macapk_ns_is_system_dir(dir)) return macapk_ns_is_system_lib(so);
+    struct stat st;
+    if (::stat((dir + "/" + so).c_str(), &st) == 0 && S_ISREG(st.st_mode)) return true;   // a host-spelled dir
+    const std::string host = macapk_arm64_remap_path((dir + "/" + so).c_str());
+    if (::stat(host.c_str(), &st) == 0 && S_ISREG(st.st_mode)) return true;
+    return macapk_path_in_guest_lib_dir(dir + "/" + so) && macapk_ns_wrapper_exists(so);
+}
+bool macapk_ns_path_exists(const std::string& path) {
+    if (macapk_ns_is_system_dir(macapk::ldns::dirname_of(path)))
+        return macapk_ns_is_system_lib(macapk::ldns::basename_of(path));
+    struct stat st;
+    if (::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) return true;
+    const std::string host = macapk_arm64_remap_path(path.c_str());
+    if (::stat(host.c_str(), &st) == 0 && S_ISREG(st.st_mode)) return true;
+    return macapk_ns_wrapper_exists(macapk::ldns::basename_of(path));
+}
+// linker.cpp is_exempt_lib's list; only applies below target sdk 24.
+bool macapk_ns_exempt(const std::string& name) {
+    if (macapk_ns().target_sdk.load() >= 24) return false;
+    static const char* const kList[] = {"libandroid_runtime.so", "libbinder.so", "libcrypto.so",
+        "libcutils.so", "libexpat.so", "libgui.so", "libmedia.so", "libnativehelper.so", "libssl.so",
+        "libstagefright.so", "libsqlite.so", "libui.so", "libutils.so", nullptr};
+    std::string n = name;
+    if (n[0] == '/' && macapk::ldns::dirname_of(n) == "/system/lib64") n = macapk::ldns::basename_of(n);
+    for (const char* const* p = kList; *p; ++p) if (n == *p) return true;
+    return false;
+}
+// Build default/system/app namespaces on first use (state.mu held). The app namespace follows
+// libnativeloader's CreateClassLoaderNamespace for the main classloader, searching the guest
+// library dir the Java side pushed; if that dir changes later the search path follows.
+void macapk_ns_init_locked(MacapkNsState& st) {
+    using namespace macapk::ldns;
+    if (!st.system) {
+        st.reg.default_ns()->default_library_paths = {"/system/lib64"};
+        st.system = st.reg.create("system", nullptr, "/system/lib64", TYPE_REGULAR, nullptr,
+                                  st.reg.default_ns(), nullptr, nullptr);
+        st.reg.export_ns("system", st.system);
+        for (const char* const* p = kMacapkSystemLibs; *p; ++p) {
+            st.reg.note_loaded(st.system, *p, std::string("/system/lib64/") + *p);
+            st.reg.note_loaded(st.reg.default_ns(), *p, std::string("/system/lib64/") + *p);
+        }
+    }
+    char buf[PATH_MAX];
+    std::string dir;
+    if (__macapk_arm64_guest_lib_dir_copy(buf, sizeof buf)) dir = buf;
+    while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+    if (!st.app) {
+        std::string err;
+        st.app = create_classloader_namespace(st.reg, ++st.clns_serial, dir, "", nullptr, st.system,
+                                              macapk_ns_system_exposed(), /*shared=*/false,
+                                              /*exempt=*/st.target_sdk.load() < 24,
+                                              /*main_classloader=*/true, &err);
+        if (!st.app) std::fprintf(stderr, "[linker-ns] app namespace creation failed: %s\n", err.c_str());
+        st.app_dir = dir;
+    } else if (!dir.empty() && dir != st.app_dir) {
+        st.app->default_library_paths = {dir};
+        st.app_dir = dir;
+    }
+}
+// Namespace of the code calling into the shim: the namespace recorded for the library that
+// contains `caller`, else the anonymous namespace (bionic: get_caller_namespace).
+macapk::ldns::Namespace* macapk_ns_caller_locked(MacapkNsState& st, const void* caller) {
+    macapk_ns_init_locked(st);
+    Dl_info di;
+    if (caller && __macapk_arm64_native_dladdr(caller, &di) && di.dli_fname) {
+        if (auto* n = st.reg.namespace_of(macapk::ldns::basename_of(di.dli_fname))) return n;
+    }
+    if (t_ns_loading && st.reg.valid(t_ns_loading)) return t_ns_loading;
+    return st.reg.anonymous_ns();
+}
+enum class NsMode { Enforce, Warn, Off };
+NsMode macapk_ns_mode() {
+    static const NsMode m = [] {
+        const char* e = std::getenv("MACAPK_LINKER_NAMESPACES");
+        if (e && e[0] == '0') return NsMode::Off;
+        if (e && std::strcmp(e, "warn") == 0) return NsMode::Warn;
+        return NsMode::Enforce;
+    }();
+    return m;
+}
+void macapk_ns_set_err(const std::string& m) { t_ns_err_pending = m; }
+}  // namespace
+
+// The gate. `ns` is the target namespace (android_dlopen_ext USE_NAMESPACE) or null for the
+// caller's.
+static void* macapk_dlopen_in_ns(const char* path, int flag, macapk::ldns::Namespace* ns,
+                                 const void* caller) {
+    if (!path || macapk_ns_mode() == NsMode::Off) return macapk_dlopen_core(path, flag);
+    MacapkNsState& st = macapk_ns();
+    macapk::ldns::Resolution r;
+    std::string ns_name;
+    macapk::ldns::Namespace* use = nullptr;
+    bool is_app_ns = false;
+    bool host_spelling = false;
+    {
+        std::lock_guard<std::mutex> g(st.mu);
+        macapk_ns_init_locked(st);
+        use = ns ? ns : macapk_ns_caller_locked(st, caller);
+        if (!use) return macapk_dlopen_core(path, flag);
+        ns_name = use->name;
+        is_app_ns = (use == st.app);
+        // A macOS path (the runtime or a translated wrapper handing the guest a host spelling)
+        // names no Android location, so the app's own namespace does not govern it; the host
+        // loader answers as it always did. Any OTHER namespace (one the guest created) governs
+        // every path it is asked for, as bionic's does.
+        if (is_app_ns && path[0] == '/') {
+            static const char* const kHostRoots[] = {"/Users/", "/Applications/", "/Library/",
+                "/private/", "/Volumes/", "/var/", "/tmp/", "/opt/", nullptr};
+            for (const char* const* h = kHostRoots; *h; ++h)
+                if (std::strncmp(path, *h, std::strlen(*h)) == 0) { host_spelling = true; break; }
+        }
+        if (!host_spelling)
+            r = st.reg.resolve(use, path, macapk_ns_dir_has, macapk_ns_path_exists, macapk_ns_exempt);
+        if (!host_spelling && !r.ok && path[0] == '/') {
+            // /var vs /private/var and other symlinked spellings: bionic compares the library's
+            // realpath, so retry with ours (namespace dirs are canonicalised at creation too).
+            char rp[PATH_MAX];
+            if (::realpath(path, rp) && std::strcmp(rp, path) != 0) {
+                auto r2 = st.reg.resolve(use, rp, macapk_ns_dir_has, macapk_ns_path_exists, macapk_ns_exempt);
+                if (r2.ok) r = r2;
+            }
+        }
+    }
+    if (!r.ok && r.error.find("is not accessible for the namespace") != std::string::npos) {
+        std::fprintf(stderr, "[linker-ns] dlopen(\"%s\") in namespace \"%s\": %s%s\n", path,
+                     ns_name.c_str(), r.error.c_str(),
+                     macapk_ns_mode() == NsMode::Warn ? " (MACAPK_LINKER_NAMESPACES=warn: allowed)" : "");
+        if (macapk_ns_mode() == NsMode::Enforce) {
+            macapk_ns_set_err(r.error);
+            return nullptr;
+        }
+    } else if (!r.ok && (ns != nullptr || !is_app_ns)) {
+        // A namespace the guest created (or named in extinfo) is authoritative: not found
+        // there is a failure with bionic's text, not a cue to try the host loader.
+        macapk_ns_set_err(r.error);
+        return nullptr;
+    } else if (!host_spelling && st.logged.fetch_add(1) < 24) {
+        std::fprintf(stderr, "[linker-ns] dlopen(\"%s\") in \"%s\" -> %s\n", path, ns_name.c_str(),
+                     r.ok ? (r.owner ? r.owner->name.c_str() : "?") : "not in the model (host loader)");
+    }
+    // A bare name resolved on the namespace's search path loads from THAT path (joined), not the
+    // raw soname (which the host loader would search for itself). System-library answers keep the
+    // soname: those are served by the markers in macapk_dlopen_core.
+    const char* load_name = path;
+    std::string joined;
+    if (r.ok && !r.path.empty() && r.path[0] == '/' && std::strchr(path, '/') == nullptr &&
+        !macapk_ns_is_system_dir(macapk::ldns::dirname_of(r.path))) {
+        joined = r.path;
+        load_name = joined.c_str();
+    }
+    void* h;
+    {
+        // The library loads inside its owning namespace: its dependencies and nested dlopens
+        // resolve through that namespace's search paths and links.
+        macapk::ldns::Namespace* const saved = t_ns_loading;
+        t_ns_loading = (r.ok && !r.already_loaded && r.owner) ? r.owner : use;
+        h = macapk_dlopen_core(load_name, flag);
+        t_ns_loading = saved;
+    }
+    if (!h && !r.ok && macapk_ns_mode() == NsMode::Enforce &&
+        r.error.find("not found") != std::string::npos && t_ns_err_pending.empty()) {
+        macapk_ns_set_err(r.error);   // bionic's text, not the host loader's "tried: ..." list
+    }
+    if (h) {
+        std::lock_guard<std::mutex> g(st.mu);
+        const std::string so = macapk::ldns::basename_of(path);
+        macapk::ldns::Namespace* owner = (r.ok && !r.already_loaded && r.owner) ? r.owner : use;
+        // A library the app loaded by a host spelling is ungoverned, so it is a member of the
+        // default namespace (what a namespace linked to default must find by soname).
+        if (host_spelling) owner = st.reg.default_ns();
+        if (!(r.ok && r.already_loaded)) {
+            const std::string lp = r.ok && !r.path.empty() ? r.path : std::string(path);
+            st.reg.note_loaded(owner, so, lp);
+            st.reg.note_primary(so, owner);
+            // Links match by SONAME, and a library loaded by absolute path may carry another name
+            // (bionic compares si->get_soname(), which is DT_SONAME).
+            const std::string ds = macapk_ns_dt_soname(lp[0] == '/' ? lp : std::string(path));
+            if (!ds.empty() && ds != so) {
+                st.reg.note_loaded(owner, ds, lp);
+                st.reg.note_primary(ds, owner);
+            }
+        }
+    }
+    return h;
+}
+
+// 1 only while a library loads inside a guest-created namespace with the gate enforcing; every
+// other load (the app's own namespace, no namespace, gate off) keeps the historic behaviour.
+extern "C" int __macapk_arm64_ns_enforcing(void) {
+    macapk::ldns::Namespace* ns = t_ns_loading;
+    if (!ns || macapk_ns_mode() != NsMode::Enforce) return 0;
+    MacapkNsState& st = macapk_ns();
+    std::lock_guard<std::mutex> g(st.mu);
+    return st.reg.valid(ns) && ns != st.app;
+}
+// Loader hook (bionic_shim_elfexec.cpp load_tree): while a library loads inside a namespace the
+// guest created, each of its DT_NEEDED entries resolves through THAT namespace (its search
+// paths and links), as bionic's load_needed_libraries does. Answers:
+//   0  no guest namespace is loading: the caller searches as before
+//   1  resolve: `path` is the file to load (membership is recorded here)
+//   2  already loaded and visible from the namespace: the caller reuses the loaded image
+//   3  system / platform library: the shim answers it, nothing to load
+//   4  not found or not accessible from the namespace: bionic fails the whole dlopen (the error
+//      is queued for dlerror); under MACAPK_LINKER_NAMESPACES=warn the import stays unresolved
+extern "C" int __macapk_arm64_ns_resolve_dep(const char* need, const char* requester, char* path, size_t path_n) {
+    macapk::ldns::Namespace* ns = t_ns_loading;
+    if (!ns || macapk_ns_mode() == NsMode::Off) return 0;
+    MacapkNsState& st = macapk_ns();
+    std::lock_guard<std::mutex> g(st.mu);
+    // The app's own namespace keeps the historic path (host loader as fallback); only a
+    // namespace the guest created governs its dependencies.
+    if (!st.reg.valid(ns) || ns == st.app) return 0;
+    macapk::ldns::Resolution r = st.reg.resolve(ns, need, macapk_ns_dir_has, macapk_ns_path_exists, macapk_ns_exempt);
+    if (!r.ok) {
+        if (st.logged.fetch_add(1) < 48)
+            std::fprintf(stderr, "[linker-ns] DT_NEEDED \"%s\" in \"%s\": %s\n", need, ns->name.c_str(), r.error.c_str());
+        if (macapk_ns_mode() == NsMode::Enforce) {
+            // linker.cpp load_library: library "X" not found: needed by <so> in namespace <ns>
+            std::string e = r.error;
+            if (e.find("needed by") == std::string::npos && e.find("not found") != std::string::npos)
+                e += std::string(": needed by ") + requester + " in namespace " + ns->name;
+            macapk_ns_set_err(e);
+        }
+        return 4;
+    }
+    if (r.already_loaded) return 2;
+    if (r.path.empty() || macapk_ns_is_system_dir(macapk::ldns::dirname_of(r.path))) return 3;
+    if (r.path.size() >= path_n) return 4;
+    std::memcpy(path, r.path.c_str(), r.path.size() + 1);
+    macapk::ldns::Namespace* owner = r.owner ? r.owner : ns;
+    st.reg.note_loaded(owner, need, r.path);
+    st.reg.note_primary(need, owner);
+    return 1;
+}
+
+// dlerror: a refusal from the gate or an android_*namespace* call is reported with bionic's
+// text; anything else is the host dlerror, as before.
+extern "C" const char* __macapk_arm64_dlerror(void) {
+    if (!t_ns_err_pending.empty()) {
+        t_ns_err_last.swap(t_ns_err_pending);
+        t_ns_err_pending.clear();
+        return t_ns_err_last.c_str();
+    }
+    return ::dlerror();
+}
+
+namespace {
+bool macapk_ns_api_fail(const char* what, const std::string& err) {
+    macapk_ns_set_err(std::string(what) + " failed: " + err);
+    return false;
+}
+}  // namespace
+
+// android/dlext.h android_dlextinfo, LP64.
+struct MacapkAndroidDlextinfo {
+    uint64_t flags;
+    void* reserved_addr;
+    size_t reserved_size;
+    int relro_fd;
+    int library_fd;
+    int64_t library_fd_offset;
+    macapk::ldns::Namespace* library_namespace;
+};
+static_assert(sizeof(MacapkAndroidDlextinfo) == 48, "android_dlextinfo is 48 bytes on LP64");
+static_assert(offsetof(MacapkAndroidDlextinfo, library_namespace) == 40, "android_dlextinfo layout");
+
+// android_dlopen_ext: linker.cpp do_dlopen's extinfo validation, then the gated load.
+// RESERVED_ADDRESS*, RELRO and FORCE_LOAD have no meaning for a host-mapped library and are
+// accepted and ignored; USE_LIBRARY_FD loads by `path` (the name that identifies the library).
+extern "C" void* __macapk_arm64_android_dlopen_ext(const char* path, int flags, const void* extinfo_v) {
+    const auto* ext = static_cast<const MacapkAndroidDlextinfo*>(extinfo_v);
+    macapk::ldns::Namespace* ns = nullptr;
+    if (ext) {
+        using namespace macapk::ldns;
+        if ((ext->flags & ~DLEXT_VALID_FLAG_BITS) != 0) {
+            char b[96];
+            std::snprintf(b, sizeof b, "invalid extended flags to android_dlopen_ext: 0x%llx",
+                          (unsigned long long)ext->flags);
+            macapk_ns_set_err(b);
+            return nullptr;
+        }
+        if ((ext->flags & DLEXT_USE_NAMESPACE) != 0) {
+            std::lock_guard<std::mutex> g(macapk_ns().mu);
+            if (ext->library_namespace == nullptr) {
+                macapk_ns_set_err("ANDROID_DLEXT_USE_NAMESPACE is set but extinfo->library_namespace is null");
+                return nullptr;
+            }
+            if (!macapk_ns().reg.valid(ext->library_namespace)) {
+                macapk_ns_set_err("ANDROID_DLEXT_USE_NAMESPACE: library_namespace is not a namespace");
+                return nullptr;
+            }
+            ns = ext->library_namespace;
+        }
+    }
+    return macapk_dlopen_in_ns(path, flags, ns, __builtin_return_address(0));
+}
+
+extern "C" macapk::ldns::Namespace* __macapk_arm64_android_create_namespace(
+        const char* name, const char* ld_library_path, const char* default_library_path, uint64_t type,
+        const char* permitted_when_isolated_path, macapk::ldns::Namespace* parent) {
+    MacapkNsState& st = macapk_ns();
+    std::lock_guard<std::mutex> g(st.mu);
+    macapk_ns_init_locked(st);
+    std::string err;
+    macapk::ldns::Namespace* caller = macapk_ns_caller_locked(st, __builtin_return_address(0));
+    auto canon = [](const char* in) -> std::string {   // each dir plus its realpath spelling
+        std::string out;
+        for (const auto& d : macapk::ldns::parse_path(in)) {
+            if (!out.empty()) out += ':';
+            out += d;
+            char rp[PATH_MAX];
+            if (::realpath(d.c_str(), rp) && d != rp) { out += ':'; out += rp; }
+        }
+        return out;
+    };
+    const std::string c_ld = canon(ld_library_path), c_def = canon(default_library_path),
+                      c_perm = canon(permitted_when_isolated_path);
+    auto* ns = st.reg.create(name, ld_library_path ? c_ld.c_str() : nullptr,
+                             default_library_path ? c_def.c_str() : nullptr, type,
+                             permitted_when_isolated_path ? c_perm.c_str() : nullptr, parent, caller, &err);
+    if (!ns) macapk_ns_api_fail("android_create_namespace", err);
+    else std::fprintf(stderr, "[linker-ns] android_create_namespace(\"%s\", type=0x%llx) -> %p\n",
+                      name ? name : "", (unsigned long long)type, (void*)ns);
+    return ns;
+}
+extern "C" bool __macapk_arm64_android_link_namespaces(macapk::ldns::Namespace* from,
+        macapk::ldns::Namespace* to, const char* shared_libs_sonames) {
+    MacapkNsState& st = macapk_ns();
+    std::lock_guard<std::mutex> g(st.mu);
+    macapk_ns_init_locked(st);
+    std::string err;
+    if (!st.reg.link(from, to, shared_libs_sonames, &err))
+        return macapk_ns_api_fail("android_link_namespaces", err);
+    return true;
+}
+extern "C" bool __macapk_arm64_android_link_namespaces_all_libs(macapk::ldns::Namespace* from,
+        macapk::ldns::Namespace* to) {
+    MacapkNsState& st = macapk_ns();
+    std::lock_guard<std::mutex> g(st.mu);
+    macapk_ns_init_locked(st);
+    std::string err;
+    if (!st.reg.link_all(from, to, &err))
+        return macapk_ns_api_fail("android_link_namespaces_all_libs", err);
+    return true;
+}
+extern "C" macapk::ldns::Namespace* __macapk_arm64_android_get_exported_namespace(const char* name) {
+    MacapkNsState& st = macapk_ns();
+    std::lock_guard<std::mutex> g(st.mu);
+    macapk_ns_init_locked(st);
+    return st.reg.get_exported(name);
+}
+extern "C" bool __macapk_arm64_android_init_anonymous_namespace(const char* shared_libs_sonames,
+                                                              const char* library_search_path) {
+    MacapkNsState& st = macapk_ns();
+    std::lock_guard<std::mutex> g(st.mu);
+    macapk_ns_init_locked(st);
+    std::string err;
+    if (!st.reg.init_anonymous(shared_libs_sonames, library_search_path, &err))
+        return macapk_ns_api_fail("android_init_anonymous_namespace", err);
+    return true;
+}
+// linker.cpp do_android_get_LD_LIBRARY_PATH / do_android_update_LD_LIBRARY_PATH: the default
+// namespace's ld_library_paths.
+extern "C" void __macapk_arm64_android_get_LD_LIBRARY_PATH(char* buffer, size_t buffer_size) {
+    MacapkNsState& st = macapk_ns();
+    std::lock_guard<std::mutex> g(st.mu);
+    macapk_ns_init_locked(st);
+    std::string joined;
+    for (const auto& p : st.reg.default_ns()->default_library_paths) { if (!joined.empty()) joined += ':'; joined += p; }
+    if (!buffer || buffer_size == 0) return;
+    if (joined.size() + 1 > buffer_size) { macapk_ns_api_fail("android_get_LD_LIBRARY_PATH", "buffer too small"); return; }
+    std::memcpy(buffer, joined.c_str(), joined.size() + 1);
+}
+extern "C" void __macapk_arm64_android_update_LD_LIBRARY_PATH(const char* ld_library_path) {
+    MacapkNsState& st = macapk_ns();
+    std::lock_guard<std::mutex> g(st.mu);
+    macapk_ns_init_locked(st);
+    st.reg.default_ns()->ld_library_paths = macapk::ldns::parse_path(ld_library_path);
+}
+extern "C" void __macapk_arm64_android_set_application_target_sdk_version(int target) {
+    macapk_ns().target_sdk.store(target);
+}
+extern "C" int __macapk_arm64_android_get_application_target_sdk_version(void) {
+    return macapk_ns().target_sdk.load();
+}
+// libdl_android's loader-prefixed spellings (what libdl forwards to; code that looks the
+// symbols up by name against libdl.so uses these).
+extern "C" macapk::ldns::Namespace* __macapk_arm64___loader_android_create_namespace(
+        const char* n, const char* a, const char* b, uint64_t t, const char* p, macapk::ldns::Namespace* parent) {
+    return __macapk_arm64_android_create_namespace(n, a, b, t, p, parent);
+}
+extern "C" bool __macapk_arm64___loader_android_link_namespaces(macapk::ldns::Namespace* f,
+        macapk::ldns::Namespace* t, const char* s) { return __macapk_arm64_android_link_namespaces(f, t, s); }
+extern "C" bool __macapk_arm64___loader_android_link_namespaces_all_libs(macapk::ldns::Namespace* f,
+        macapk::ldns::Namespace* t) { return __macapk_arm64_android_link_namespaces_all_libs(f, t); }
+extern "C" macapk::ldns::Namespace* __macapk_arm64___loader_android_get_exported_namespace(const char* n) {
+    return __macapk_arm64_android_get_exported_namespace(n);
+}
+extern "C" bool __macapk_arm64___loader_android_init_anonymous_namespace(const char* a, const char* b) {
+    return __macapk_arm64_android_init_anonymous_namespace(a, b);
+}
+
 // __readlink_chk(path, buf, size, buflen): Bionic FORTIFY variant of readlink; the
 // extra buflen is the compiler-known size of buf, used only to detect an overflow.
 // The guest already sized buf correctly, so forward to readlink(2).
@@ -57883,6 +58952,19 @@ extern "C" int __macapk_arm64_ASharedMemory_create(const char* name, size_t size
 }
 // ASharedMemory_getSize(fd): our ashmem fd is a plain (unlinked) file, so its
 // size is what ftruncate set. fstat reports it.
+// libcutils ashmem_create_region(name, size) -> fd, and the no-op region calls.
+extern "C" int __macapk_arm64_ashmem_create_region(const char* name, size_t size) {
+    return __macapk_arm64_ASharedMemory_create(name, size);
+}
+extern "C" int __macapk_arm64_ashmem_set_prot_region(int, int) { return 0; }
+extern "C" int __macapk_arm64_ashmem_pin_region(int, size_t, size_t) { return 0; }
+extern "C" int __macapk_arm64_ashmem_unpin_region(int, size_t, size_t) { return 0; }
+extern "C" int __macapk_arm64_ashmem_valid(int fd) {
+    struct stat st; return fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
+}
+extern "C" int __macapk_arm64_ashmem_get_size_region(int fd) {
+    struct stat st; return (fd >= 0 && fstat(fd, &st) == 0) ? (int)st.st_size : -1;
+}
 extern "C" size_t __macapk_arm64_ASharedMemory_getSize(int fd) {
     struct stat st;
     if (fd >= 0 && ::fstat(fd, &st) == 0 && st.st_size > 0) return (size_t)st.st_size;
@@ -57983,6 +59065,56 @@ extern "C" int __macapk_arm64_sendmmsg(int /*fd*/, void* /*msgvec*/, unsigned /*
                                        int /*flags*/) {
     errno = errno_mac2lin(ENOSYS);
     return -1;
+}
+
+// fallocate / fallocate64 (bionic libc/include/fcntl.h, API 21+): Linux space reservation.
+// macOS has no fallocate; F_PREALLOCATE reserves the blocks and ftruncate extends the size, which
+// is what mode 0 (and FALLOC_FL_KEEP_SIZE, which skips the size change) promise. The other modes
+// (PUNCH_HOLE 2, COLLAPSE_RANGE 8, ZERO_RANGE 0x10, INSERT_RANGE 0x20) have no macOS equivalent
+// and Linux itself reports them as EOPNOTSUPP on filesystems without support, so callers already
+// handle that answer. .NET's libSystem.Native imports this for FileStream.SetLength preallocation.
+static int macapk_fallocate_impl(int fd, int mode, int64_t offset, int64_t len) {
+    constexpr int kKeepSize = 1;
+    if (offset < 0 || len <= 0) { errno = errno_mac2lin(EINVAL); return -1; }
+    if (mode & ~kKeepSize)      { errno = errno_mac2lin(ENOTSUP); return -1; }
+    struct stat st;
+    if (::fstat(fd, &st) != 0)  { errno = errno_mac2lin(errno); return -1; }
+    if (!S_ISREG(st.st_mode))   { errno = errno_mac2lin(ENODEV); return -1; }
+    const int64_t end = offset + len;
+    if (end > (int64_t)st.st_size) {
+        fstore_t fs{};
+        fs.fst_flags = F_ALLOCATEALL;
+        fs.fst_posmode = F_PEOFPOSMODE;
+        fs.fst_offset = 0;
+        fs.fst_length = end - (int64_t)st.st_size;
+        if (::fcntl(fd, F_PREALLOCATE, &fs) != 0 && errno == ENOSPC) {
+            errno = errno_mac2lin(ENOSPC);
+            return -1;
+        }
+        if (!(mode & kKeepSize) && ::ftruncate(fd, (off_t)end) != 0) {
+            errno = errno_mac2lin(errno);
+            return -1;
+        }
+    }
+    return 0;
+}
+extern "C" int __macapk_arm64_fallocate(int fd, int mode, int64_t offset, int64_t len) {
+    return macapk_fallocate_impl(fd, mode, offset, len);
+}
+extern "C" int __macapk_arm64_fallocate64(int fd, int mode, int64_t offset, int64_t len) {
+    return macapk_fallocate_impl(fd, mode, offset, len);
+}
+
+// sched_getcpu (bionic libc/include/sched.h): the CPU the caller is running on. Callers use it only
+// to pick a per-CPU shard, never for correctness. Apple Silicon exposes no portable CPU index to
+// user space, so answer a stable per-thread index within the online CPU count (the contract the
+// callers rely on: 0 <= result < number of CPUs, cheap, and mostly stable for a thread).
+extern "C" int __macapk_arm64_sched_getcpu(void) {
+    static const unsigned ncpu = []{
+        int n = (int)sysconf(_SC_NPROCESSORS_ONLN);
+        return (unsigned)(n > 0 ? n : 1);
+    }();
+    return (int)(pthread_mach_thread_np(pthread_self()) % ncpu);
 }
 
 extern "C" int __macapk_arm64_madvise(void* addr, size_t len, int advice) {
@@ -58445,6 +59577,23 @@ extern "C" const char* __macapk_get_runtime_apk_path() {
 // assets without name collision.
 static std::string g_data_subdir;
 static std::mutex  g_data_subdir_mutex;
+// The JAVA side's /proc (2026-10-30). Java code that reads /proc/self/* (Google
+// Play services' memory metrics open /proc/self/status with a FileReader)
+// never passes through this shim, so it found nothing on macOS. The runtime
+// hands such paths here (NativeCocoa.remapProcPath, installed into the
+// patched java.io.FileReader by Boot) and gets back the SAME synthesized host
+// file a guest's native open of that path reads. Only /proc paths are
+// answered; anything else, or a path we do not synthesize, returns -1 and the
+// Java open proceeds unchanged. Writes the host path into `out` (NUL
+// terminated) and returns its length.
+extern "C" int __macapk_remap_proc_path(const char* in, char* out, size_t cap) {
+    if (!in || !out || cap == 0 || std::strncmp(in, "/proc/", 6) != 0) return -1;
+    std::string host = macapk_arm64_remap_path(in);
+    if (host.empty() || host == in || host.size() + 1 > cap) return -1;
+    std::memcpy(out, host.c_str(), host.size() + 1);
+    return (int)host.size();
+}
+
 extern "C" void __macapk_set_data_subdir(const char* s) {
     if (!s) return;
     std::lock_guard<std::mutex> g(g_data_subdir_mutex);
@@ -58775,6 +59924,24 @@ extern "C" void __macapk_install_jni_trace_env(JNIEnv* env) {
     uintptr_t hi_addr = reinterpret_cast<uintptr_t>(vtable) + sizeof(JNINativeInterface_);
     uintptr_t page_lo = lo_addr & ~uintptr_t(page - 1);
     uintptr_t page_hi = (hi_addr + sizeof(void*) + page - 1) & ~uintptr_t(page - 1);
+    // Remember each page's CURRENT protection and put exactly that back. The
+    // table shares its page(s) with libjvm's writable data (JFR trace ids, ...),
+    // so forcing PROT_READ afterwards made the JVM's next write there SIGBUS.
+    std::vector<std::pair<uintptr_t, int>> saved_prot;
+    for (uintptr_t pg = page_lo; pg < page_hi; pg += page) {
+        mach_vm_address_t ra = pg;
+        mach_vm_size_t rs = 0;
+        vm_region_basic_info_data_64_t ri;
+        mach_msg_type_number_t rc_cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t on = MACH_PORT_NULL;
+        int prot = PROT_READ | PROT_WRITE;
+        if (mach_vm_region(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                           reinterpret_cast<vm_region_info_t>(&ri), &rc_cnt, &on) == KERN_SUCCESS
+            && ra <= pg) {
+            prot = ri.protection;
+        }
+        saved_prot.emplace_back(pg, prot);
+    }
     if (mprotect(reinterpret_cast<void*>(page_lo), page_hi - page_lo,
                   PROT_READ | PROT_WRITE) != 0) {
         std::fprintf(stderr,
@@ -58790,10 +59957,11 @@ extern "C" void __macapk_install_jni_trace_env(JNIEnv* env) {
     vtable->GetStaticFieldID  = macapk_traced_GetStaticFieldID;
     vtable->GetStringUTFChars   = macapk_traced_GetStringUTFChars;
     vtable->GetStaticObjectField= macapk_traced_GetStaticObjectField;
-    if (mprotect(reinterpret_cast<void*>(page_lo), page_hi - page_lo,
-                  PROT_READ) != 0) {
-        std::fprintf(stderr,
-            "[jni-trace] mprotect R-- failed: %s\n", std::strerror(errno));
+    for (const auto& sp : saved_prot) {
+        if (mprotect(reinterpret_cast<void*>(sp.first), page, sp.second) != 0) {
+            std::fprintf(stderr,
+                "[jni-trace] mprotect restore failed: %s\n", std::strerror(errno));
+        }
     }
     std::fprintf(stderr,
         "[jni-trace] CallObjectMethodV hook installed on vtable %p "
@@ -60775,6 +61943,20 @@ static const char* arm32_lookup_sig(uint64_t thunk_addr) {
 // MACAPK_ARM32_JNI_SIG_FP=0). On a HIT it walks the descriptor AAPCS32-
 // correctly. Both end via macapk_invoke_safe_core (fault-protected).
 //
+// Stack-passed arguments of a RegisterNatives(arm32) native (#105, AI Douyin:
+// Alog.nativeCreate has 21 integer args, others 7-8). HotSpot calls a native with
+// the C ABI: env, this/class and the first six declared integer-class args go in
+// x0-x7, the first eight float/double args in v0-v7, and EVERYTHING ELSE is pushed
+// on the host stack in descriptor order. On macOS/aarch64 that stack is PACKED:
+// each argument sits at align_up(offset, its own size) and takes only its own size
+// (jboolean/jbyte 1, jchar/jshort 2, jint/jfloat 4, jlong/jdouble/object 8)
+// -- openjdk/jdk21u src/hotspot/cpu/aarch64/interpreterRT_aarch64.cpp,
+// next_stack_offset(): "On macos/aarch64 native stack is packed, int/float are
+// using only 4 bytes on stack. Natural alignment for types are still in place".
+// macapk_arm32_regnat_entry_* receive the address of the first stack argument
+// (the thunk forwards its entry sp) and publish it here for the descriptor walk.
+static thread_local const uint8_t* t_regnat_stack_args = nullptr;
+
 // `out_r1` (2026-07-28): forwarded straight to macapk_invoke_safe_core so a
 // RegisterNatives(arm32) J/D-returning native (macapk_arm32_regnat_invoke,
 // ~line 35130) can recover the high word. Trailing + static for the exact
@@ -60843,6 +62025,7 @@ static int32_t macapk_arm32_jni_call_core(
     // regardless of how many integer parameters precede it. So F/D consume
     // from `fbank` with their own counter and must NOT advance `ai`.
     int nfp = 0;
+    unsigned host_soff = 0;   // offset into t_regnat_stack_args
     const char* p = std::strchr(sig, '(');
     if (p) ++p;
     // MACAPK_ARM32_JNI_WALK_CONTINUE (default ON, v1.0.1653): walk the WHOLE
@@ -60871,10 +62054,28 @@ static int32_t macapk_arm32_jni_call_core(
             else if (*p) ++p; }
         else { ++p; }   // I/Z/B/C/S -> 4-byte, INT bank
         uint64_t v;
-        if (isfp && nfp >= 8) {
-            v = 0;   // FP bank exhausted: a host-stack argument, not forwarded
-        } else if (!isfp && ai >= 6) {
-            v = 0;   // integer bank exhausted: likewise
+        if ((isfp && nfp >= 8) || (!isfp && ai >= 6)) {
+            // Bank exhausted: a host-STACK argument (see t_regnat_stack_args).
+            // Size/alignment by DECLARED type, packed (macOS), in descriptor
+            // order across both banks. Without the stack pointer (the
+            // name-based thunk path never has one) it stays 0, as before.
+            unsigned sz = is8 ? 8u : isobj ? 8u : isfp ? 4u : 4u;
+            if (!isfp && !isobj && !is8) {
+                const char tc = c;    // the descriptor char of this primitive
+                sz = (tc == 'Z' || tc == 'B') ? 1u : (tc == 'C' || tc == 'S') ? 2u : 4u;
+            }
+            host_soff = (host_soff + sz - 1u) & ~(sz - 1u);
+            v = 0;
+            if (t_regnat_stack_args) {
+                const uint8_t* q = t_regnat_stack_args + host_soff;
+                if (sz == 1) { v = *q; if (c == 'B') v = (uint64_t)(int64_t)(int8_t)*q; }
+                else if (sz == 2) { uint16_t x; std::memcpy(&x, q, 2); v = (c == 'S') ? (uint64_t)(int64_t)(int16_t)x : x; }
+                else if (sz == 4) { uint32_t x; std::memcpy(&x, q, 4); v = x; }
+                else { std::memcpy(&v, q, 8); }
+            }
+            host_soff += sz;
+            // A floating value read off the stack is already raw bits, which is
+            // what the SOFTFP guest takes, so skip the FP-bank conversion below.
         } else if (isfp) {
             // armeabi-v7a JNI is SOFTFP: the guest takes floats in CORE
             // registers, so hand it the raw bit pattern, not a v-register.
@@ -61145,7 +62346,11 @@ static ArmRegNativeSigInfo macapk_arm32_regnat_parse_sig(const char* sig) {
     // (...)J never bound, so native game code never ran). See
     // docs/arm32-jni-64bit-return_2026-07-28.md.
     bool ret_ok = std::strchr("VZBCSIFL[JD", info.ret_type) != nullptr;
-    info.ok = ret_ok && info.n_gp_args <= 6 && info.n_fp_args <= 8;
+    // No argument-count ceiling any more: arguments beyond x2-x7 / v0-v7 are read
+    // off the host stack by the descriptor walk (t_regnat_stack_args). The
+    // MACAPK_ARM32_REGNAT_MAXARGS=1 escape hatch restores the old 6/8 limit.
+    static const bool s_limit = std::getenv("MACAPK_ARM32_REGNAT_MAXARGS") != nullptr;
+    info.ok = ret_ok && (!s_limit || (info.n_gp_args <= 6 && info.n_fp_args <= 8));
     return info;
 }
 
@@ -61168,8 +62373,14 @@ static int32_t macapk_arm32_regnat_invoke(
         uint64_t g4, uint64_t g5,
         double f0, double f1, double f2, double f3,
         double f4, double f5, double f6, double f7,
-        uint32_t* out_r1 = nullptr) {
+        uint32_t* out_r1 = nullptr, const uint8_t* sargs = nullptr) {
     uint32_t sp_init = __macapk_alloc_thread_stack();
+    // Nested natives (native -> Java -> native) must not see our caller's value.
+    struct SargsScope {
+        const uint8_t* saved;
+        explicit SargsScope(const uint8_t* n) : saved(t_regnat_stack_args) { t_regnat_stack_args = n; }
+        ~SargsScope() { t_regnat_stack_args = saved; }
+    } sargs_scope(sargs);
     return macapk_arm32_jni_call_core(
         d->fn, d->self_addr, reinterpret_cast<void*>(env),
         reinterpret_cast<uint64_t>(thiz), g0, g1, g2, g3, g4, g5,
@@ -61188,9 +62399,10 @@ extern "C" uint64_t macapk_arm32_regnat_entry_gp(
         uint64_t g4, uint64_t g5,
         double f0, double f1, double f2, double f3,
         double f4, double f5, double f6, double f7,
-        ArmRegNativeDesc* d) {
+        ArmRegNativeDesc* d, const uint8_t* sargs) {
     int32_t r = macapk_arm32_regnat_invoke(d, env, thiz, g0, g1, g2, g3, g4, g5,
-                                           f0, f1, f2, f3, f4, f5, f6, f7);
+                                           f0, f1, f2, f3, f4, f5, f6, f7,
+                                           nullptr, sargs);
     return static_cast<uint64_t>(static_cast<uint32_t>(r));
 }
 extern "C" float macapk_arm32_regnat_entry_float(
@@ -61199,9 +62411,10 @@ extern "C" float macapk_arm32_regnat_entry_float(
         uint64_t g4, uint64_t g5,
         double f0, double f1, double f2, double f3,
         double f4, double f5, double f6, double f7,
-        ArmRegNativeDesc* d) {
+        ArmRegNativeDesc* d, const uint8_t* sargs) {
     int32_t r = macapk_arm32_regnat_invoke(d, env, thiz, g0, g1, g2, g3, g4, g5,
-                                           f0, f1, f2, f3, f4, f5, f6, f7);
+                                           f0, f1, f2, f3, f4, f5, f6, f7,
+                                           nullptr, sargs);
     uint32_t bits = static_cast<uint32_t>(r);
     float f; std::memcpy(&f, &bits, sizeof(f));
     return f;
@@ -61212,10 +62425,69 @@ extern "C" jobject macapk_arm32_regnat_entry_obj(
         uint64_t g4, uint64_t g5,
         double f0, double f1, double f2, double f3,
         double f4, double f5, double f6, double f7,
-        ArmRegNativeDesc* d) {
+        ArmRegNativeDesc* d, const uint8_t* sargs) {
     int32_t r = macapk_arm32_regnat_invoke(d, env, thiz, g0, g1, g2, g3, g4, g5,
-                                           f0, f1, f2, f3, f4, f5, f6, f7);
+                                           f0, f1, f2, f3, f4, f5, f6, f7,
+                                           nullptr, sargs);
     void* real = __macapk_jni_resolve_handle(static_cast<uint32_t>(r));
+    if (jni_trace_enabled()) {
+        // #105: what exactly does a native hand back to the interpreter? A
+        // returned jobject must be a valid LOCAL or GLOBAL reference; the
+        // interpreter resolves it blindly. GetObjectRefType: 0 invalid,
+        // 1 local, 2 global, 3 weak global.
+        jint rt = real ? env->GetObjectRefType(reinterpret_cast<jobject>(real)) : -1;
+        std::fprintf(stderr,
+            "[jni-trace] regnat_entry_obj: guest r0=0x%x -> real=%p reftype=%d "
+            "(0 invalid,1 local,2 global,3 weak,-1 null)\n",
+            static_cast<uint32_t>(r), real, static_cast<int>(rt));
+        if (real && rt != 0) {
+            jclass k = env->GetObjectClass(reinterpret_cast<jobject>(real));
+            if (k) {
+                jclass cc = env->FindClass("java/lang/Class");
+                jmethodID gn = cc ? env->GetMethodID(cc, "getName", "()Ljava/lang/String;") : nullptr;
+                jstring nm = gn ? static_cast<jstring>(env->CallObjectMethod(k, gn)) : nullptr;
+                const char* u = nm ? env->GetStringUTFChars(nm, nullptr) : nullptr;
+                std::fprintf(stderr, "[jni-trace] regnat_entry_obj: result class=%s\n", u ? u : "?");
+                if (u) env->ReleaseStringUTFChars(nm, u);
+            }
+        }
+    }
+    // Declared-return-type guard (#105). HotSpot's interpreter trusts a native's
+    // returned reference to have the declared type (the verifier is off here and
+    // JNI does no check without -Xcheck:jni). A guest native that hands back an
+    // object of the WRONG class -- AI Douyin's libflipped getDeclaredMethod returns
+    // its own java.lang.Class argument where java.lang.reflect.Method is declared
+    // -- makes the next invokevirtual walk a vtable that is not the receiver's and
+    // crash the VM (SEGV in LinkResolver). Return NULL instead (a catchable NPE
+    // for the caller) and say so. Only an exact 'L<class>;' return is checked, only
+    // when no exception is pending, and a class FindClass cannot resolve skips the
+    // check. Default ON; MACAPK_NATIVE_RETURN_TYPECHECK=0 restores the old
+    // behaviour for a bisect.
+    if (real && d && !env->ExceptionCheck()) {
+        static const bool on = []{
+            const char* v = std::getenv("MACAPK_NATIVE_RETURN_TYPECHECK");
+            return !(v && v[0] == '0');
+        }();
+        size_t rp = d->sig.rfind(')');
+        if (on && rp != std::string::npos && rp + 2 < d->sig.size() &&
+            d->sig[rp + 1] == 'L' && d->sig.back() == ';') {
+            std::string cn = d->sig.substr(rp + 2, d->sig.size() - rp - 3);
+            jclass want = env->FindClass(cn.c_str());
+            if (env->ExceptionCheck()) { env->ExceptionClear(); want = nullptr; }
+            if (want) {
+                jobject o = reinterpret_cast<jobject>(real);
+                if (!env->IsInstanceOf(o, want)) {
+                    std::fprintf(stderr,
+                        "[macapk-shim] native %s%s returned an object that is not a %s "
+                        "(the interpreter would crash on it); returning NULL instead\n",
+                        d->name.c_str(), d->sig.c_str(), cn.c_str());
+                    env->DeleteLocalRef(want);
+                    return nullptr;
+                }
+                env->DeleteLocalRef(want);
+            }
+        }
+    }
     return reinterpret_cast<jobject>(real);
 }
 // Two more entry shapes (2026-07-28), for a native whose JAVA-VISIBLE return
@@ -61248,11 +62520,11 @@ extern "C" jlong macapk_arm32_regnat_entry_long(
         uint64_t g4, uint64_t g5,
         double f0, double f1, double f2, double f3,
         double f4, double f5, double f6, double f7,
-        ArmRegNativeDesc* d) {
+        ArmRegNativeDesc* d, const uint8_t* sargs) {
     uint32_t hi = 0;
     int32_t lo = macapk_arm32_regnat_invoke(d, env, thiz, g0, g1, g2, g3, g4, g5,
                                             f0, f1, f2, f3, f4, f5, f6, f7,
-                                            &hi);
+                                            &hi, sargs);
     uint64_t bits = (static_cast<uint64_t>(hi) << 32)
                   | static_cast<uint64_t>(static_cast<uint32_t>(lo));
     return static_cast<jlong>(bits);
@@ -61263,11 +62535,11 @@ extern "C" jdouble macapk_arm32_regnat_entry_double(
         uint64_t g4, uint64_t g5,
         double f0, double f1, double f2, double f3,
         double f4, double f5, double f6, double f7,
-        ArmRegNativeDesc* d) {
+        ArmRegNativeDesc* d, const uint8_t* sargs) {
     uint32_t hi = 0;
     int32_t lo = macapk_arm32_regnat_invoke(d, env, thiz, g0, g1, g2, g3, g4, g5,
                                             f0, f1, f2, f3, f4, f5, f6, f7,
-                                            &hi);
+                                            &hi, sargs);
     uint64_t bits = (static_cast<uint64_t>(hi) << 32)
                   | static_cast<uint64_t>(static_cast<uint32_t>(lo));
     // Reassemble the SOFTFP bit pattern -- NOT a numeric int-to-double
@@ -61292,14 +62564,20 @@ extern "C" jdouble macapk_arm32_regnat_entry_double(
 // adr()/ldst_uimm()/addsub_imm()/blr()/ret() formulas (read-only
 // reference).
 static void* macapk_arm32_regnat_build_thunk(void* entry_fn, void* descriptor) {
-    uint32_t code[12];
+    // 14 instructions (56 bytes) + two 8-byte literals = 72 bytes. The entry
+    // function takes the descriptor as its 9th (first stack) argument and the
+    // address of the Java caller's own stack arguments as its 10th: the thunk is
+    // entered with sp pointing at the first stack argument HotSpot pushed, so
+    // that sp is forwarded (stack-passed args beyond x0-x7/v0-v7, #105).
+    // adr+ldr (not adrp, and not a direct bl/b) because the thunk is placed by an
+    // anonymous mmap that can land anywhere in the 64-bit address space; blr has
+    // no range limit (same pattern as macapk_build_aapcs_thunk).
+    uint32_t code[14];
     int n = 0;
-    // adr Xd, #delta  =  0x10000000 | ((delta&3)<<29) | (((delta>>2)&0x7ffff)<<5) | Rd
     auto enc_adr = [](unsigned rd, uint32_t delta) -> uint32_t {
         return 0x10000000u | ((delta & 3u) << 29)
              | (((delta >> 2) & 0x7ffffu) << 5) | (rd & 31u);
     };
-    // ldr/str Xt, [Xn, #off8]  (64-bit, unsigned offset, scaled by 8)
     auto enc_ldr = [](unsigned rt, unsigned rn, uint32_t off8) -> uint32_t {
         return 0xF9400000u | (((off8 >> 3) & 0xfffu) << 10)
              | ((rn & 31u) << 5) | (rt & 31u);
@@ -61314,34 +62592,39 @@ static void* macapk_arm32_regnat_build_thunk(void* entry_fn, void* descriptor) {
     auto enc_add_sp = [](uint32_t imm12) -> uint32_t {
         return 0x91000000u | ((imm12 & 0xfffu) << 10) | (31u << 5) | 31u;
     };
+    // add Xd, sp, #0  (== mov Xd, sp)
+    auto enc_mov_from_sp = [](unsigned rd) -> uint32_t {
+        return 0x91000000u | (31u << 5) | (rd & 31u);
+    };
     auto enc_blr = [](unsigned rn) -> uint32_t {
         return 0xD63F0000u | ((rn & 31u) << 5);
     };
     constexpr uint32_t kRet = 0xD65F03C0u;   // ret (implicit x30)
     constexpr uint32_t kNop = 0xD503201Fu;
-    constexpr unsigned kX9 = 9, kX10 = 10, kX30 = 30, kSP = 31;
+    constexpr unsigned kX9 = 9, kX10 = 10, kX11 = 11, kX30 = 30, kSP = 31;
 
-    code[n++] = enc_adr(kX9, 48);           // adr x9,  #48   -> &literal[0]
+    code[n++] = enc_adr(kX9, 56);           // adr x9,  #56   -> &literal[0]
     code[n++] = enc_ldr(kX9, kX9, 0);       // ldr x9,  [x9]   -- x9 = descriptor
-    code[n++] = enc_adr(kX10, 48);          // adr x10, #48   -> &literal[1]
+    code[n++] = enc_adr(kX10, 56);          // adr x10, #56   -> &literal[1]
     code[n++] = enc_ldr(kX10, kX10, 0);     // ldr x10, [x10]  -- x10 = entry_fn
-    code[n++] = enc_sub_sp(16);             // sub sp, sp, #16
-    code[n++] = enc_str(kX30, kSP, 8);      // str x30, [sp, #8]  -- save caller lr
-    code[n++] = enc_str(kX9, kSP, 0);       // str x9,  [sp, #0]  -- descriptor arg
+    code[n++] = enc_mov_from_sp(kX11);      // mov x11, sp     -- Java caller's stack args
+    code[n++] = enc_sub_sp(32);             // sub sp, sp, #32
+    code[n++] = enc_str(kX30, kSP, 16);     // str x30, [sp, #16] -- save caller lr
+    code[n++] = enc_str(kX9, kSP, 0);       // str x9,  [sp, #0]  -- 9th arg: descriptor
+    code[n++] = enc_str(kX11, kSP, 8);      // str x11, [sp, #8]  -- 10th arg: stack args
     code[n++] = enc_blr(kX10);              // blr x10
-    code[n++] = enc_ldr(kX30, kSP, 8);      // ldr x30, [sp, #8]  -- restore lr
-    code[n++] = enc_add_sp(16);             // add sp, sp, #16
+    code[n++] = enc_ldr(kX30, kSP, 16);     // ldr x30, [sp, #16] -- restore lr
+    code[n++] = enc_add_sp(32);             // add sp, sp, #32
     code[n++] = kRet;                       // ret
     code[n++] = kNop;                       // pad to 8-align the literal pool
-    // n == 12 instructions == 48 bytes; literals at +48 (descriptor) and
-    // +56 (entry_fn), matching the "#48" deltas both adr's compute from
-    // their own (different) addresses.
-    uint8_t buf[48 + 16];
-    std::memcpy(buf, code, 48);
+    // n == 14 instructions == 56 bytes; literals at +56 (descriptor) and +64
+    // (entry_fn): the adr at +0 reaches +56, the adr at +8 reaches +64.
+    uint8_t buf[56 + 16];
+    std::memcpy(buf, code, 56);
     uint64_t desc_lit = reinterpret_cast<uint64_t>(descriptor);
     uint64_t fn_lit   = reinterpret_cast<uint64_t>(entry_fn);
-    std::memcpy(buf + 48, &desc_lit, 8);
-    std::memcpy(buf + 56, &fn_lit, 8);
+    std::memcpy(buf + 56, &desc_lit, 8);
+    std::memcpy(buf + 64, &fn_lit, 8);
     return macapk_alloc_exec(buf, sizeof(buf));
 }
 
@@ -63024,6 +64307,309 @@ extern "C" int32_t __macapk_dlsym_tramp_dispatch(uint32_t idx, uint32_t r0,
             default: return 0;
         }
     }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// ARM32 loader surface for AI Douyin (#105): getauxval, dl_iterate_phdr and two
+// synthetic ELF32 modules (libnativeloader.so, libdl_android.so).
+//
+// Why: ByteDance's libsoloader.so reaches the Android linker through libshadowhook
+// (xDL): shadowhook_dlopen("libnativeloader.so") does NOT call dlopen. It finds the module
+// by NAME through getauxval(AT_BASE/AT_SYSINFO_EHDR/AT_PHDR) + dl_iterate_phdr, builds a
+// handle from the module's in-memory program headers and then shadowhook_dlsym reads the
+// module's .dynsym/DT_HASH out of guest memory. With neither import bound the calls
+// panicked ("unresolved external call to ARM address 0xcfd0/0xd4b0, returning 0"),
+// shadowhook_dlopen returned NULL, SoNameSpace::Init failed and JNI_OnLoad never registered
+// SoLoader.native_init. Facts: docs/linker-namespaces_2026-11-03.md (ARM32 section).
+//
+// What this is NOT: a libart.so (SoClassLoader::Init needs art::Thread/ClassLinker
+// internals; deliberately not built, owner decision pending) and not a general module
+// list: dl_iterate_phdr reports only these synthetic modules.
+//
+// The images live in guest memory (bias 0, absolute guest addresses). Each export's
+// st_value is a guest trampoline in [kDlsymTrampBase, ...) so a `blx` lands in
+// __macapk_dlsym_tramp_dispatch_ns, which forwards to the arch-neutral linker-namespace
+// Registry (the same one the arm64 android_* API uses). Namespace pointers never enter
+// the i32 register file: guests see small opaque handles (macapk_ns32_*).
+namespace {
+constexpr uint32_t kNs32HandleBase = 0x3EF00100u;      // opaque, never dereferenced
+std::mutex g_ns32_mu;
+std::vector<macapk::ldns::Namespace*> g_ns32_handles;
+uint32_t macapk_ns32_handle(macapk::ldns::Namespace* ns) {
+    if (!ns) return 0;
+    std::lock_guard<std::mutex> g(g_ns32_mu);
+    for (size_t i = 0; i < g_ns32_handles.size(); ++i)
+        if (g_ns32_handles[i] == ns) return kNs32HandleBase + 4u * static_cast<uint32_t>(i);
+    g_ns32_handles.push_back(ns);
+    return kNs32HandleBase + 4u * static_cast<uint32_t>(g_ns32_handles.size() - 1);
+}
+macapk::ldns::Namespace* macapk_ns32_ns(uint32_t h) {
+    if (h < kNs32HandleBase) return nullptr;
+    std::lock_guard<std::mutex> g(g_ns32_mu);
+    const size_t i = (h - kNs32HandleBase) / 4u;
+    return i < g_ns32_handles.size() ? g_ns32_handles[i] : nullptr;
+}
+
+// dlf == kSynthData: a data symbol (STT_OBJECT) at guest address data_g, `size` bytes.
+constexpr uint32_t kSynthData = 0xFFFFFFFFu;
+struct Arm32SynthSym { const char* name; uint32_t dlf; uint32_t data_g = 0; uint32_t size = 0; };
+struct Arm32SynthMod {
+    const char* path;               // dlpi_name; starts with '/' so xDL matches it by basename
+    uint32_t phdr_g = 0;            // guest address of the program-header array
+    uint16_t phnum = 0;
+    uint32_t info_g = 0;            // guest copy of the dl_phdr_info handed to the callback
+};
+Arm32SynthMod g_arm32_mods[3] = {
+    {"/system/lib/libnativeloader.so"},
+    {"/apex/com.android.runtime/lib/libdl_android.so"},
+    {"/apex/com.android.art/lib/libart.so"},
+};
+// libnativeloader.so exports, all spellings libsoloader looks up (by Android API level):
+// 24-26 / 27-28 mangled android:: names, 29+ the plain C names.
+const Arm32SynthSym kNativeLoaderSyms[] = {
+    {"_ZN7android26CreateClassLoaderNamespaceEP7_JNIEnviP8_jobjectbP8_jstringS5_", DLF_nl_CreateClassLoaderNamespace},
+    {"_ZN7android26CreateClassLoaderNamespaceEP7_JNIEnviP8_jobjectbbP8_jstringS5_", DLF_nl_CreateClassLoaderNamespace},
+    {"CreateClassLoaderNamespace", DLF_nl_CreateClassLoaderNamespace},
+    {"_ZN7android26FindNamespaceByClassLoaderEP7_JNIEnvP8_jobject", DLF_nl_FindNamespaceByClassLoader},
+    {"FindNamespaceByClassLoader", DLF_nl_FindNamespaceByClassLoader},
+};
+const Arm32SynthSym kDlAndroidSyms[] = {
+    {"android_create_namespace", DLF_dl_android_create_namespace},
+    {"android_link_namespaces", DLF_dl_android_link_namespaces},
+    {"android_link_namespaces_all_libs", DLF_dl_android_link_namespaces_all_libs},
+    {"android_get_exported_namespace", DLF_dl_android_get_exported_namespace},
+    {"android_init_anonymous_namespace", DLF_dl_android_init_anonymous_namespace},
+};
+uint32_t macapk_elf_hash(const char* n) {
+    uint32_t h = 0;
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(n); *p; ++p) {
+        h = (h << 4) + *p;
+        const uint32_t g = h & 0xf0000000u;
+        if (g) h ^= g >> 24;
+        h &= ~g;
+    }
+    return h;
+}
+// Build one ELF32 ET_DYN image in guest memory: Ehdr, 2 Phdr (PT_LOAD, PT_DYNAMIC), .dynsym,
+// .dynstr, DT_HASH, .dynamic. The image is 0-based and its load bias (dl_phdr_info.dlpi_addr) is the
+// guest allocation address: xDL skips modules whose dlpi_addr is 0, so an absolute (bias 0) image is invisible to it.
+void macapk_arm32_build_module(Arm32SynthMod& m, const Arm32SynthSym* syms, size_t n) {
+    const uint32_t nsym = static_cast<uint32_t>(n) + 1;                // index 0 = STN_UNDEF
+    std::string strtab(1, '\0');
+    std::vector<uint32_t> name_off(nsym, 0);
+    for (size_t i = 0; i < n; ++i) { name_off[i + 1] = static_cast<uint32_t>(strtab.size()); strtab += syms[i].name; strtab.push_back('\0'); }
+    const uint32_t nbucket = 7;
+    const uint32_t ehdr = 0x34, phdrs = 2 * 32;
+    const uint32_t off_phdr = ehdr;
+    const uint32_t off_sym = (ehdr + phdrs + 15) & ~15u;
+    const uint32_t off_str = off_sym + nsym * 16;
+    const uint32_t off_hash = (off_str + static_cast<uint32_t>(strtab.size()) + 3) & ~3u;
+    const uint32_t off_dyn = (off_hash + 4 * (2 + nbucket + nsym) + 7) & ~7u;
+    const uint32_t total = off_dyn + 6 * 8;
+    const uint32_t g = guest_alloc(total + 16, true);
+    if (!g) { std::fprintf(stderr, "[arm32-ldmod] guest alloc failed for %s\n", m.path); return; }
+    uint8_t* b = reinterpret_cast<uint8_t*>(gptr(g));
+    std::memset(b, 0, total);
+    auto w32 = [&](uint32_t off, uint32_t v) { std::memcpy(b + off, &v, 4); };
+    auto w16 = [&](uint32_t off, uint16_t v) { std::memcpy(b + off, &v, 2); };
+    // Ehdr
+    b[0] = 0x7f; b[1] = 'E'; b[2] = 'L'; b[3] = 'F'; b[4] = 1; b[5] = 1; b[6] = 1;
+    w16(16, 3); w16(18, 40); w32(20, 1); w32(28, off_phdr);
+    w16(40, 52); w16(42, 32); w16(44, 2);
+    // PT_LOAD
+    w32(off_phdr + 0, 1); w32(off_phdr + 4, 0); w32(off_phdr + 8, 0); w32(off_phdr + 12, 0);
+    w32(off_phdr + 16, total); w32(off_phdr + 20, total); w32(off_phdr + 24, 5); w32(off_phdr + 28, 0x1000);
+    // PT_DYNAMIC
+    const uint32_t p2 = off_phdr + 32;
+    w32(p2 + 0, 2); w32(p2 + 4, off_dyn); w32(p2 + 8, off_dyn); w32(p2 + 12, off_dyn);
+    w32(p2 + 16, 6 * 8); w32(p2 + 20, 6 * 8); w32(p2 + 24, 6); w32(p2 + 28, 4);
+    // .dynsym / .dynstr
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t o = off_sym + (static_cast<uint32_t>(i) + 1) * 16;
+        w32(o + 0, name_off[i + 1]);
+        const bool data = syms[i].dlf == kSynthData;
+        w32(o + 4, (data ? syms[i].data_g : kDlsymTrampBase + 4u * syms[i].dlf) - g);   // st_value (relative; + bias g = absolute)
+        w32(o + 8, data ? syms[i].size : 4);
+        b[o + 12] = data ? 0x11 : 0x12;                      // STB_GLOBAL | STT_OBJECT / STT_FUNC
+        w16(o + 14, 1);                                      // defined
+    }
+    std::memcpy(b + off_str, strtab.data(), strtab.size());
+    // DT_HASH
+    std::vector<uint32_t> bucket(nbucket, 0), chain(nsym, 0);
+    for (uint32_t i = 1; i < nsym; ++i) {
+        const uint32_t h = macapk_elf_hash(syms[i - 1].name) % nbucket;
+        chain[i] = bucket[h]; bucket[h] = i;
+    }
+    w32(off_hash, nbucket); w32(off_hash + 4, nsym);
+    for (uint32_t i = 0; i < nbucket; ++i) w32(off_hash + 8 + 4 * i, bucket[i]);
+    for (uint32_t i = 0; i < nsym; ++i) w32(off_hash + 8 + 4 * nbucket + 4 * i, chain[i]);
+    // .dynamic
+    uint32_t d = off_dyn;
+    auto dyn = [&](uint32_t tag, uint32_t val) { w32(d, tag); w32(d + 4, val); d += 8; };
+    dyn(4, off_hash);                                    // DT_HASH
+    dyn(5, off_str);                                     // DT_STRTAB
+    dyn(6, off_sym);                                     // DT_SYMTAB
+    dyn(10, static_cast<uint32_t>(strtab.size()));           // DT_STRSZ
+    dyn(11, 16);                                             // DT_SYMENT
+    dyn(0, 0);                                               // DT_NULL
+    m.phdr_g = g + off_phdr; m.phnum = 2;
+    // dl_phdr_info (ARM32 bionic, 0x28 bytes): addr, name, phdr, phnum(+pad), adds, subs, tls_modid, tls_data.
+    const size_t plen = std::strlen(m.path) + 1;
+    const uint32_t ig = guest_alloc(0x28 + plen + 8, true);
+    if (!ig) return;
+    uint8_t* ib = reinterpret_cast<uint8_t*>(gptr(ig));
+    std::memset(ib, 0, 0x28);
+    std::memcpy(ib + 0x28, m.path, plen);
+    const uint32_t name_g = ig + 0x28, phn = m.phnum;
+    std::memcpy(ib + 0, &g, 4); std::memcpy(ib + 4, &name_g, 4);
+    std::memcpy(ib + 8, &m.phdr_g, 4); std::memcpy(ib + 12, &phn, 4);
+    m.info_g = ig;
+}
+// libart.so (#105): what libsoloader's SoClassLoader reads. Everything ART-shaped is opaque to it:
+// Thread* only goes back into DecodeJObject; the decoded object only goes into
+// GetOrCreateAllocatorForClassLoader; the result is only compared with 0. ClassLinker* comes from
+// GetClassLinkerByVTable: scan *Runtime::instance_ in [4,0x400] for a pointer whose first word is
+// _ZTVN3art11ClassLinkerE + 8 (itanium vtable address point). Layout below is OURS, not AOSP's:
+// class_linker_ sits at kArtClassLinkerOff inside a zeroed Runtime-sized block (only the scan range matters).
+constexpr uint32_t kArtClassLinkerOff = 0x180;
+constexpr uint32_t kArtVtableSlots = 32;
+std::vector<Arm32SynthSym> g_art_syms;
+void macapk_art_build_syms() {
+    const uint32_t vt = guest_alloc(4 * (2 + kArtVtableSlots) + 16, true);
+    const uint32_t cl = guest_alloc(0x40, true);
+    const uint32_t rt = guest_alloc(0x400 + 16, true);
+    const uint32_t inst = guest_alloc(16, true);
+    if (!vt || !cl || !rt || !inst) { std::fprintf(stderr, "[arm32-ldmod] libart data alloc failed\n"); return; }
+    uint32_t* v = reinterpret_cast<uint32_t*>(gptr(vt));
+    std::memset(v, 0, 4 * (2 + kArtVtableSlots));
+    for (uint32_t i = 0; i < kArtVtableSlots; ++i) v[2 + i] = kDlsymTrampBase + 4u * DLF_art_nullstub;   // harmless, return 0
+    std::memset(gptr(cl), 0, 0x40);
+    const uint32_t amp = vt + 8; std::memcpy(gptr(cl), &amp, 4);                  // ClassLinker: first word = vtable address point
+    std::memset(gptr(rt), 0, 0x400 + 16);
+    std::memcpy(gptr(rt + kArtClassLinkerOff), &cl, 4);                           // Runtime::class_linker_
+    std::memcpy(gptr(inst), &rt, 4);                                              // Runtime::instance_
+    g_art_syms = {
+        {"_ZN3art6Thread14CurrentFromGdbEv", DLF_art_CurrentFromGdb},
+        {"_ZNK3art6Thread13DecodeJObjectEP8_jobject", DLF_art_DecodeJObject},
+        {"_ZNK3art6Thread19DecodeGlobalJObjectEP8_jobject", DLF_art_DecodeJObject},
+        {"_ZN3art11ClassLinker34GetOrCreateAllocatorForClassLoaderEPNS_6mirror11ClassLoaderE", DLF_art_GetOrCreateAllocator},
+        {"_ZN3art11ClassLinker34GetOrCreateAllocatorForClassLoaderENS_6ObjPtrINS_6mirror11ClassLoaderEEE", DLF_art_GetOrCreateAllocator},
+        {"_ZTVN3art11ClassLinkerE", kSynthData, vt, 4 * (2 + kArtVtableSlots)},
+        {"_ZN3art7Runtime9instance_E", kSynthData, inst, 4},
+    };
+}
+void macapk_arm32_synth_modules() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        macapk_art_build_syms();
+        macapk_arm32_build_module(g_arm32_mods[2], g_art_syms.data(), g_art_syms.size());
+        macapk_arm32_build_module(g_arm32_mods[0], kNativeLoaderSyms, sizeof kNativeLoaderSyms / sizeof *kNativeLoaderSyms);
+        macapk_arm32_build_module(g_arm32_mods[1], kDlAndroidSyms, sizeof kDlAndroidSyms / sizeof *kDlAndroidSyms);
+        std::fprintf(stderr, "[arm32-ldmod] synthetic modules: %s (phdr=0x%x), %s (phdr=0x%x)\n",
+                     g_arm32_mods[0].path, g_arm32_mods[0].phdr_g, g_arm32_mods[1].path, g_arm32_mods[1].phdr_g);
+    });
+}
+}  // namespace
+
+// getauxval(type) for ARM32 lifted code that imports it (xDL, cpu-features statics):
+// same ARM32-correct answers as the dlsym trampoline (DLF_getauxval). AT_BASE /
+// AT_SYSINFO_EHDR / AT_PHDR are 0: there is no linker/vdso/app_process image in guest memory,
+// and xDL treats 0 as "not available" and falls back to dl_iterate_phdr.
+extern "C" uint32_t __macapk_shim_getauxval(uint32_t type, uint32_t, uint32_t, uint32_t) {
+    switch (type) {
+        case 16: return macapk_arm32_hwcap();                               // AT_HWCAP
+        case 26: return macapk_arm32_hwcap2();                              // AT_HWCAP2
+        case 6:  return static_cast<uint32_t>(sysconf(_SC_PAGESIZE));       // AT_PAGESZ
+        default: return 0;                                                  // AT_SECURE, AT_BASE, ...
+    }
+}
+
+// dl_iterate_phdr(callback, data): enumerates the synthetic ELF32 modules only. The guest
+// callback runs on a nested guest stack through __macapk_invoke_safe (same host->guest
+// re-entry as qsort); a non-zero return stops the walk and is returned, as in bionic.
+extern "C" int32_t __macapk_shim_dl_iterate_phdr(uint32_t cb, uint32_t data, uint32_t, uint32_t) {
+    if (!cb) return 0;
+    macapk_arm32_synth_modules();
+    void* host_fn = __macapk_resolve_function(cb);
+    if (!host_fn) {
+        std::fprintf(stderr, "[arm32-ldmod] dl_iterate_phdr: unresolved callback vaddr=0x%x\n", cb);
+        return 0;
+    }
+    for (auto& m : g_arm32_mods) {
+        if (!m.info_g) continue;
+        const uint32_t sp = __macapk_alloc_thread_stack();
+        const int32_t r = __macapk_invoke_safe(reinterpret_cast<LiftedArmFn>(host_fn),
+                                               m.info_g, 0x28u, data, 0, sp);
+        if (r != 0) return r;
+    }
+    return 0;
+}
+
+// Targets of the synthetic modules' exports (see DLF_NS_FIRST). Guest strings are
+// guest pointers (gptr); the 64-bit `type` of android_create_namespace sits on the guest
+// stack (AAPCS32 8-byte alignment skips r3), followed by permitted_when_isolated_path and parent.
+extern "C" int32_t __macapk_dlsym_tramp_dispatch_ns(uint32_t idx, uint32_t r0, uint32_t r1,
+                                                    uint32_t r2, uint32_t r3, uint32_t sp) {
+    auto stk = [&](unsigned i) -> uint32_t { uint32_t v = 0; if (sp) std::memcpy(&v, gptr(sp + 4u * i), 4); return v; };
+    auto str = [&](uint32_t g) -> const char* { return g ? gptr(g) : nullptr; };
+    switch (idx) {
+    case DLF_nl_CreateClassLoaderNamespace: {
+        // libnativeloader CreateClassLoaderNamespace(env, sdk, class_loader, is_shared, dex, lib, permitted, uses)
+        // -> jstring error or NULL. The single app namespace already exists (created lazily by
+        // the registry); report success.
+        MacapkNsState& st = macapk_ns();
+        std::lock_guard<std::mutex> g(st.mu);
+        macapk_ns_init_locked(st);
+        std::fprintf(stderr, "[arm32-ldmod] CreateClassLoaderNamespace(sdk=%d, shared=%u) -> NULL (ok)\n",
+                     static_cast<int32_t>(r1), r3 & 0xff);
+        return 0;
+    }
+    case DLF_nl_FindNamespaceByClassLoader: {
+        MacapkNsState& st = macapk_ns();
+        std::lock_guard<std::mutex> g(st.mu);
+        macapk_ns_init_locked(st);
+        const uint32_t h = macapk_ns32_handle(st.app ? st.app : st.system);
+        std::fprintf(stderr, "[arm32-ldmod] FindNamespaceByClassLoader -> 0x%x\n", h);
+        return static_cast<int32_t>(h);
+    }
+    case DLF_dl_android_create_namespace: {
+        const uint64_t type = static_cast<uint64_t>(stk(0)) | (static_cast<uint64_t>(stk(1)) << 32);
+        macapk::ldns::Namespace* ns = __macapk_arm64_android_create_namespace(
+            str(r0), str(r1), str(r2), type, str(stk(2)), macapk_ns32_ns(stk(3)));
+        return static_cast<int32_t>(macapk_ns32_handle(ns));
+    }
+    case DLF_dl_android_link_namespaces:
+        return __macapk_arm64_android_link_namespaces(macapk_ns32_ns(r0), macapk_ns32_ns(r1), str(r2)) ? 1 : 0;
+    case DLF_dl_android_link_namespaces_all_libs:
+        return __macapk_arm64_android_link_namespaces_all_libs(macapk_ns32_ns(r0), macapk_ns32_ns(r1)) ? 1 : 0;
+    case DLF_dl_android_get_exported_namespace:
+        return static_cast<int32_t>(macapk_ns32_handle(__macapk_arm64_android_get_exported_namespace(str(r0))));
+    case DLF_dl_android_init_anonymous_namespace:
+        return __macapk_arm64_android_init_anonymous_namespace(str(r0), str(r1)) ? 1 : 0;
+    case DLF_art_CurrentFromGdb: {
+        // art::Thread* for the calling guest thread: a stable opaque non-zero guest block per thread.
+        static thread_local uint32_t t_thread = 0;
+        if (!t_thread) { t_thread = guest_alloc(64, true); if (t_thread) std::memset(gptr(t_thread), 0, 64); }
+        return static_cast<int32_t>(t_thread);
+    }
+    case DLF_art_DecodeJObject:
+        // (Thread*, jobject) -> mirror::Object*: JNI handles are the object identity here and
+        // libsoloader never dereferences the result, so the handle is returned as is.
+        return static_cast<int32_t>(r1);
+    case DLF_art_GetOrCreateAllocator: {
+        // (ClassLinker*, ClassLoader*) -> LinearAlloc*: a stable non-zero 16-byte block per loader.
+        static std::mutex mu;
+        static std::unordered_map<uint32_t, uint32_t> allocs;
+        std::lock_guard<std::mutex> g(mu);
+        uint32_t& a = allocs[r1];
+        if (!a) { a = guest_alloc(16, true); if (a) std::memset(gptr(a), 0, 16); }
+        return static_cast<int32_t>(a);
+    }
+    case DLF_art_nullstub:
+        return 0;
+    }
+    (void)r3;
     return 0;
 }
 

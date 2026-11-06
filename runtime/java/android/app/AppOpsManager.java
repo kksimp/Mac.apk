@@ -417,6 +417,13 @@ public class AppOpsManager {
         boolean uidMatches = uid == android.os.Process.myUid()
                 || !android.os.Process.isApplicationUid(uid);
         if (packageMatches && uidMatches) return;
+        // Another installed app's uid (a cross-app Binder caller): AppOpsService
+        // .checkPackage resolves the package's uid through PMS and compares. Each
+        // package's uid is the shared per-package table's (AppUids).
+        if (packageName != null && com.macapk.loader.AppUids.enabled()) {
+            String[] owners = com.macapk.loader.AppUids.packagesFor(uid);
+            if (owners != null) for (String o : owners) if (packageName.equals(o)) return;
+        }
         throw new SecurityException("Package " + packageName + " does not belong to " + uid);
     }
 

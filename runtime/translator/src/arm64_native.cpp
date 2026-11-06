@@ -65,6 +65,9 @@
 #include <libkern/OSCacheControl.h>  // sys_icache_invalidate
 #include <malloc/malloc.h>           // malloc_zone_pressure_relief (t3-syms RAM-measurement hook only)
 #include <sys/stat.h>                // mkdir (x18 plan-cache dir)
+
+// Defined in bionic_shim.cpp (C linkage). Declared at file scope: used by Image::preload_needed_closure.
+extern "C" const char* __macapk_get_apkt_dir();
 #include <mach/mach.h>               // mach_task_self (guest_safe_read)
 #include <mach/mach_vm.h>            // mach_vm_read_overwrite (guest_safe_read)
 #include <mach-o/dyld.h>             // _dyld_image_count/_header/_name (VM census)
@@ -1037,6 +1040,8 @@ private:
     // reuse the entire relocate/patch/init_array pipeline byte-for-byte
     // instead of duplicating ~850 lines of it.
     bool load_common();
+    // Loads the bundled DT_NEEDED closure before apply_relocations().
+    void preload_needed_closure();
     // PT_TLS -> register the image's TLS template with the per-thread
     // allocator (bionic_shim.cpp), capturing tls_module_id_ for the
     // DTPMOD/DTPREL reloc cases. Must run after map_segments (base_ known)
@@ -1057,6 +1062,8 @@ private:
     // The loaded-image step for a WEAK undefined import: only this image's
     // DT_NEEDED tree is searched (bionic's local group). See its definition.
     void* weak_scope_lookup(const std::string& name) const;
+    // Definition of `name` inside this image's DT_NEEDED tree only (bionic's local group).
+    void* needed_tree_lookup(const std::string& name) const;
     // Last-resort eager map builder -- see exports_fallback_'s comment.
     // Only called from load() when neither hash table is present.
     void build_export_map();
@@ -2541,6 +2548,54 @@ static const char* macapk_image_basename(const char* n) {
     return sl ? sl + 1 : n;
 }
 
+// MACAPK_STRONG_LOCAL_SCOPE (default ON): a STRONG import that more than one
+// guest library defines binds to the definition in the importer's OWN DT_NEEDED
+// tree first, the way bionic's local group orders it, instead of to whichever
+// loaded image comes first in load order. Issue #113: libtcpbuffer.so carries
+// protobuf 2.5.0 generated code and imports google::protobuf::internal::
+// VerifyVersion; five other libraries in the same APK define their own copy
+// (2.5 and 3.3.2). On a device each importer sees its own dependency's copy;
+// the flat walk handed libtcpbuffer libstream_sdk_jni's 3.3.2 copy and the
+// version check aborted in init_array. A name defined nowhere in the tree keeps
+// the flat walk, so this can only change WHICH of several definitions wins,
+// never turn a resolved import into a miss. =0 restores the flat walk.
+static bool macapk_strong_local_scope() {
+    static const bool on = [] {
+        const char* v = std::getenv("MACAPK_STRONG_LOCAL_SCOPE");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+
+// Guest wrapper dylibs are named <soname>.dylib (libtcpbuffer.so.dylib) and
+// export a trampoline per ELF export, so a host dlsym(RTLD_DEFAULT) can answer
+// with one image's copy regardless of who is asking.
+static bool host_addr_in_guest_wrapper(void* addr) {
+    Dl_info di;
+    if (!addr || !dladdr(addr, &di) || !di.dli_fname) return false;
+    size_t n = std::strlen(di.dli_fname);
+    return n > 9 && std::strcmp(di.dli_fname + n - 9, ".so.dylib") == 0;
+}
+
+void* Image::needed_tree_lookup(const std::string& name) const {
+    std::vector<const Image*> group;
+    std::vector<std::string> queue(needed_.begin(), needed_.end());
+    std::unordered_set<std::string> seen(queue.begin(), queue.end());
+    for (size_t qi = 0; qi < queue.size(); ++qi) {
+        for (Image* img : loaded_images()) {
+            if (img == this || queue[qi] != macapk_image_basename(img->name()))
+                continue;
+            group.push_back(img);
+            for (const auto& n : img->needed())
+                if (seen.insert(n).second) queue.push_back(n);
+            break;
+        }
+    }
+    for (const Image* img : group)
+        if (void* p = img->lookup(name.c_str())) return p;
+    return nullptr;
+}
+
 void* Image::weak_scope_lookup(const std::string& name) const {
     // BFS over the DT_NEEDED tree, rooted at this image (bionic's local group
     // order). A needed library that is not a loaded guest image is one we
@@ -2827,6 +2882,12 @@ void* Image::resolve_external(const std::string& name, uint8_t bind) {
     // the owning dylib, no package name; the game fleet imports zero crypto
     // symbols, so it is unaffected either way.
     if (void* p = dlsym(RTLD_DEFAULT, name.c_str())) {
+        // A guest wrapper's trampoline answered: prefer the copy in our own
+        // DT_NEEDED tree (see macapk_strong_local_scope).
+        if (bind != STB_WEAK && macapk_strong_local_scope() &&
+            host_addr_in_guest_wrapper(p)) {
+            if (void* g = needed_tree_lookup(name)) return g;
+        }
         // A framework-owned hit is an accident of the global dlsym walk, not a
         // resolution. Prefer any loaded guest ELF definition instead; without
         // this, an import whose name collides with a framework export executes
@@ -2898,6 +2959,9 @@ void* Image::resolve_external(const std::string& name, uint8_t bind) {
     // because the Mach-O wrappers only export a small set of
     // trampolines, not the full ELF symbol table. Skip ourselves to
     // avoid an infinite recursion if a symbol is genuinely missing.
+    if (bind != STB_WEAK && macapk_strong_local_scope()) {
+        if (void* g = needed_tree_lookup(name)) return g;
+    }
     for (Image* img : loaded_images()) {
         if (img == this) continue;
         if (void* p = img->lookup(name.c_str())) return p;
@@ -5273,6 +5337,55 @@ static void macapk_openal_stub_retired_note() {
 // this image logs as "libX.so+0xNNN" instead of a bare address.
 extern "C" void macapk_diag_note_guest_image(uintptr_t base, size_t span, const char* name);
 
+// MACAPK_NATIVE_DT_NEEDED_PRELOAD (default ON; =0 restores the old order): load
+// this image's bundled DT_NEEDED closure BEFORE its imports are bound, the way
+// bionic's dlopen does. The Java System.loadLibrary path already did this
+// (AppClassLoader.preloadDependencies), but a library first reached by a NATIVE
+// dlopen (a guest library dlopen("libX.so") -> the shim's redirect to the
+// translated wrapper) skipped it: the importer relocated while its dependency
+// was not loaded, every import of it bound to the unresolved trap, and the
+// later Java-side preload loaded the dependency too late. Issue #35: libnative-lib.so
+// imports ~50 lib_so_* names from its bundled lib_sdt_cipher_service.so. A
+// dependency is loaded through its translated wrapper (lib_native/<soname>.dylib,
+// so the wrapper and the Image stay one object); a soname with no wrapper is a
+// system library and is left to the usual lookups.
+static bool macapk_native_dt_needed_preload() {
+    static const bool on = [] {
+        const char* v = std::getenv("MACAPK_NATIVE_DT_NEEDED_PRELOAD");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+
+void Image::preload_needed_closure() {
+    if (!macapk_native_dt_needed_preload() || needed_.empty()) return;
+    const char* ad = __macapk_get_apkt_dir();
+    if (!ad) return;
+    std::string app_dir(ad);
+    static const char kSuffix[] = "/_apkt";
+    const size_t slen = sizeof(kSuffix) - 1;
+    if (app_dir.size() > slen &&
+        app_dir.compare(app_dir.size() - slen, slen, kSuffix) == 0)
+        app_dir.resize(app_dir.size() - slen);
+    for (const std::string& soname : needed_) {
+        if (soname.size() < 4 || soname.compare(soname.size() - 3, 3, ".so") != 0)
+            continue;
+        if (soname == macapk_image_basename(dbg_name_)) continue;
+        bool loaded = false;
+        for (Image* img : loaded_images())
+            if (soname == macapk_image_basename(img->name())) { loaded = true; break; }
+        if (loaded) continue;
+        const std::string wrapper = app_dir + "/lib_native/" +
+            soname.substr(0, soname.size() - 3) + ".dylib";
+        struct stat st;
+        if (::stat(wrapper.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        void* h = dlopen(wrapper.c_str(), RTLD_NOW | RTLD_LOCAL);
+        std::fprintf(stderr,
+            "[arm64-native] %s: DT_NEEDED %s preloaded before relocation (%s)\n",
+            dbg_name_, soname.c_str(), h ? "ok" : "failed");
+    }
+}
+
 bool Image::load_common() {
     // MACAPK_LOAD_TIMING=1: wall time of every pass in this load, printed as
     // `[load-timing] <lib>: <pass> <ms>` for passes >= 2 ms. A boot-time
@@ -5300,6 +5413,8 @@ bool Image::load_common() {
         dbg_name_, rela_count_, pltrel_count_, init_array_count_);
     parse_and_register_tls();   // PT_TLS -> tls_module_id_ (before relocs)
     lap("parse_dynamic + tls");
+    preload_needed_closure();
+    lap("preload DT_NEEDED");
     if (!apply_relocations())                 return false;
     std::fprintf(stderr,
         "[arm64-native] %s: relocations applied\n", dbg_name_);

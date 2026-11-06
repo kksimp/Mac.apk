@@ -252,4 +252,16 @@ public final class VMRuntime {
     public static boolean is64BitAbi(String abi) {
         return is64BitInstructionSet(getInstructionSet(abi));
     }
+
+    /**
+     * AOSP VMRuntime.getBaseApkOptimizationInfo (a native in ART,
+     * dalvik_system_VMRuntime.cc): the compiler filter and compilation reason ART
+     * registered for the primary APK's odex (AppInfo::GetPrimaryApkOptimizationStatus).
+     * No ART odex exists here (the app's DEX runs converted, on HotSpot), so the
+     * honest answer is AppInfo's "nothing registered" value, "unknown" for both,
+     * which every OptimizationInfo predicate reports as false.
+     */
+    public static DexFile.OptimizationInfo getBaseApkOptimizationInfo() {
+        return new DexFile.OptimizationInfo("unknown", "unknown");
+    }
 }

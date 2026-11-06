@@ -61,15 +61,165 @@ public final class Parcel {
         size = 0;
     }
 
-    // AOSP Parcel exception protocol (AIDL/Binder stubs). Mac.apk marshals
-    // only its own in-process Parcelables (no real Binder), so there is never
-    // a remote exception to surface: writeNoException/writeException are no-ops
-    // and readException returns normally. Generated AIDL proxy/stub code calls
-    // these unconditionally (HCR 1.43 hit readException()).
-    public void writeNoException() {}
-    public void writeException(Exception e) {}
-    public void readException() {}
-    public void readException(int code, String msg) {}
+    // AOSP Parcel exception protocol -- the RPC reply header every generated
+    // AIDL stub writes (writeNoException / writeException) and every proxy
+    // reads (readException). Mirrors android14-release Parcel.java:2832-3087
+    // verbatim in wire shape: an int code (0 = no exception), then for an
+    // exception the message, a stack-trace header size (0: AOSP writes a
+    // trace only when sParcelExceptionStackTrace is on, which it is not by
+    // default), then the EX_SERVICE_SPECIFIC errorCode or the EX_PARCELABLE
+    // length-prefixed payload. The StrictMode / noted-app-ops reply headers
+    // (-128 / -127) are READ and skipped but never written: we gather neither.
+    //
+    // These were no-ops while every Binder call was in-process (both ends
+    // skipped them symmetrically, so nothing broke -- except that an exception
+    // thrown by the service vanished). With a cross-process transport
+    // (MacApkBinderTransport) the far side's exception must arrive, and the
+    // header is what AIDL code on BOTH sides already expects. Audit at the
+    // switch (2026-10-30): every in-tree onTransact either is oneway (writes
+    // no reply at all, e.g. LicensingService) or calls writeNoException.
+    private static final int EX_SECURITY = -1;
+    private static final int EX_BAD_PARCELABLE = -2;
+    private static final int EX_ILLEGAL_ARGUMENT = -3;
+    private static final int EX_NULL_POINTER = -4;
+    private static final int EX_ILLEGAL_STATE = -5;
+    private static final int EX_NETWORK_MAIN_THREAD = -6;
+    private static final int EX_UNSUPPORTED_OPERATION = -7;
+    private static final int EX_SERVICE_SPECIFIC = -8;
+    private static final int EX_PARCELABLE = -9;
+    /** @hide */ public static final int EX_HAS_NOTED_APPOPS_REPLY_HEADER = -127;
+    private static final int EX_HAS_STRICTMODE_REPLY_HEADER = -128;
+
+    public final void writeNoException() { writeInt(0); }
+
+    public final void writeException(Exception e) {
+        int code = getExceptionCode(e);
+        writeInt(code);
+        if (code == 0) {
+            if (e instanceof RuntimeException) throw (RuntimeException) e;
+            throw new RuntimeException(e);
+        }
+        writeString(e.getMessage());
+        writeInt(0);   // remote stack-trace header size: none
+        switch (code) {
+            case EX_SERVICE_SPECIFIC:
+                writeInt(((ServiceSpecificException) e).errorCode);
+                break;
+            case EX_PARCELABLE: {
+                final int sizePosition = dataPosition();
+                writeInt(0);
+                writeParcelable((Parcelable) e, Parcelable.PARCELABLE_WRITE_RETURN_VALUE);
+                final int payloadPosition = dataPosition();
+                setDataPosition(sizePosition);
+                writeInt(payloadPosition - sizePosition);
+                setDataPosition(payloadPosition);
+                break;
+            }
+        }
+    }
+
+    public static int getExceptionCode(Throwable e) {
+        int code = 0;
+        if (e instanceof Parcelable
+                && e.getClass().getClassLoader() == Parcelable.class.getClassLoader()) {
+            code = EX_PARCELABLE;
+        } else if (e instanceof SecurityException) {
+            code = EX_SECURITY;
+        } else if (e instanceof BadParcelableException) {
+            code = EX_BAD_PARCELABLE;
+        } else if (e instanceof IllegalArgumentException) {
+            code = EX_ILLEGAL_ARGUMENT;
+        } else if (e instanceof NullPointerException) {
+            code = EX_NULL_POINTER;
+        } else if (e instanceof IllegalStateException) {
+            code = EX_ILLEGAL_STATE;
+        } else if (e instanceof NetworkOnMainThreadException) {
+            code = EX_NETWORK_MAIN_THREAD;
+        } else if (e instanceof UnsupportedOperationException) {
+            code = EX_UNSUPPORTED_OPERATION;
+        } else if (e instanceof ServiceSpecificException) {
+            code = EX_SERVICE_SPECIFIC;
+        }
+        return code;
+    }
+
+    public final void readException() {
+        int code = readExceptionCode();
+        if (code != 0) {
+            String msg = readString();
+            readException(code, msg);
+        }
+    }
+
+    public final int readExceptionCode() {
+        int code = readInt();
+        if (code == EX_HAS_NOTED_APPOPS_REPLY_HEADER) {
+            // AppOpsManager.readAndLogNotedAppops: an int count of longs.
+            int n = readInt();
+            for (int i = 0; i < n; i++) readLong();
+            code = readInt();
+        }
+        if (code == EX_HAS_STRICTMODE_REPLY_HEADER) {
+            int headerSize = readInt();
+            if (headerSize > 4) setDataPosition(dataPosition() + headerSize - 4);
+            return 0;
+        }
+        return code;
+    }
+
+    public final void readException(int code, String msg) {
+        String remoteStackTrace = null;
+        final int remoteStackPayloadSize = readInt();
+        if (remoteStackPayloadSize > 0) remoteStackTrace = readString();
+        Exception e = createExceptionOrNull(code, msg);
+        if (e == null) e = new RuntimeException("Unknown exception code: " + code + " msg " + msg);
+        if (remoteStackTrace != null) {
+            e.addSuppressed(new RemoteException("Remote stack trace:\n" + remoteStackTrace));
+        }
+        Parcel.<RuntimeException>macapkSneakyThrow(e);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T extends Throwable> void macapkSneakyThrow(Throwable t) throws T {
+        throw (T) t;
+    }
+
+    public Exception createExceptionOrNull(int code, String msg) {
+        switch (code) {
+            case EX_PARCELABLE:
+                if (readInt() > 0) {
+                    return (Exception) readParcelable(Parcelable.class.getClassLoader());
+                }
+                return new RuntimeException(msg + " [missing Parcelable]");
+            case EX_SECURITY:             return new SecurityException(msg);
+            case EX_BAD_PARCELABLE:       return new BadParcelableException(msg);
+            case EX_ILLEGAL_ARGUMENT:     return new IllegalArgumentException(msg);
+            case EX_NULL_POINTER:         return new NullPointerException(msg);
+            case EX_ILLEGAL_STATE:        return new IllegalStateException(msg);
+            case EX_NETWORK_MAIN_THREAD:  return new NetworkOnMainThreadException();
+            case EX_UNSUPPORTED_OPERATION:return new UnsupportedOperationException(msg);
+            case EX_SERVICE_SPECIFIC:     return new ServiceSpecificException(readInt(), msg);
+            default:                      return null;
+        }
+    }
+
+    // ---- transport boundary (MacApkBinderTransport, package-private) --------
+    // A Parcel crossing processes is its bytes plus its side table: each
+    // objects[i] is what the int at objectOffsets[*] indexes. The transport
+    // turns IBinder entries into Mach port rights and rebuilds the table on
+    // the far side with the SAME indices, so the bytes need no rewriting --
+    // the job flat_binder_object + the offsets array do for the binder driver.
+    final byte[] macapkTransportBytes() { return java.util.Arrays.copyOf(data, size); }
+    final Object[] macapkTransportObjects() { return objects.toArray(); }
+    final int[] macapkTransportOffsets() {
+        return java.util.Arrays.copyOf(objectOffsets, objectOffsetCount);
+    }
+    final void macapkTransportLoad(byte[] bytes, Object[] objs, int[] offsets) {
+        unmarshall(bytes, 0, bytes.length);
+        if (objs != null) java.util.Collections.addAll(objects, objs);
+        if (offsets != null) for (int off : offsets) noteObjectOffset(off);
+        pos = 0;
+    }
 
     public int  dataPosition() { return pos; }
     public int  dataSize()     { return size; }
@@ -1881,19 +2031,32 @@ public final class Parcel {
         ensure(newCapacity);
     }
 
-    // AOSP scans the parcel's object table for BINDER_TYPE_FD. Mac.apk has no
-    // binder transport and writeFileDescriptor is a no-op, so a parcel here can
-    // never carry a marshalled fd and the honest answer is always false.
-    public final boolean hasFileDescriptors() { return false; }
+    // AOSP scans the parcel's object table for BINDER_TYPE_FD; ours holds the
+    // live FileDescriptor / ParcelFileDescriptor entries in the same place.
+    public final boolean hasFileDescriptors() {
+        for (Object o : objects) {
+            if (o instanceof java.io.FileDescriptor || o instanceof ParcelFileDescriptor) return true;
+        }
+        return false;
+    }
 
-    /** AOSP :1002 -- the same question restricted to a byte RANGE. Same answer
-     *  for the same reason (no parcel here can contain an fd), but the bounds
-     *  check is real: AOSP's native side rejects a range outside the parcel. */
+    /** AOSP :1002 -- the same question restricted to a byte RANGE: an fd
+     *  entry whose marker lies inside it. AOSP's native side rejects a range
+     *  outside the parcel, and so do we. */
     public boolean hasFileDescriptors(int offset, int length) {
         if (offset < 0 || length < 0 || offset > size - length) {
             throw new IllegalArgumentException(
                     "Invalid range: offset=" + offset + " length=" + length
                     + " dataSize=" + size);
+        }
+        for (int i = 0; i < objectOffsetCount; i++) {
+            final int at = objectOffsets[i];
+            if (at < offset || at > offset + length - 4) continue;
+            final int idx = (data[at] & 0xff) | ((data[at + 1] & 0xff) << 8)
+                          | ((data[at + 2] & 0xff) << 16) | ((data[at + 3] & 0xff) << 24);
+            if (idx < 0 || idx >= objects.size()) continue;
+            Object o = objects.get(idx);
+            if (o instanceof java.io.FileDescriptor || o instanceof ParcelFileDescriptor) return true;
         }
         return false;
     }
@@ -1975,12 +2138,39 @@ public final class Parcel {
         }
     }
 
-    // FileDescriptor marshalling: no IPC, so writing is a no-op and reading
-    // yields null. AOSP would dup the fd into the binder transaction.
-    public final void writeFileDescriptor(java.io.FileDescriptor val) {}
-    public final void writeRawFileDescriptor(java.io.FileDescriptor val) {}
-    public final ParcelFileDescriptor readFileDescriptor() { return null; }
-    public final ParcelFileDescriptor readRawFileDescriptor() { return null; }
+    // FileDescriptor marshalling. AOSP puts a BINDER_TYPE_FD object in the
+    // parcel and the driver installs a duplicate in the receiver. Here the
+    // descriptor is an entry in the object table (like a binder); within one
+    // process it stays the live FileDescriptor, and MacApkBinderTransport turns
+    // it into a Mach fileport (a kernel-held duplicate) when the parcel crosses
+    // processes, installing a fresh fd on the far side. These were no-ops that
+    // read back null, so every fd sent through a Parcel disappeared.
+    // readRawFileDescriptor returns java.io.FileDescriptor, as AOSP declares it
+    // (it used to be typed ParcelFileDescriptor, so the AOSP descriptor would
+    // not link).
+    public final void writeFileDescriptor(java.io.FileDescriptor val) {
+        if (val == null) throw new NullPointerException("FileDescriptor");
+        writeObjectRef(val);
+    }
+    public final void writeRawFileDescriptor(java.io.FileDescriptor val) {
+        writeFileDescriptor(val);
+    }
+    /** AOSP: a NEW ParcelFileDescriptor holding a dup of the parcel's fd. */
+    public final ParcelFileDescriptor readFileDescriptor() {
+        java.io.FileDescriptor fd = readRawFileDescriptor();
+        if (fd == null) return null;
+        try {
+            return ParcelFileDescriptor.dup(fd);
+        } catch (java.io.IOException e) {
+            throw new BadParcelableException("could not dup fd: " + e.getMessage());
+        }
+    }
+    public final java.io.FileDescriptor readRawFileDescriptor() {
+        Object o = readObjectRef();
+        if (o instanceof java.io.FileDescriptor) return (java.io.FileDescriptor) o;
+        if (o instanceof ParcelFileDescriptor) return ((ParcelFileDescriptor) o).getFileDescriptor();
+        return null;
+    }
 
     // Blob: AOSP routes large (>~16KB) byte payloads through ashmem; in-process
     // we just treat it as a byte array.

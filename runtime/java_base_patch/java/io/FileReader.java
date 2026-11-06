@@ -83,14 +83,37 @@ public class FileReader extends InputStreamReader {
         return "/proc/self/smaps".equals(name) || "/proc/self/maps".equals(name);
     }
 
+    // Any OTHER /proc path (2026-10-30): the runtime installs this hook
+    // (Boot, via reflection) to the bionic shim's /proc synthesis, so a Java
+    // read of e.g. /proc/self/status gets the same true per-process contents a
+    // native read does (Google Play services' memory metrics read it this way).
+    // Null outside the runtime, or for a path the shim does not answer: the
+    // open then proceeds exactly as the JDK's.
+    private static volatile java.util.function.UnaryOperator<String> macapkProcRemap;
+
+    private static String macapkRemap(String name) {
+        java.util.function.UnaryOperator<String> h = macapkProcRemap;
+        if (h == null || name == null || !name.startsWith("/proc/")) return name;
+        try {
+            String host = h.apply(name);
+            return host != null ? host : name;
+        } catch (Throwable t) {
+            return name;
+        }
+    }
+
     private static InputStream macapkOpen(String fileName) throws FileNotFoundException {
         if (macapkIsProc(fileName)) return new ByteArrayInputStream(PROC_BODY);
-        return new FileInputStream(fileName);
+        return new FileInputStream(macapkRemap(fileName));
     }
 
     private static InputStream macapkOpen(File file) throws FileNotFoundException {
         if (file != null && macapkIsProc(file.getPath()))
             return new ByteArrayInputStream(PROC_BODY);
+        if (file != null && file.getPath().startsWith("/proc/")) {
+            String host = macapkRemap(file.getPath());
+            if (!host.equals(file.getPath())) return new FileInputStream(host);
+        }
         return new FileInputStream(file);
     }
 }

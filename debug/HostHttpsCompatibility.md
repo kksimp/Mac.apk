@@ -7,3 +7,5 @@ A startup provider list is captured through private JNI bindings. Host operation
 GMS HTTP has a private startup SSLContext/factory and hostname policy. MCS opens its existing private TLS socket inside the same host provider scope. Startup initialization runs for both APK and GMS CLI entry points; it does not depend on installing an application KeyStore. No certificates or verification policies are bypassed.
 
 Run `debug/check_host_https.sh` after building the Java jars. The production JNI bridge and Android-patched JRE make only loopback connections. Fixtures exercise incompatible XDH parameters, default/explicit factories, implicit TLS, callback scope, startup trust-store capture, later application mutations, wrong-host/untrusted-CA rejection, gzip POST/error bodies and redirects. These tests do not prove an external service registration or message delivery.
+
+同步上游后，GMS HTTP 和 MCS 保留 HostProxy 传输，并在其外层维持原有 HostCrypto scope。新增 loopback 代理回归，在捕获应用代理配置后替换全局 ProxySelector，验证 GMS 仍通过捕获的真实本机代理收发请求；TLS 证书和主机名负例继续通过。

@@ -64,6 +64,13 @@ import java.util.List;
 // adds no behaviour over BaseDexClassLoader here, so this is a hierarchy fix,
 // not a behaviour change.
 public final class AppClassLoader extends dalvik.system.PathClassLoader {
+    // Parallel-capable. ART never serializes a whole class loader: classes load
+    // under per-class locks. On HotSpot, a loader that does not register gets
+    // getClassLoadingLock(name) == the loader itself, so every thread loading
+    // ANY class waits on one lock (JFR on WhatsApp: 718 waits, the UI thread
+    // up to 695 ms). Each class up the chain to URLClassLoader must register.
+    static { ClassLoader.registerAsParallelCapable(); }
+
     private static final String TAG = "Mac.apk.AppCl";
     /** Guards the per-class loadClass/findClass info lines (~25K/boot for
      *  Reddit, ~13K for GD Lite). Derived from NativeLog.isLoggable(INFO)
@@ -774,7 +781,9 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
                 byte[] raw = remapRewrite(direct != null ? direct : in.readAllBytes());
                 ClassFileRewriter.Result r =
                     ClassFileRewriter.maybeRewrite(raw, classDotted);
-                if (r.rewritten) {
+                if (r.rewritten && !QUIET_CLASSLOAD) {
+                    // Quiet too: WhatsApp rewrites ~1,400 classes per boot, one
+                    // INFO line each.
                     NativeLog.i(TAG, "findClass(" + classDotted
                         + ") -> defineClass [rewritten: " + r.reason + "]");
                 } else if (!QUIET_CLASSLOAD) {
@@ -1407,6 +1416,7 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
                 // libc++_shared / libopenal / etc. via dlsym(RTLD_DEFAULT)
                 // when its __macapk_arm64_native_load runs.
                 preloadDependencies(libname);
+                ensureLibBiases();
                 cached.getParentFile().mkdirs();
                 if (translate(so, cached, libBias.getOrDefault(libname, 0L))) {
                     NativeLog.i(TAG, "findLibrary(" + libname + ") -> translated " +
@@ -1834,6 +1844,7 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         if (!exposeDir.canWrite()) exposeDir.setWritable(true, true);
         File cacheDir = new File(appDir, "lib_native");
         cacheDir.mkdirs();
+        ensureLibBiases();
         int prepared = 0, failed = 0;
         for (File so : sos) {
             String fileBase = so.getName().substring(0, so.getName().length() - 3); // "libX"
@@ -1876,6 +1887,53 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
                     + prepared + " exposed"
                     + (failed > 0 ? ", " + failed + " skipped/failed" : ""));
         return prepared;
+    }
+
+    // ---- On-demand load of an extracted ELF .so (the guest System.load path) ----
+    //
+    // On a device a library loader that bypasses System.loadLibrary (Facebook's
+    // SoLoader) asks System.mapLibraryName for "libX.so", looks for that file in
+    // directories it manages, UNPACKING an archive into them at run time, and
+    // System.load()s the path it found. MacApkNativeLoad answers mapLibraryName
+    // the Bionic way and routes load() here, so a .so that appears at any moment
+    // (extracted mid-attachBaseContext, on any thread) is translated the moment
+    // the app asks for it. Before this the loader could only load what an earlier
+    // pass had pre-translated, so a thread that asked for a library right after
+    // SoLoader extracted it (Instagram's Lacrima_startup, the cold first launch)
+    // lost a race against the exposure pass and the app killed itself.
+    private final java.util.concurrent.ConcurrentHashMap<String, Object> soLoadLocks =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** System.load(path) as the guest sees it. An ELF "libX.so" is translated into
+     *  the same lib_native/libX.dylib cache findLibrary and the exposure passes
+     *  use (same stamps, same load bias), then loaded against THIS loader; any
+     *  other path loads as it always did. Throws UnsatisfiedLinkError as
+     *  System.load does. */
+    public void macapkLoadNative(String path) {
+        if (path == null) throw new NullPointerException("path");
+        File f = new File(path);
+        String n = f.getName();
+        if (!(n.startsWith("lib") && n.endsWith(".so") && f.isFile())) {
+            loadIntoThisLoader(path);
+            return;
+        }
+        String fileBase = n.substring(0, n.length() - 3);   // "libX"
+        String libname = fileBase.substring(3);
+        File cacheDir = new File(appDir, "lib_native");
+        cacheDir.mkdirs();
+        File cached = new File(cacheDir, fileBase + ".dylib");
+        Object lock = soLoadLocks.computeIfAbsent(cached.getAbsolutePath(), k -> new Object());
+        synchronized (lock) {
+            if (!(soSourceMatches(cached, f) && cached.exists() && nativeIdMatches(cached))) {
+                if (!translate(f, cached, libBias.getOrDefault(libname, 0L))) {
+                    throw new UnsatisfiedLinkError("Mac.apk could not translate " + path);
+                }
+                writeNativeIdStamp(cached);
+                writeSoSourceStamp(cached, f);
+                NativeLog.i(TAG, "macapkLoadNative: translated " + n + " on demand for System.load");
+            }
+        }
+        loadIntoThisLoader(cached.getAbsolutePath());
     }
 
     /** Recognised R-class subtype names. Each corresponds to a `<public type="...">`
@@ -2010,37 +2068,20 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
     private final java.util.Set<String> preloading =
         java.util.Collections.synchronizedSet(new java.util.HashSet<>());
 
-    /** v1.0.152: walk the APK's lib/<abi>/ dir and translate EVERY .so
-     *  into lib_native/lib<name>.dylib. Unity's libmain calls
-     *  dlopen("libunity.so") directly after JNI loadLibrary("main"),
-     *  bypassing our findLibrary. To make that dlopen succeed, the
-     *  cached .dylib must exist before libmain's native init runs.
-     *  preloadDependencies handles DT_NEEDED chains but Unity's libmain
-     *  DT_NEEDED doesn't include libunity (libunity is loaded
-     *  lazily at runtime). So we eagerly translate every .so in the
-     *  APK on the first findLibrary call.
-     *
-     *  Cost: O(libs) translator invocations, each producing a Stage 6
-     *  arm64 wrapper around the .so. For Crossy Road's 15 native libs
-     *  (libunity, libil2cpp, libcrashlytics, libFirebase*, ...) this
-     *  is ~30-60 sec on first boot (mostly file I/O for the 87 MB
-     *  libil2cpp). Subsequent boots cache-hit so this is one-time.
-     *
-     *  Failures translate to skipping that one lib (preloadDependencies
-     *  / direct dlopen of the .dylib will return whatever was already
-     *  there). Doesn't fail the whole boot.
-     */
-    private void preloadAllApkLibs() {
-        // The one installed isa dir (same resolution as locateApkSo).
+    private boolean libBiasesAssigned;
+    /** Assign the per-image ARM32 load biases (idempotent). MUST run before ANY translate():
+     *  exposeDylibsForSoLoader / findLibrary used to translate first, with libBias still
+     *  empty, so every dylib of a SoLoader app was built at bias 0 and all images overlapped
+     *  at guest vaddr 0 (AI Douyin: 199 libs, 638 segment overlaps; the later preload then
+     *  saw them as cache hits). */
+    private synchronized void ensureLibBiases() {
+        if (libBiasesAssigned) return;
         File abiDir = nativeLibDir();
         if (abiDir == null) return;
-        String forcedAbi = forcedAbi();
-        String cacheSuffix = (forcedAbi != null) ? "-" + forcedAbi : "";
         File[] sos = abiDir.listFiles((dir, name) ->
             name.startsWith("lib") && name.endsWith(".so"));
         if (sos == null || sos.length == 0) return;
-        NativeLog.i(TAG, "preloadAllApkLibs: " + sos.length
-            + " .so file(s) under " + abiDir.getAbsolutePath());
+        libBiasesAssigned = true;
         // Per-image load-bias assignment (ARM32 multi-.so collision fix).
         // Only the lifted ARM32 path uses biases; the arm64 Stage-6 loader
         // maps each .so at its own mmap base already. Largest vaddr
@@ -2116,6 +2157,67 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
                 bias = next;
             }
         }
+    }
+
+    /** The load bias this dylib must have been built with (0 when none is assigned). */
+    private long expectedBias(File cached) {
+        String n = cached.getName();
+        if (!n.startsWith("lib") || !n.endsWith(".dylib")) return 0L;
+        n = n.substring(3, n.length() - 6);
+        Long b = libBias.get(n);
+        if (b == null) {
+            String fa = forcedAbi();
+            if (fa != null && n.endsWith("-" + fa))
+                b = libBias.get(n.substring(0, n.length() - fa.length() - 1));
+        }
+        return b == null ? 0L : b;
+    }
+
+    /** The native-id stamp a dylib must carry: the build id, plus the load bias when it is
+     *  non-zero (so a dylib built at bias 0 is re-translated once a bias is wanted). */
+    private String wantedNativeId(File cached, String id) {
+        long bias = expectedBias(cached);
+        return bias == 0 ? id : id + "+bias=0x" + Long.toHexString(bias);
+    }
+
+    /** v1.0.152: walk the APK's lib/<abi>/ dir and translate EVERY .so
+     *  into lib_native/lib<name>.dylib. Unity's libmain calls
+     *  dlopen("libunity.so") directly after JNI loadLibrary("main"),
+     *  bypassing our findLibrary. To make that dlopen succeed, the
+     *  cached .dylib must exist before libmain's native init runs.
+     *  preloadDependencies handles DT_NEEDED chains but Unity's libmain
+     *  DT_NEEDED doesn't include libunity (libunity is loaded
+     *  lazily at runtime). So we eagerly translate every .so in the
+     *  APK on the first findLibrary call.
+     *
+     *  Cost: O(libs) translator invocations, each producing a Stage 6
+     *  arm64 wrapper around the .so. For Crossy Road's 15 native libs
+     *  (libunity, libil2cpp, libcrashlytics, libFirebase*, ...) this
+     *  is ~30-60 sec on first boot (mostly file I/O for the 87 MB
+     *  libil2cpp). Subsequent boots cache-hit so this is one-time.
+     *
+     *  Failures translate to skipping that one lib (preloadDependencies
+     *  / direct dlopen of the .dylib will return whatever was already
+     *  there). Doesn't fail the whole boot.
+     */
+    private void preloadAllApkLibs() {
+        // The one installed isa dir (same resolution as locateApkSo).
+        File abiDir = nativeLibDir();
+        if (abiDir == null) return;
+        String forcedAbi = forcedAbi();
+        String cacheSuffix = (forcedAbi != null) ? "-" + forcedAbi : "";
+        File[] sos = abiDir.listFiles((dir, name) ->
+            name.startsWith("lib") && name.endsWith(".so"));
+        if (sos == null || sos.length == 0) return;
+        NativeLog.i(TAG, "preloadAllApkLibs: " + sos.length
+            + " .so file(s) under " + abiDir.getAbsolutePath());
+        // Per-image load-bias assignment: see ensureLibBiases() (also run by every other
+        // path that can translate, so no dylib is ever built before the biases exist).
+        ensureLibBiases();
+        String abiName = abiDir.getName();
+        final boolean libDirAbi = !"0".equals(System.getenv("MACAPK_ARM32_LIBDIR_ABI"));
+        boolean isArm32Abi = abiName.equals("armeabi-v7a") || abiName.equals("armeabi")
+            || (libDirAbi && abiName.equals("arm"));
         int translated = 0, hits = 0, failed = 0;
         long startMs = System.currentTimeMillis();
         // Cache-hit scan stays a plain sequential loop: each check is a
@@ -2563,6 +2665,8 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
     private boolean nativeIdMatches(File cached) {
         String want = System.getenv("MACAPK_BUILD_NATIVE_ID");
         if (want == null || want.isEmpty()) return true;
+        ensureLibBiases();
+        want = wantedNativeId(cached, want);
         File stamp = new File(cached.getPath() + ".nativeid");
         String have = null;
         try {
@@ -2583,9 +2687,11 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
 
     /** Record which translator+shim produced this dylib. Best effort: a
      *  missing stamp only costs one re-translation next launch. */
-    static void writeNativeIdStamp(File cached) {
+    void writeNativeIdStamp(File cached) {
         String id = System.getenv("MACAPK_BUILD_NATIVE_ID");
         if (id == null || id.isEmpty() || !cached.isFile()) return;
+        ensureLibBiases();
+        id = wantedNativeId(cached, id);
         try {
             java.nio.file.Files.write(
                 new File(cached.getPath() + ".nativeid").toPath(),

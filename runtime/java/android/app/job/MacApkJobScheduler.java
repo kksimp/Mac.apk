@@ -358,6 +358,21 @@ final class MacApkJobScheduler extends JobScheduler {
             return RESULT_FAILURE;
         }
 
+        // A job runs in the android:process its JobService is declared in (the
+        // JobSchedulerService binds the service THERE). When the system broker has
+        // split this app into processes and the service is another process's,
+        // the job is scheduled in that process (started if needed), whose own
+        // scheduler arms and fires it; nothing is armed here. Finsky's
+        // InstallQueuePhoneskyJob is exactly this: scheduled from the main process,
+        // declared android:process=":background".
+        if (com.macapk.loader.SystemClient.jobHostedElsewhere(job.getService())) {
+            int rc = com.macapk.loader.SystemClient.scheduleJobRemote(job, work);
+            log((work != null ? "enqueue" : "schedule") + " id=" + job.getId()
+                    + " service=" + job.getService().flattenToString()
+                    + " -> hosted in another android:process; rc=" + rc);
+            return rc;
+        }
+
         final boolean isEnqueue = work != null;
         JobParameters stopThis = null;
         JobTarget stopOn = null;
@@ -433,6 +448,8 @@ final class MacApkJobScheduler extends JobScheduler {
     }
 
     @Override public void cancel(int jobId) {
+        // The job may live in one of the app's other processes.
+        com.macapk.loader.SystemClient.cancelJobsElsewhere(jobId, false);
         JobParameters stopThis = null;
         JobTarget stopOn = null;
         synchronized (mLock) {
@@ -459,6 +476,7 @@ final class MacApkJobScheduler extends JobScheduler {
     }
 
     @Override public void cancelAll() {
+        com.macapk.loader.SystemClient.cancelJobsElsewhere(-1, true);
         List<Integer> ids;
         synchronized (mLock) { ids = new ArrayList<>(mJobs.keySet()); }
         log("cancelAll (" + ids.size() + " jobs)");
@@ -470,18 +488,24 @@ final class MacApkJobScheduler extends JobScheduler {
      *  to run." A completed one-shot is neither, so it is not listed --
      *  which is why complete() removes it from the store. */
     @Override public List<JobInfo> getAllPendingJobs() {
+        ArrayList<JobInfo> out;
         synchronized (mLock) {
-            ArrayList<JobInfo> out = new ArrayList<>(mJobs.size());
+            out = new ArrayList<>(mJobs.size());
             for (JobRecord r : mJobs.values()) out.add(r.info);
-            return out;
         }
+        // One JobScheduler per app on a device: also the jobs held by the app's
+        // other processes (none unless the broker has split it).
+        out.addAll(com.macapk.loader.SystemClient.pendingJobsElsewhere(-1));
+        return out;
     }
 
     @Override public JobInfo getPendingJob(int jobId) {
         synchronized (mLock) {
             JobRecord r = mJobs.get(jobId);
-            return r != null ? r.info : null;
+            if (r != null) return r.info;
         }
+        java.util.List<JobInfo> other = com.macapk.loader.SystemClient.pendingJobsElsewhere(jobId);
+        return other.isEmpty() ? null : other.get(0);
     }
 
     /** A content-trigger job waiting for its first change report is blocked on

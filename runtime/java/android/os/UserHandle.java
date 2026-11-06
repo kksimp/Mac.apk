@@ -12,6 +12,8 @@ package android.os;
 // user exists.
 public final class UserHandle implements Parcelable {
     public static final UserHandle SYSTEM = new UserHandle(0);
+    /** AOSP @Deprecated @SystemApi: the old name for user 0 (USER_OWNER). */
+    @Deprecated public static final UserHandle OWNER = new UserHandle(0);
     public static final UserHandle ALL    = new UserHandle(-1);
     public static final UserHandle CURRENT = SYSTEM;
     public static final UserHandle CURRENT_OR_SELF = SYSTEM;
@@ -33,6 +35,9 @@ public final class UserHandle implements Parcelable {
         return (o instanceof UserHandle) && ((UserHandle) o).identifier == identifier;
     }
     public String toString() { return "UserHandle{" + identifier + "}"; }
+    /** AOSP android14 UserHandle.java:574 -- `return this.equals(OWNER);`. Google
+     *  Play services' bound-service entry (GmsApiChimeraService.onBind) asks it. */
+    @Deprecated public boolean isOwner() { return this.equals(OWNER); }
 
     public static UserHandle getUserHandleForUid(int uid) { return SYSTEM; }
     public static int getUserId(int uid)   { return USER_SYSTEM; }

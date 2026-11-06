@@ -140,9 +140,7 @@ public abstract class Context {
     // a delivery timer + listener registrations, so it must be a stable
     // per-Context instance (AOSP also caches it via SystemServiceRegistry).
     private android.hardware.SensorManager macapkSensorManager;
-    /** ONE LocaleManager per Context. The per-app locale selection lives in an
-     *  instance field, so handing out a fresh manager per getSystemService()
-     *  call made set-then-get return empty. AOSP uses a CachedServiceFetcher. */
+    /** Cached facade; LocaleManager shares stored state through SharedPrefsImpl. */
     private android.app.LocaleManager macapkLocaleManager;
     private android.location.LocationManager macapkLocationManager;
     public android.content.res.Resources.Theme getTheme() {
@@ -256,16 +254,37 @@ public abstract class Context {
         }
     }
 
-    /** API-24+ direct-boot storage. AOSP semantics: an app can register
-     *  for device-protected storage (encrypted storage available
-     *  before the user unlocks the device) by calling
-     *  createDeviceProtectedStorageContext() and storing data there.
-     *  We don't have direct-boot semantics; reporting "not device-
-     *  protected" makes apps default to their normal storage path.
-     *  HCR 1.68's androidx.startup chain calls isDeviceProtectedStorage()
-     *  during init -- NoSuchMethodError otherwise. */
+    /** API-24+ device-protected / credential-protected storage (direct boot).
+     *  AOSP: an app has two private storage areas -- credential-encrypted (CE,
+     *  /data/user/<user>/<pkg>, available only after the user unlocks) and
+     *  device-encrypted (DE, /data/user_de/<user>/<pkg>, available from boot,
+     *  before and after unlock). A context carries a flavor flag;
+     *  createDeviceProtectedStorageContext() / createCredentialProtectedStorageContext()
+     *  return a context whose file APIs point at the respective area, and
+     *  isDeviceProtectedStorage()/isCredentialProtectedStorage() report it. The
+     *  DEFAULT app context is credential-protected (its data dir IS the CE dir),
+     *  so it reports CE true / DE false -- mirrored here (ContextImpl's
+     *  constructor infers exactly this when no flag bit is set).
+     *
+     *  Mac.apk is single-user and always "unlocked", so CE storage is the normal
+     *  <root>/data/data/<dir> and the default context delegates to it; a DE
+     *  context repoints at the sibling <root>/data/user_de/0/<dir>. See
+     *  StorageContext for the flavor implementation.
+     *
+     *  This used to report isDeviceProtectedStorage()==false unconditionally and
+     *  return `this` from createDeviceProtectedStorageContext() (no real DE
+     *  context, no createCredentialProtectedStorageContext() at all). That broke
+     *  Google Play services' Chimera module-config commit, which obtains a DE
+     *  context and asserts checkArgument(ctx.isDeviceProtectedStorage()) before
+     *  deriving a CE context from it: the assertion threw, GmsModuleFinder
+     *  swallowed it, the module config never committed, and every GMS operation
+     *  (checkin included) stayed "Stale snapshot (new configuration available)".
+     *  HCR 1.68's androidx.startup chain only reads isDeviceProtectedStorage() on
+     *  the default context, which still answers false, so its path is unchanged. */
     public boolean isDeviceProtectedStorage()    { return false; }
-    public Context createDeviceProtectedStorageContext() { return this; }
+    public boolean isCredentialProtectedStorage() { return true; }
+    public Context createDeviceProtectedStorageContext()     { return StorageContext.deviceProtected(this); }
+    public Context createCredentialProtectedStorageContext() { return StorageContext.credentialProtected(this); }
     /** v1.0.100: AOSP isRestricted() returns true when the Context is the
      *  parsed Context from a LayoutInflater factory (Resources-only, no app
      *  context). F-Droid's StatusBanner constructor checks this so it can
@@ -1125,6 +1144,8 @@ public abstract class Context {
     public static final String PRINT_SERVICE                 = "print";
     public static final String RESTRICTIONS_SERVICE          = "restrictions";
     public static final String ROLE_SERVICE                  = "role";
+    /** @SystemApi AOSP Context.ROLLBACK_SERVICE. */
+    public static final String ROLLBACK_SERVICE              = "rollback";
     public static final String STATUS_BAR_SERVICE            = "statusbar";
     public static final String STORAGE_STATS_SERVICE         = "storagestats";
     public static final String SYSTEM_HEALTH_SERVICE         = "systemhealth";
@@ -1382,7 +1403,7 @@ public abstract class Context {
                 // CachedServiceFetcher like every other manager, and API 33 is
                 // exactly where AppCompatDelegate hands locale duty to it.
                 if (macapkLocaleManager == null) {
-                    macapkLocaleManager = new android.app.LocaleManager();
+                    macapkLocaleManager = new android.app.LocaleManager(this);
                 }
                 result = macapkLocaleManager;
                 break;
@@ -1552,6 +1573,12 @@ public abstract class Context {
                 // answer for such a device.
                 result = new android.hardware.ConsumerIrManager();
                 break;
+            case ROLLBACK_SERVICE:
+                // AOSP registers RollbackManager for every app (SystemServiceRegistry);
+                // the server enforces MANAGE_ROLLBACKS per call. Play Store throws
+                // "Android is missing rollback service" when this is null.
+                result = new android.content.rollback.RollbackManager(this);
+                break;
             case CREDENTIAL_SERVICE:
                 // No credential providers on a de-Googled device; the manager
                 // exists and its get/create calls report "no credential" via
@@ -1715,6 +1742,8 @@ public abstract class Context {
                 return LAUNCHER_APPS_SERVICE;
             case "android.app.role.RoleManager":
                 return ROLE_SERVICE;
+            case "android.content.rollback.RollbackManager":
+                return ROLLBACK_SERVICE;
             case "android.os.health.SystemHealthManager":
                 return SYSTEM_HEALTH_SERVICE;
             case "android.app.WallpaperManager":
@@ -2022,6 +2051,15 @@ public abstract class Context {
     private Intent macapkRegisterReceiver(android.content.BroadcastReceiver receiver,
                                           android.content.IntentFilter filter,
                                           android.os.Handler scheduler) {
+        return macapkRegisterReceiver(receiver, filter, scheduler, 0);
+    }
+
+    /** `flags`: RECEIVER_EXPORTED / RECEIVER_NOT_EXPORTED, kept with the
+     *  registration -- a NOT_EXPORTED receiver must never hear another app's
+     *  broadcast (they now arrive from other processes, SystemClient). */
+    private Intent macapkRegisterReceiver(android.content.BroadcastReceiver receiver,
+                                          android.content.IntentFilter filter,
+                                          android.os.Handler scheduler, int flags) {
         // BATTERY_CHANGED is synthesized on demand rather than published on a
         // timer: a registration is the only moment its value is observed, and
         // BatteryManager already caches its pmset read behind a short TTL.
@@ -2036,7 +2074,7 @@ public abstract class Context {
         // minute ticker captured the FIRST registrant's Activity and pinned it
         // for the process lifetime. Store both.
         if (receiver != null && filter != null) {
-            sReceivers.add(new Object[]{ receiver, filter, this, scheduler });
+            sReceivers.add(new Object[]{ receiver, filter, this, scheduler, flags });
         }
         // Start the minute ticker only when something actually wants it.
         try {
@@ -2192,6 +2230,26 @@ public abstract class Context {
 
     public void sendBroadcast(Intent intent) {
         if (intent == null) return;
+        // Other apps run in other processes (each Mac.apk app has its own): AMS
+        // delivers a broadcast to every app whose receivers match, so it goes to
+        // the system broker too (com.macapk.loader.SystemClient; a no-op unless
+        // it is enabled, and never for a broadcast aimed at THIS package).
+        com.macapk.loader.SystemClient.forwardBroadcast(intent);
+        macapkDeliverLocal(intent);
+    }
+
+    /** Deliver a broadcast to THIS process's receivers only (dynamic + this
+     *  app's manifest receivers) -- the in-process half of sendBroadcast, and
+     *  what the broker calls when ANOTHER app's broadcast arrives here. */
+    /** True while delivering a broadcast that ANOTHER app sent (set by
+     *  com.macapk.loader.SystemClient around macapkDeliverLocal): only
+     *  exported receivers may hear it, as AMS enforces. */
+    public static final ThreadLocal<Boolean> MACAPK_FROM_OTHER_APP =
+        ThreadLocal.withInitial(() -> Boolean.FALSE);
+
+    public void macapkDeliverLocal(Intent intent) {
+        if (intent == null) return;
+        final boolean fromOtherApp = MACAPK_FROM_OTHER_APP.get();
         // AOSP: an EXPLICIT broadcast (component set) is delivered to exactly
         // that component's manifest-declared receiver and NEVER consults the
         // dynamic registry -- ActivityManagerService.broadcastIntentLocked
@@ -2226,6 +2284,8 @@ public abstract class Context {
             if (!targeted.equals(selfPkgName)) return;
         }
         for (Object[] e : sReceivers) {
+            if (fromOtherApp && e.length > 4 && e[4] instanceof Integer
+                    && (((Integer) e[4]) & RECEIVER_NOT_EXPORTED) != 0) continue;
             android.content.IntentFilter f = (android.content.IntentFilter) e[1];
             // Full AOSP filter match (action AND data/scheme/type AND categories),
             // not action-only: a data- or category-constrained dynamic receiver
@@ -2388,6 +2448,7 @@ public abstract class Context {
             if (ri == null || ri.activityInfo == null || ri.activityInfo.name == null) continue;
             String owner = ri.activityInfo.packageName;
             if (skipPackage != null && skipPackage.equals(owner)) continue;
+            if (MACAPK_FROM_OTHER_APP.get() && !ri.activityInfo.exported) continue;
             macapkRunManifestReceiver(ri.activityInfo.name, intent);
         }
     }
@@ -2428,6 +2489,13 @@ public abstract class Context {
         }
         String cls = cn.getClassName();
         if (cls == null) return;
+        if (MACAPK_FROM_OTHER_APP.get()) {
+            // Another app's explicit broadcast: only an exported receiver.
+            try {
+                android.content.pm.ActivityInfo ai = getPackageManager().getReceiverInfo(cn, 0);
+                if (ai != null && !ai.exported) return;
+            } catch (Throwable ignored) { return; }
+        }
         // Manifest-relative names (".Foo") normalize against the package.
         final String className = cls.startsWith(".") && cn.getPackageName() != null
                 ? cn.getPackageName() + cls : cls;
@@ -2484,6 +2552,17 @@ public abstract class Context {
      *  up on the wrong thread. */
     private void macapkRunManifestReceiver(final String className, Intent intent) {
         if (className == null || className.isEmpty()) return;
+        // A manifest receiver runs in ITS OWN android:process. When the system
+        // broker has split this package into processes, one declared for another
+        // process is that process's to run (the broker delivers the broadcast
+        // there); instantiating it here would run it in a process a device never
+        // would, and run it twice once the broker also delivers. Always true when
+        // processes are not split.
+        if (!com.macapk.loader.SystemClient.hostsHere(className)) {
+            com.macapk.loader.NativeLog.i("Context", "manifest receiver " + className
+                + " belongs to another android:process; left to the process that hosts it");
+            return;
+        }
         final Intent delivered = intent;
         Runnable run = () -> {
             try {
@@ -2746,7 +2825,7 @@ public abstract class Context {
      *  RECEIVER_NOT_EXPORTED). F-Droid + ContextCompat call this. */
     public Intent registerReceiver(android.content.BroadcastReceiver receiver,
                                    android.content.IntentFilter filter,
-                                   int flags) { return macapkRegisterReceiver(receiver, filter); }
+                                   int flags) { return macapkRegisterReceiver(receiver, filter, null, flags); }
     /** AOSP API-1+ 4-arg variant with broadcast permission and Handler.
      *  ContextCompat probes this via reflection to gate flag-arg vs
      *  permission-arg overloads. */
@@ -2759,7 +2838,7 @@ public abstract class Context {
                                    android.content.IntentFilter filter,
                                    String broadcastPermission,
                                    android.os.Handler scheduler,
-                                   int flags) { return macapkRegisterReceiver(receiver, filter, scheduler); }
+                                   int flags) { return macapkRegisterReceiver(receiver, filter, scheduler, flags); }
     /** Receiver-export flags for the 3-arg / 5-arg variants. AOSP. */
     public static final int RECEIVER_EXPORTED     = 0x2;
     public static final int RECEIVER_NOT_EXPORTED = 0x4;
@@ -2904,6 +2983,13 @@ public abstract class Context {
         // IllegalArgumentException, not a quiet false.
         if (conn == null) throw new IllegalArgumentException("connection is null");
         if (intent == null) return false;
+        // Another package running in ANOTHER process (each Mac.apk app has its
+        // own): AMS-style, through the system broker, delivering a real
+        // cross-process IBinder. A package the broker does not know keeps every
+        // in-process path below unchanged. See com.macapk.loader.SystemClient.
+        if (com.macapk.loader.SystemClient.bindsRemotely(this, intent)) {
+            return com.macapk.loader.SystemClient.bindRemote(this, intent, flags, executor, conn);
+        }
         // AOSP bindService only resolves and returns: CREATE_SERVICE and
         // BIND_SERVICE are main-looper messages that run after the caller has
         // unwound (ActivityThread.H handleCreateService / handleBindService). We
@@ -3048,6 +3134,8 @@ public abstract class Context {
      *  AOSP would have returned true, so a faithful throw here would invent a
      *  crash real Android never produces. */
     public void    unbindService(ServiceConnection conn) {
+        // A connection to another app's process: drop it there (SystemClient).
+        if (conn != null && com.macapk.loader.SystemClient.unbindRemote(conn)) return;
         if (conn == null) return;
         synchronized (sBoundConnections) {
             sBoundConnections.remove(conn); sBoundBy.remove(conn); sPendingBinds.remove(conn);
@@ -3061,6 +3149,11 @@ public abstract class Context {
      *  package-name branch. Returns the started ComponentName or null
      *  when the Intent names no resolvable component. */
     public android.content.ComponentName startService(Intent service) {
+        // Another app's service in another process: through the broker
+        // (com.macapk.loader.SystemClient), as bindService does.
+        if (com.macapk.loader.SystemClient.bindsRemotely(this, service)) {
+            return com.macapk.loader.SystemClient.startRemote(service);
+        }
         return android.app.ServiceRegistry.start(this, service, false);
     }
     /** AOSP API-26+: same contract as startService except the service
@@ -3073,9 +3166,17 @@ public abstract class Context {
      *  caller (WorkForegroundUpdater) completes its future
      *  regardless. */
     public android.content.ComponentName startForegroundService(Intent service) {
+        if (com.macapk.loader.SystemClient.bindsRemotely(this, service)) {
+            return com.macapk.loader.SystemClient.startRemote(service);
+        }
         return android.app.ServiceRegistry.start(this, service, true);
     }
     public boolean stopService(Intent service) {
+        // A service another process hosts (another app's, or this app's in its
+        // own android:process): stopped there, through the broker.
+        if (com.macapk.loader.SystemClient.bindsRemotely(this, service)) {
+            return com.macapk.loader.SystemClient.stopRemote(service);
+        }
         return android.app.ServiceRegistry.stop(service);
     }
     /** AOSP permission checks. ContextImpl funnels every one of these
@@ -3457,7 +3558,7 @@ public abstract class Context {
      *  through this Context. Mac.apk has one app identity. */
     public android.content.AttributionSource getAttributionSource() {
         return new android.content.AttributionSource(android.os.Process.myUid(),
-                com.macapk.loader.Boot.processName(), null);
+                com.macapk.loader.Boot.packageName(), null);
     }
 
     public String getBasePackageName() { return getPackageName(); }

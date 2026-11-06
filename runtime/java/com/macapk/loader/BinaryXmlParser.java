@@ -61,6 +61,17 @@ public final class BinaryXmlParser {
 
     /** Namespace for the value-type annotations. */
     public static final String MACAPK_TYPE_NS = "http://macapk/axml-type";
+    /** An attribute's NAME in the app's resource table, when the document's own
+     *  name string differs from it (see setAttr), and the attr's resource id.
+     *  Parser-internal: DomXmlResourceParser hides both from attribute
+     *  iteration and consults them only for by-name and by-id lookups. */
+    public static final String MACAPK_ALIAS_NS = "http://macapk/axml-alias";
+    public static final String MACAPK_ATTRID_NS = "http://macapk/axml-attrid";
+    /** The attribute's name AS STORED in the compiled file's string pool, beside
+     *  an attribute this parser renamed to its table spelling. Android's
+     *  AttributeSet.getAttributeName(i) (XmlBlock.Parser) answers from that pool,
+     *  so an app that inspects names sees the document's spelling. */
+    public static final String MACAPK_DOCNAME_NS = "http://macapk/axml-docname";
     private static final String ANDROID_NS =
         "http://schemas.android.com/apk/res/android";
 
@@ -169,10 +180,24 @@ public final class BinaryXmlParser {
     private static void writeElement(StringBuilder sb, Element el) {
         sb.append('<').append(el.getTagName());
         org.w3c.dom.NamedNodeMap attrs = el.getAttributes();
+        boolean aliasNs = false, attrIdNs = false, docNameNs = false;
         for (int i = 0; i < attrs.getLength(); i++) {
             org.w3c.dom.Node a = attrs.item(i);
             String qn = a.getNodeName();
             if (MACAPK_TYPE_NS.equals(a.getNamespaceURI())) continue;
+            // The alias / attr-id records travel with the text too, so they need
+            // their prefixes declared (on the element itself), or the text is
+            // not well-formed and every reader of it fails.
+            if (!aliasNs && MACAPK_ALIAS_NS.equals(a.getNamespaceURI())) {
+                sb.append(" xmlns:macapkAlias=\"").append(MACAPK_ALIAS_NS).append('"');
+                aliasNs = true;
+            } else if (!attrIdNs && MACAPK_ATTRID_NS.equals(a.getNamespaceURI())) {
+                sb.append(" xmlns:macapkAttrId=\"").append(MACAPK_ATTRID_NS).append('"');
+                attrIdNs = true;
+            } else if (!docNameNs && MACAPK_DOCNAME_NS.equals(a.getNamespaceURI())) {
+                sb.append(" xmlns:macapkDocName=\"").append(MACAPK_DOCNAME_NS).append('"');
+                docNameNs = true;
+            }
             sb.append(' ').append(qn).append("=\"");
             escape(sb, a.getNodeValue());
             sb.append('"');
@@ -380,9 +405,22 @@ public final class BinaryXmlParser {
         int dataType = u8(a + 15);
         int data     = i32(a + 16);
 
+        int attrId = (nameIdx >= 0 && nameIdx < resourceMap.length) ? resourceMap[nameIdx] : 0;
         String name = poolStr(nameIdx);
-        if (name.isEmpty() && nameIdx >= 0 && nameIdx < resourceMap.length) {
-            String known = WELL_KNOWN_ATTRS.get(resourceMap[nameIdx]);
+        final String docName = name;
+        final boolean namedInDocument = !name.isEmpty();
+        // A resource optimizer may keep the numeric attribute ID but replace
+        // its pool name with an invalid or shared spelling, and a shrunk APK
+        // (Meta's: WhatsApp, Instagram) strips every attribute name string and
+        // keeps only the resource map. The resource map is authoritative,
+        // including the app's distinct synthesized names: the app's own table
+        // first, then the platform table for 0x0101xxxx.
+        String tableName = names != null && attrId != 0 ? names.typeName(attrId) : null;
+        if (tableName != null && tableName.startsWith("attr/")) {
+            name = tableName.substring(5);
+        } else if (attrId != 0) {
+            String known = WELL_KNOWN_ATTRS.get(attrId);
+            if (known == null) known = FrameworkAttrIds.name(attrId);
             if (known != null) name = known;
         }
         if (name.isEmpty()) return;   // unusable attribute
@@ -390,7 +428,6 @@ public final class BinaryXmlParser {
         // The attr this value is assigned to (the resource map pairs each
         // attribute-name string with the attr's resource id) -- what the
         // enum/flag symbol tables are keyed by.
-        int attrId = (nameIdx >= 0 && nameIdx < resourceMap.length) ? resourceMap[nameIdx] : 0;
         String value;
         String typeTag;
         switch (dataType) {
@@ -467,21 +504,67 @@ public final class BinaryXmlParser {
         }
 
         String nsUri = nsIdx >= 0 ? poolStr(nsIdx) : "";
+        // Some optimized XML also erases the namespace strings. A compiled
+        // framework attribute still has Android identity through its ID.
+        // Only when the document ERASED it: a namespace the file does carry is the
+        // attribute's namespace (AOSP XmlBlock.Parser.getAttributeNamespace answers
+        // it as stored), e.g. framework-res's res-auto "tint" (0x01010121) and
+        // "layoutManager" (0x01120079), which the DOM must keep under res-auto so a
+        // (namespace, name) lookup finds what the AXML parser finds.
+        if (nsUri.isEmpty()) {
+            if ((attrId >>> 24) == 0x01) nsUri = ANDROID_NS;
+            else if (attrId != 0) nsUri = "http://schemas.android.com/apk/res-auto";
+        }
         try {
             if (!nsUri.isEmpty()) {
                 String prefix = nsPrefix.get(nsUri);
                 if (prefix == null || prefix.isEmpty()) {
                     prefix = ANDROID_NS.equals(nsUri) ? "android" : "ns";
                 }
+                if (el.lookupNamespaceURI(prefix) == null) {
+                    el.setAttributeNS("http://www.w3.org/2000/xmlns/", "xmlns:" + prefix, nsUri);
+                }
                 el.setAttributeNS(nsUri, prefix + ":" + name, value);
             } else {
                 el.setAttribute(name, value);
+            }
+            // Under resource-name obfuscation the table spelling replaces the
+            // document's ("layout_constraintTop_toBottomOf" becomes
+            // "APKTOOL_RENAMED_0x7f0405d7"), but an app reading
+            // AttributeSet.getAttributeName(i) gets the document's spelling on
+            // Android: Play Store's auto-replace view stub (acou) throws
+            // "Invalid attribute specified on an auto replace view stub" for any
+            // name that is not layout* / id / visibility / ..., and its
+            // signed-out screen inflated blank. Keep the pool name beside it.
+            if (namedInDocument && !docName.equals(name)) {
+                el.setAttributeNS(MACAPK_DOCNAME_NS, "macapkDocName:" + name, docName);
             }
             // Type annotation for typed (non-string) values, so the
             // Bundle-typing consumer can be Android-correct without
             // guessing from the text form.
             if (!"string".equals(typeTag)) {
                 el.setAttributeNS(MACAPK_TYPE_NS, "macapkType:" + name, typeTag);
+            }
+            // A shrunk APK (WhatsApp) keeps attribute NAMES in some compiled XML
+            // (res/xml MotionScenes) while its resource table has the attr's name
+            // removed (APKTOOL_RENAMED_0x...). A device matches styleable slots
+            // by the resource-map ID, so it never notices; our TypedArray matches
+            // by the TABLE name and getAttributeNameResource by the document
+            // name, so `constraintSetStart` was invisible to both -- MotionLayout
+            // then had no start state, skipped its measure, and the Settings
+            // header (back arrow, profile) laid out at 0x0. Record the table
+            // spelling and the id beside the attribute.
+            if (namedInDocument && attrId != 0 && (attrId >>> 24) == 0x7f && names != null) {
+                String tn = names.typeName(attrId);
+                if (tn != null && tn.startsWith("attr/")) {
+                    String aliasName = tn.substring(5);
+                    if (!aliasName.isEmpty() && !aliasName.equals(name)) {
+                        // Only where the names disagree, so an APK with intact
+                        // names parses exactly as before.
+                        el.setAttributeNS(MACAPK_ALIAS_NS, "macapkAlias:" + aliasName, value);
+                        el.setAttributeNS(MACAPK_ATTRID_NS, "macapkAttrId:" + name, Integer.toString(attrId));
+                    }
+                }
             }
         } catch (Throwable t) {
             // DOM name validation can reject odd attr names from

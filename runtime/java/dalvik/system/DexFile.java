@@ -314,4 +314,83 @@ public final class DexFile {
         }
         return l;
     }
+
+    /**
+     * AOSP DexFile.OptimizationInfo (libcore DexFile.java): what ART reports about
+     * a dex file's odex state. The predicates are ART's CompilerFilter rules
+     * (libartbase/base/compiler_filter.cc), reached in AOSP through the
+     * DexFile_is*CompilerFilter natives: a name ParseCompilerFilter does not know
+     * (such as "unknown") answers false to every one of them.
+     */
+    public static final class OptimizationInfo {
+        private final String status;
+        private final String reason;
+
+        OptimizationInfo(String status, String reason) {
+            this.status = status;
+            this.reason = reason;
+        }
+
+        /** @hide (SystemApi MODULE_LIBRARIES) */
+        public String getStatus() { return status; }
+
+        /** @hide (SystemApi MODULE_LIBRARIES) */
+        public String getReason() { return reason; }
+
+        public boolean isVerified() { return isVerifiedCompilerFilter(status); }
+
+        public boolean isOptimized() { return isOptimizedCompilerFilter(status); }
+
+        public boolean isFullyCompiled() {
+            return isOptimizedCompilerFilter(status) && !isProfileGuidedCompilerFilter(status);
+        }
+    }
+
+    /** ART CompilerFilter::ParseCompilerFilter, with the obsolete aliases it still
+     *  maps. Returns the canonical filter name, or null when ART would fail to parse. */
+    private static String parseCompilerFilter(String option) {
+        if (option == null) return null;
+        switch (option) {
+            case "verify-none":
+            case "assume-verified":   return "assume-verified";
+            case "interpret-only":
+            case "verify-profile":
+            case "verify-at-runtime":
+            case "extract":
+            case "quicken":
+            case "verify":            return "verify";
+            case "balanced":
+            case "speed":             return "speed";
+            case "time":
+            case "space":             return "space";
+            case "space-profile":     return "space-profile";
+            case "speed-profile":     return "speed-profile";
+            case "everything":        return "everything";
+            case "everything-profile": return "everything-profile";
+            default:                  return null;
+        }
+    }
+
+    /** AOSP: whether the given filter is a valid compiler filter name. */
+    public static boolean isValidCompilerFilter(String filter) {
+        return parseCompilerFilter(filter) != null;
+    }
+
+    /** AOSP (CompilerFilter::DependsOnProfile). */
+    public static boolean isProfileGuidedCompilerFilter(String filter) {
+        String f = parseCompilerFilter(filter);
+        return f != null && f.endsWith("-profile");
+    }
+
+    /** AOSP (CompilerFilter::IsVerificationEnabled). @hide */
+    public static boolean isVerifiedCompilerFilter(String filter) {
+        String f = parseCompilerFilter(filter);
+        return f != null && !f.equals("assume-verified");
+    }
+
+    /** AOSP (CompilerFilter::IsAotCompilationEnabled). @hide */
+    public static boolean isOptimizedCompilerFilter(String filter) {
+        String f = parseCompilerFilter(filter);
+        return f != null && !f.equals("assume-verified") && !f.equals("verify");
+    }
 }

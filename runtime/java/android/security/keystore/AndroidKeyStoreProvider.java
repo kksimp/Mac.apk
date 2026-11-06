@@ -25,17 +25,13 @@ import java.security.Security;
 // EncryptedSharedPreferences breaks at first use.
 //
 // What we intentionally do NOT mirror:
-//  - AndroidKeyStoreBCWorkaroundProvider: on Android it exists to route
-//    Cipher/Mac operations on NON-EXTRACTABLE keystore keys into the
-//    keymaster service. Our keys are plain software SecretKeySpec objects
-//    (macOS has no keymaster), so the stock JCE providers (SunJCE) operate
-//    on them directly and no workaround provider is needed.
-//  - KeyPairGenerator.EC/RSA landed v1.0.1597; KeyFactory.EC/RSA landed
-//    v1.0.1604. SecretKeyFactory: still not yet.
-//    implemented (they need X.509 self-signed certificate fabrication for
-//    engineGetCertificate). Add them, mirroring AOSP, when an app exercises
-//    that surface; the symmetric-key surface here is what the
-//    MasterKeys/Tink/EncryptedSharedPreferences ecosystem uses.
+//  - AES KeyStore handles use the key-class-restricted Cipher service below,
+//    following AndroidKeyStoreBCWorkaroundProvider's routing contract. The host
+//    backend remains software-backed; hardware keymaster is not advertised.
+//  - EC/RSA generation and KeyInfo lookup are supported. SecretKeyFactory.AES
+//    exposes policy metadata without exporting the opaque key. Authentication-
+//    bound AES/RSA/EC routes require native OS grants; unsupported authenticated
+//    algorithms or hardware constraints fail closed.
 //
 // Registration order: appended via Security.addProvider (lowest priority),
 // matching real Android where the AndroidKeyStore provider sits near the END
@@ -47,6 +43,23 @@ public class AndroidKeyStoreProvider extends Provider {
 
     public AndroidKeyStoreProvider() {
         super(PROVIDER_NAME, "1.0", "Android KeyStore security provider");
+        put("Cipher.AES", "android.security.keystore.AndroidKeyStoreAesCipherSpi");
+        put("Cipher.AES SupportedKeyClasses", "android.security.keystore.AndroidKeyStoreAesKey");
+        put("Cipher.AES SupportedModes", "GCM|CBC|CTR|ECB");
+        put("Cipher.AES SupportedPaddings", "NOPADDING|PKCS5PADDING|PKCS7PADDING");
+        put("Cipher.RSA", "android.security.keystore.AndroidKeyStoreRsaCipherSpi");
+        put("Cipher.RSA SupportedKeyClasses", "android.security.keystore.AndroidKeyStorePrivateKey|java.security.PublicKey");
+        put("Cipher.RSA SupportedModes", "ECB|NONE");
+        put("Cipher.RSA SupportedPaddings", "NOPADDING|PKCS1PADDING|OAEPPADDING|OAEPWITHSHA-?(1|224|256|384|512)ANDMGF1PADDING");
+        put("SecretKeyFactory.AES", "android.security.keystore.AndroidKeyStoreSecretKeyFactorySpi");
+        for (String digest : new String[]{"SHA1", "SHA224", "SHA256", "SHA384", "SHA512"}) {
+            put("Signature." + digest + "withRSA", "android.security.keystore.AndroidKeyStoreSignatureSpi$" + digest + "RSA");
+            put("Signature." + digest + "withRSA SupportedKeyClasses", "android.security.keystore.AndroidKeyStorePrivateKey|java.security.PublicKey");
+            put("Signature." + digest + "withECDSA", "android.security.keystore.AndroidKeyStoreSignatureSpi$" + digest + "EC");
+            put("Signature." + digest + "withECDSA SupportedKeyClasses", "android.security.keystore.AndroidKeyStorePrivateKey|java.security.PublicKey");
+        }
+        put("Signature.RSASSA-PSS", "android.security.keystore.AndroidKeyStoreSignatureSpi$PSS");
+        put("Signature.RSASSA-PSS SupportedKeyClasses", "android.security.keystore.AndroidKeyStorePrivateKey|java.security.PublicKey");
         put("KeyStore.AndroidKeyStore",
             "android.security.keystore.AndroidKeyStoreSpi");
         put("KeyGenerator.AES",

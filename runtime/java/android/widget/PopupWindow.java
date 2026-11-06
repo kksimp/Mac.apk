@@ -60,10 +60,37 @@ public class PopupWindow {
     private OnDismissListener onDismissListener;
 
     public PopupWindow()                                          {}
-    public PopupWindow(Context c)                                 { this.context = c; }
-    public PopupWindow(Context c, android.util.AttributeSet a)    { this.context = c; }
-    public PopupWindow(Context c, android.util.AttributeSet a, int s) { this.context = c; }
-    public PopupWindow(Context c, android.util.AttributeSet a, int s, int r) { this.context = c; }
+    // AOSP chains (Context) -> (Context, attrs) -> (.., popupWindowStyle) ->
+    // (.., defStyleRes 0), and the last one reads the style: popupBackground,
+    // overlapAnchor, popupElevation (PopupWindow.java:240-275). These bodies used
+    // to only store the context, so every popup an app built from a style got
+    // NO background -- WhatsApp's overflow menu drew its items straight over the
+    // chat list.
+    public PopupWindow(Context c)                                 { this(c, null); }
+    public PopupWindow(Context c, android.util.AttributeSet a)    { this(c, a, 0x01010076 /* popupWindowStyle */); }
+    public PopupWindow(Context c, android.util.AttributeSet a, int s) { this(c, a, s, 0); }
+    public PopupWindow(Context c, android.util.AttributeSet a, int s, int r) {
+        this.context = c;
+        macapkApplyStyle(c, a, s, r);
+    }
+
+    /** Sorted, as a styleable is: popupBackground, overlapAnchor, popupElevation. */
+    private static final int[] MACAPK_POPUP_ATTRS = { 0x01010176, 0x01010462, 0x0101048c };
+
+    private void macapkApplyStyle(Context c, android.util.AttributeSet attrs, int defStyleAttr, int defStyleRes) {
+        if (c == null) return;
+        android.content.res.TypedArray a = null;
+        try {
+            a = c.obtainStyledAttributes(attrs, MACAPK_POPUP_ATTRS, defStyleAttr, defStyleRes);
+            if (a.hasValue(0)) backgroundDrawable = a.getDrawable(0);
+            if (a.hasValue(1)) mOverlapAnchor = a.getBoolean(1, false);
+            if (a.hasValue(2)) mElevation = a.getDimension(2, 0f);
+        } catch (Throwable t) {
+            // A style that cannot be resolved must never break construction.
+        } finally {
+            if (a != null) try { a.recycle(); } catch (Throwable ignored) {}
+        }
+    }
     public PopupWindow(int w, int h)                              { this.width = w; this.height = h; }
     public PopupWindow(View contentView)                          { this.contentView = contentView; }
     public PopupWindow(View contentView, int w, int h)            { this.contentView = contentView; this.width = w; this.height = h; }
@@ -145,9 +172,11 @@ public class PopupWindow {
     //    that owns mBackground (:1494-1499); we set the background on the decor
     //    itself. Same painted result and same padding contribution, one level
     //    less nesting.
-    //  - No enter/exit Transition playback and no elevation shadow.
-    //  - findDropDownPosition's tryFitVertical/tryFitHorizontal flip-above and
-    //    resize passes (:1817-1900) are NOT ported. WindowOverlayStack
+    //  - No enter/exit Transition playback. The elevation is real: the decor
+    //    carries it (preparePopup) and WindowOverlayStack casts the shadow.
+    //  - findDropDownPosition's tryFitVertical flip-above and the resize
+    //    passes (:1817-1900) are NOT ported; only the horizontal shift back
+    //    into the window is (macapkPositionAsDropDown). WindowOverlayStack
     //    .measureAndLayout already clamps a layer to the screen, so a dropdown
     //    that does not fit below its anchor SLIDES up instead of FLIPPING above
     //    it. isAboveAnchor() therefore reports the clamped outcome, not a
@@ -331,6 +360,11 @@ public class PopupWindow {
         } catch (Throwable ignored) { }
         PopupDecorView decor = new PopupDecorView(c);
         if (backgroundDrawable != null) decor.setBackgroundDrawable(backgroundDrawable);
+        // AOSP preparePopup: mBackgroundView.setElevation(mElevation) (the style's
+        // popupElevation or setElevation). WindowOverlayStack casts a window's
+        // shadow from its root's Z, so a popup now gets the shadow that sets it
+        // off from a same-coloured screen behind it.
+        if (mElevation > 0f) decor.setElevation(mElevation);
         try {
             decor.addView(contentView, new ViewGroup.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -352,8 +386,10 @@ public class PopupWindow {
 
     /** AOSP PopupWindow.findDropDownPosition (PopupWindow.java:1733-1816), reduced
      *  to the part this tree can honour: align to the anchor's bottom-left in
-     *  WINDOW coordinates plus the caller's offsets, and adjust for a RIGHT
-     *  horizontal gravity. Window coordinates rather than AOSP's
+     *  WINDOW coordinates plus the caller's offsets, adjust for a RIGHT
+     *  horizontal gravity (START/END resolved by the anchor's direction), and
+     *  shift the popup back inside the window horizontally. Window
+     *  coordinates rather than AOSP's
      *  screen-minus-appRoot arithmetic because WindowOverlayStack's layer bounds
      *  and TouchDispatcher's hit-testing are both in that same space.
      *
@@ -370,11 +406,44 @@ public class PopupWindow {
         p.x = loc[0] + xoff;
         p.y = loc[1] + anchorH + yoff;
         p.gravity = computeGravity();
-        final int hgrav = gravity & android.view.Gravity.HORIZONTAL_GRAVITY_MASK;
-        if (hgrav == android.view.Gravity.RIGHT && p.width >= 0) {
-            p.x -= p.width - anchorW;
+        // AOSP resolves START/END against the ANCHOR's layout direction
+        // (Gravity.getAbsoluteGravity(gravity, anchor.getLayoutDirection())), so
+        // under RTL the default TOP|START aligns the popup's right edge with the
+        // anchor's. The raw gravity was tested here, which never matched RIGHT.
+        final int hgrav = android.view.Gravity.getAbsoluteGravity(gravity, anchor.getLayoutDirection())
+                & android.view.Gravity.HORIZONTAL_GRAVITY_MASK;
+        int w = p.width;
+        if (w < 0) w = macapkMeasuredDecorWidth(anchor);
+        if (hgrav == android.view.Gravity.RIGHT && w >= 0) {
+            p.x -= w - anchorW;
+        }
+        // AOSP tryFitHorizontal / positionInDisplayHorizontal (PopupWindow.java
+        // :1860-1900): a popup that would cross the display edge is shifted back
+        // inside it. Not ported before, so an RTL overflow menu anchored at the
+        // left edge hung off the screen and its longest item was cut.
+        View root = anchor.getRootView();
+        int rootW = root != null ? root.getWidth() : 0;
+        if (rootW > 0 && w > 0) {
+            if (p.x + w > rootW) p.x = rootW - w;
+            if (p.x < 0) p.x = 0;
         }
         return p.y < loc[1];
+    }
+
+    /** The decor's width for a WRAP_CONTENT popup, measured against the window. */
+    private int macapkMeasuredDecorWidth(View anchor) {
+        if (mDecorView == null) return -1;
+        try {
+            View root = anchor.getRootView();
+            int rw = root != null ? root.getWidth() : 0;
+            int rh = root != null ? root.getHeight() : 0;
+            if (rw <= 0) return -1;
+            mDecorView.measure(View.MeasureSpec.makeMeasureSpec(rw, View.MeasureSpec.AT_MOST),
+                    View.MeasureSpec.makeMeasureSpec(Math.max(rh, 1), View.MeasureSpec.AT_MOST));
+            return mDecorView.getMeasuredWidth();
+        } catch (Throwable t) {
+            return -1;
+        }
     }
 
     /** AOSP PopupWindow.showAtLocation (PopupWindow.java:1327-1346). */
@@ -523,9 +592,9 @@ public class PopupWindow {
     // AOSP :1061 / :610 / :514 -- all three discarded their argument, which is
     // why the matching getters (isAttachedInDecor / getElevation /
     // getEpicenterBounds, added below) had nothing to read. Storing them is
-    // additive: mAttachedInDecor and mElevation are consumed by nothing in this
-    // port's window path, and mEpicenterBounds only orients a transition we do
-    // not run.
+    // additive: mAttachedInDecor is consumed by nothing in this port's window
+    // path, mElevation becomes the decor's elevation in preparePopup, and
+    // mEpicenterBounds only orients a transition we do not run.
     public void setAttachedInDecor(boolean enabled) { mAttachedInDecor = enabled; }
     public void setElevation(float elevation) { mElevation = elevation; }
     /** AOSP :514 defensively COPIES the Rect in and out, so a caller mutating

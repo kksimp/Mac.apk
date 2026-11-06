@@ -10,7 +10,92 @@ import android.os.IBinder;
  *  Source: frameworks/base/core/java/android/accounts/AbstractAccountAuthenticator.java */
 public abstract class AbstractAccountAuthenticator {
     private final Context mContext;
-    private final android.os.Binder mTransport = new android.os.Binder();
+    private final android.os.Binder mTransport = new Transport();
+
+    // AIDL android.accounts.IAccountAuthenticator, in AOSP's method order. The
+    // system broker's account service (com.macapk.loader.AccountsService) calls
+    // these on an authenticator in ANOTHER process, the way AccountManagerService
+    // does; every call is one-way and answers through the response binder.
+    static final String AUTHENTICATOR_DESCRIPTOR = "android.accounts.IAccountAuthenticator";
+    static final int TX_ADD_ACCOUNT = IBinder.FIRST_CALL_TRANSACTION;
+    static final int TX_CONFIRM_CREDENTIALS = IBinder.FIRST_CALL_TRANSACTION + 1;
+    static final int TX_GET_AUTH_TOKEN = IBinder.FIRST_CALL_TRANSACTION + 2;
+    static final int TX_GET_AUTH_TOKEN_LABEL = IBinder.FIRST_CALL_TRANSACTION + 3;
+    static final int TX_UPDATE_CREDENTIALS = IBinder.FIRST_CALL_TRANSACTION + 4;
+    static final int TX_EDIT_PROPERTIES = IBinder.FIRST_CALL_TRANSACTION + 5;
+    static final int TX_HAS_FEATURES = IBinder.FIRST_CALL_TRANSACTION + 6;
+    static final int TX_GET_ACCOUNT_REMOVAL_ALLOWED = IBinder.FIRST_CALL_TRANSACTION + 7;
+
+    /** AOSP's Transport (IAccountAuthenticator.Stub): run the authenticator method,
+     *  hand a non-null Bundle straight back through the response, and turn an
+     *  exception into onError (ERROR_CODE_NETWORK_ERROR for NetworkErrorException,
+     *  ERROR_CODE_UNSUPPORTED_OPERATION for UnsupportedOperationException, else
+     *  ERROR_CODE_REMOTE_EXCEPTION), as AbstractAccountAuthenticator.handleException does. */
+    private final class Transport extends android.os.Binder {
+        Transport() { super(AUTHENTICATOR_DESCRIPTOR); }
+        @Override protected boolean onTransact(int code, android.os.Parcel d, android.os.Parcel r,
+                int flags) throws android.os.RemoteException {
+            if (code < TX_ADD_ACCOUNT || code > TX_GET_ACCOUNT_REMOVAL_ALLOWED) {
+                return super.onTransact(code, d, r, flags);
+            }
+            d.enforceInterface(AUTHENTICATOR_DESCRIPTOR);
+            AccountAuthenticatorResponse resp = new AccountAuthenticatorResponse(d.readStrongBinder(), true);
+            try {
+                Bundle out;
+                switch (code) {
+                    case TX_ADD_ACCOUNT: {
+                        String type = d.readString(), tokenType = d.readString();
+                        String[] features = d.createStringArray();
+                        out = addAccount(resp, type, tokenType, features, d.readBundle());
+                        break;
+                    }
+                    case TX_CONFIRM_CREDENTIALS: {
+                        Account a = d.readTypedObject(Account.CREATOR);
+                        out = confirmCredentials(resp, a, d.readBundle());
+                        break;
+                    }
+                    case TX_GET_AUTH_TOKEN: {
+                        Account a = d.readTypedObject(Account.CREATOR);
+                        String tokenType = d.readString();
+                        out = getAuthToken(resp, a, tokenType, d.readBundle());
+                        break;
+                    }
+                    case TX_GET_AUTH_TOKEN_LABEL: {
+                        out = new Bundle();
+                        out.putString(AccountManager.KEY_AUTH_TOKEN_LABEL, getAuthTokenLabel(d.readString()));
+                        break;
+                    }
+                    case TX_UPDATE_CREDENTIALS: {
+                        Account a = d.readTypedObject(Account.CREATOR);
+                        String tokenType = d.readString();
+                        out = updateCredentials(resp, a, tokenType, d.readBundle());
+                        break;
+                    }
+                    case TX_EDIT_PROPERTIES:
+                        out = editProperties(resp, d.readString());
+                        break;
+                    case TX_HAS_FEATURES: {
+                        Account a = d.readTypedObject(Account.CREATOR);
+                        out = hasFeatures(resp, a, d.createStringArray());
+                        break;
+                    }
+                    default: {
+                        Account a = d.readTypedObject(Account.CREATOR);
+                        out = getAccountRemovalAllowed(resp, a);
+                    }
+                }
+                if (out != null) resp.onResult(out);
+            } catch (NetworkErrorException e) {
+                resp.onError(AccountManager.ERROR_CODE_NETWORK_ERROR, e.getMessage());
+            } catch (UnsupportedOperationException e) {
+                resp.onError(AccountManager.ERROR_CODE_UNSUPPORTED_OPERATION, "unsupported");
+            } catch (RuntimeException e) {
+                resp.onError(AccountManager.ERROR_CODE_REMOTE_EXCEPTION, String.valueOf(e));
+            }
+            if (r != null) r.writeNoException();
+            return true;
+        }
+    }
     public AbstractAccountAuthenticator(Context context) {
         mContext = context;
         synchronized (BY_TRANSPORT) {

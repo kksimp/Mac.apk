@@ -27,14 +27,13 @@
 //     connect by HOSTNAME and set ServerNames explicitly.
 //   - use a PRIVATE SSLContext, never SSLContext.getDefault(): the global
 //     default is mutable by guest code sharing this JVM.
-//   - a bare Socket obeys guest-mutable socksProxyHost; use Proxy.NO_PROXY.
+//   - a bare Socket obeys guest-mutable socksProxyHost. HostProxy supplies the
+//     captured per-app transport (or the legacy direct path with no config).
 package com.macapk.gms;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.InetSocketAddress;
-import java.net.Proxy;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.security.KeyStore;
@@ -286,8 +285,7 @@ public final class McsClient {
             Socket plain = null;
             boolean complete = false;
             try (com.macapk.loader.HostCrypto.Scope crypto = com.macapk.loader.HostCrypto.use()) {
-                plain = new Socket(Proxy.NO_PROXY);
-                plain.connect(new InetSocketAddress(HOST, port), CONNECT_TIMEOUT_MS);
+                plain = com.macapk.loader.HostProxy.connect(HOST, port, CONNECT_TIMEOUT_MS);
                 plain.setKeepAlive(true);
                 plain.setTcpNoDelay(true);
                 SSLSocket s = (SSLSocket) factory().createSocket(plain, HOST, port, true);

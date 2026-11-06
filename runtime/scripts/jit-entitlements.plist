@@ -77,5 +77,13 @@
          keys above: one half without the other is a SILENT denial. -->
     <key>com.apple.security.personal-information.location</key>
     <true/>
+    <!-- Bluetooth for android.bluetooth (bluetooth_bridge.mm and
+         bluetooth_peripheral_bridge.mm, opt-in via MACAPK_BLUETOOTH_HOST).
+         The hardened runtime Resource Access key for CoreBluetooth; same rule
+         as the keys above: the bundle usage string is only half of it, and
+         one half without the other is a silent denial or a TCC kill, not a
+         prompt. -->
+    <key>com.apple.security.device.bluetooth</key>
+    <true/>
 </dict>
 </plist>

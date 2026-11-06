@@ -9,7 +9,7 @@
 //
 // ---- WHAT WE SEND, AND THE THINGS WE DELIBERATELY DO NOT --------------------
 // We send what we honestly are: the Build fields android.os.Build already
-// reports to every guest (BRAND "Mac.apk", MODEL "Mac.apk", the real SDK level,
+// reports to every guest (BRAND/MANUFACTURER "Apple", MODEL the host hw.model, the real SDK level,
 // the real ABI list, the real screen metrics). We register as a Mac.apk device
 // because that is what this is.
 //

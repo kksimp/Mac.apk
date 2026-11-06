@@ -109,22 +109,47 @@ public class Binder implements IBinder {
     // SecurityException("Binding only allowed within app") on the receive path
     // when they disagree. 0 was an inert placeholder from before any caller
     // compared the two; the values are now consistent (both 10000 / this pid).
-    public static int getCallingPid()  { return android.os.Process.myPid(); }
-    public static int getCallingUid()  { return android.os.Process.myUid(); }
+    //
+    // CROSS-PROCESS (2026-10-30): MacApkBinderTransport sets sCallingIdentity
+    // for the duration of an incoming cross-process dispatch, the way the
+    // binder driver fills IPCThreadState per transaction. The pid there comes
+    // from the KERNEL (the Mach audit trailer of the sender); the uid is the
+    // sender's ANDROID uid, carried in the transport header, because every
+    // Mac.apk process runs as the same macOS user and the audit uid would say
+    // 501 for all of them. (Phase 3's broker assigns per-package uids and
+    // checks the header against the pid it launched.) With no dispatch on the
+    // thread, the answers are this process's, unchanged.
+    static final ThreadLocal<long[]> sCallingIdentity = new ThreadLocal<>();
+    public static int getCallingPid() {
+        long[] id = sCallingIdentity.get();
+        return id != null ? (int) id[0] : android.os.Process.myPid();
+    }
+    public static int getCallingUid() {
+        long[] id = sCallingIdentity.get();
+        return id != null ? (int) id[1] : android.os.Process.myUid();
+    }
 
     // AOSP declares these `public static final native` too, and the same
     // invokestatic rationale as getCalling{Pid,Uid} applies. The token is
     // opaque to callers on a real device as well: IPCThreadState packs the
     // CURRENT calling identity as `((int64_t)mCallingUid << 32) | mCallingPid`
     // and then resets the caller to this process, and restoreCallingIdentity
-    // unpacks it back. Mac.apk has exactly one identity, so there is nothing
-    // to swap away from and the packed value is simply our own identity;
-    // restoring it is therefore genuinely a no-op rather than a stub. Callers
-    // use the token only as a handle to hand back in a finally block.
+    // unpacks it back. Outside a cross-process dispatch the packed value is
+    // simply our own identity and restoring it changes nothing; inside one,
+    // clear resets to this process and restore puts the caller back.
     public static long clearCallingIdentity() {
-        return ((long) getCallingUid() << 32) | (getCallingPid() & 0xffffffffL);
+        long token = ((long) getCallingUid() << 32) | (getCallingPid() & 0xffffffffL);
+        sCallingIdentity.remove();
+        return token;
     }
-    public static void restoreCallingIdentity(long token) {}
+    public static void restoreCallingIdentity(long token) {
+        int uid = (int) (token >>> 32), pid = (int) token;
+        if (pid == android.os.Process.myPid() && uid == android.os.Process.myUid()) {
+            sCallingIdentity.remove();
+        } else {
+            sCallingIdentity.set(new long[] { pid, uid });
+        }
+    }
 
     // AOSP: "Flush any Binder commands pending in the current thread to the
     // kernel driver", used to force delivery of queued oneway transactions
@@ -213,5 +238,14 @@ public class Binder implements IBinder {
         mDescriptor = descriptor;
     }
     public IBinder asBinder() { return this; }
-    protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) throws RemoteException { return false; }
+    /** AOSP Binder.onTransact's defaults: INTERFACE_TRANSACTION answers the
+     *  descriptor (how a remote BinderProxy's getInterfaceDescriptor() asks),
+     *  PING_TRANSACTION succeeds; anything else is unknown. */
+    protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) throws RemoteException {
+        if (code == INTERFACE_TRANSACTION) {
+            if (reply != null) reply.writeString(getInterfaceDescriptor());
+            return true;
+        }
+        return code == PING_TRANSACTION;
+    }
 }

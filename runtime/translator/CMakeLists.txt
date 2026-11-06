@@ -169,10 +169,15 @@ add_library(macapk-bionic-shim SHARED
     src/bionic_shim_sensors.cpp
     # The guest's libvulkan.so: MoltenVK plus the VK_KHR_android_surface
     # translation, for apps that require Vulkan. Self-contained TU; see its banner.
-    src/bionic_shim_vulkan.cpp)
+    src/bionic_shim_vulkan.cpp
+    # The guest's libbinder_ndk.so (AIBinder/AParcel/AStatus/AServiceManager) as an
+    # in-process local-binder implementation. Self-contained TU; see its banner.
+    src/bionic_shim_binder_ndk.cpp)
 target_include_directories(macapk-bionic-shim PRIVATE
     "${SHIM_JAVA_HOME}/include"
-    "${SHIM_JAVA_HOME}/include/darwin")
+    "${SHIM_JAVA_HOME}/include/darwin"
+    # macapk/linker_namespaces.h (header-only Android linker namespace model)
+    "${CMAKE_CURRENT_SOURCE_DIR}/../include")
 # zlib (libpng IDAT decompression bridge: Bionic z_stream is 56 bytes,
 # macOS z_stream is ~112 bytes, so the shim keeps a host-side z_stream
 # per guest pointer and forwards inflate*/crc32 to libSystem zlib).

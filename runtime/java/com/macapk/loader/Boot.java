@@ -796,11 +796,94 @@ public final class Boot {
      *  is parsed, and the message omits the clause while it is, exactly as AOSP
      *  does when currentProcessName() is not available yet. */
     private static volatile String sProcessName;
+    private static volatile String sPackageName;
 
-    /** The app's package/process name once the manifest is parsed, else null.
-     *  Exposed for framework surfaces (e.g. SdkSandboxController) that report the
-     *  host client package. */
+    /** The name of THIS process once the manifest is parsed, else null: what
+     *  ActivityThread.currentProcessName() reports. The package name for the
+     *  package's default process; `<pkg>:background` (or a global name) for a
+     *  process the system broker spawned for components the manifest puts in
+     *  another android:process. NOT a package name -- use packageName() for that
+     *  (they differ in every non-default process). */
     public static String processName() { return sProcessName; }
+
+    /** The app's package name once the manifest is parsed, else null. Exposed for
+     *  framework surfaces (e.g. SdkSandboxController, Context.getAttributionSource)
+     *  that report the host client package. */
+    public static String packageName() { return sPackageName; }
+
+    /** The process name the system broker told this runtime it is
+     *  (MACAPK_PROCESS_NAME, set per spawned process by SystemServer.launch), when
+     *  the manifest really declares that process; otherwise the package's default
+     *  process. A name the manifest does not declare is a stale or wrong
+     *  environment, never a reason to run as a process the app has no components
+     *  in, so it is ignored (logged). Unset = the package's default process
+     *  (its application-level android:process if the broker's split is on, else
+     *  the package name), exactly the runtime's behaviour before processes were
+     *  split. */
+    static String chooseProcessName(Manifest manifest, String requested) {
+        // Without the broker's process split the runtime hosts every component
+        // in ONE process and reports the package name, as it always has.
+        String def = SystemClient.splitConfigured() ? manifest.defaultProcessName()
+                                                    : manifest.packageName;
+        if (requested == null || requested.isEmpty()) return def;
+        if (manifest.processNames().contains(requested)) return requested;
+        NativeLog.w(TAG, "MACAPK_PROCESS_NAME=" + requested + " is not a process "
+            + manifest.packageName + " declares " + manifest.processNames()
+            + "; running as " + def);
+        return def;
+    }
+
+    /** Hold, just before any of the app's code runs, until the system broker says
+     *  the system apps it boots (Play services, Services Framework) are up. Set by
+     *  the Google Play stub (MACAPK_AWAIT_SYSTEM_READY=<broker readiness file>) so
+     *  Play's own boot -- JVM, manifest, class loader, resources, window -- runs
+     *  ALONGSIDE the services' boot instead of after it; what Play sees is
+     *  unchanged (its providers and Application.onCreate start with the services
+     *  already attached, as when the stub waited before the exec). The file's first
+     *  line is the broker's pid, and a file whose broker is gone is not readiness.
+     *  A timeout (MACAPK_AWAIT_SYSTEM_READY_TIMEOUT_S, default 180) is a warning,
+     *  never fatal: binds into a service still wait for it to attach. */
+    private static void awaitSystemReady() {
+        String path = System.getenv("MACAPK_AWAIT_SYSTEM_READY");
+        if (path == null || path.isEmpty()) return;
+        long timeoutMs = 180_000L;
+        try {
+            String t = System.getenv("MACAPK_AWAIT_SYSTEM_READY_TIMEOUT_S");
+            if (t != null && !t.isEmpty()) timeoutMs = Long.parseLong(t.trim()) * 1000L;
+        } catch (NumberFormatException ignored) {
+            // keep the default
+        }
+        final long start = System.currentTimeMillis();
+        final long deadline = start + timeoutMs;
+        bootClock("waiting for the system broker's services");
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                java.util.List<String> lines = java.nio.file.Files.readAllLines(new File(path).toPath());
+                if (!lines.isEmpty()
+                        && ProcessHandle.of(Long.parseLong(lines.get(0).trim())).isPresent()) {
+                    String failed = lines.size() > 2 ? lines.get(2).trim() : "";
+                    if (failed.isEmpty()) {
+                        NativeLog.i(TAG, "system services ready (" + (lines.size() > 1 ? lines.get(1) : "")
+                            + ") after " + (System.currentTimeMillis() - start) + " ms");
+                    } else {
+                        NativeLog.w(TAG, "system services ready, but did not start: " + failed);
+                    }
+                    bootClock("system broker's services ready");
+                    return;
+                }
+            } catch (Throwable notYet) {
+                // no file yet, or one being written: look again
+            }
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        NativeLog.w(TAG, "system services not reported ready in " + (timeoutMs / 1000)
+            + " s; starting the app anyway (binds wait for them)");
+    }
 
     public static void run(String apkPath, String appJar, String appDir, String manifestPath) {
         bootClock("Boot.run entered");
@@ -1277,6 +1360,17 @@ public final class Boot {
             NativeLog.e(TAG, "NativeCocoa.init() failed");
             return;
         }
+        // Java reads of /proc/self/* see the shim's synthesized files, as
+        // native reads do (java.io.FileReader's macapkProcRemap hook; the
+        // java.base patch cannot name this class, so the hook is installed
+        // here). No-op if the patched FileReader is absent.
+        try {
+            java.lang.reflect.Field f = java.io.FileReader.class.getDeclaredField("macapkProcRemap");
+            f.setAccessible(true);
+            f.set(null, (java.util.function.UnaryOperator<String>) NativeCocoa::remapProcPath);
+        } catch (Throwable t) {
+            NativeLog.w(TAG, "Java /proc remap not installed: " + t);
+        }
 
         // ---- 1. Parse manifest ----
         Manifest manifest;
@@ -1290,16 +1384,28 @@ public final class Boot {
         // RELAUNCHES an activity needs that activity's android:configChanges,
         // and `manifest` is otherwise a local of run().
         sManifest = manifest;
+        // This package's app uid (per package when the broker is on; AppUids).
+        AppUids.setSelf(manifest.packageName, manifest.sharedUserId);
         bootClock("manifest parsed");
         noteGuestVulkan(manifest);
         if (manifest.launchableActivity == null) {
-            NativeLog.e(TAG, "no launchable activity in manifest");
-            return;
+            // A SERVICE HOST launches no activity (the broker started it to
+            // answer a bind), so a package with no launcher -- Google Play
+            // services, Services Framework, any service-only APK -- boots fine.
+            if (!SystemClient.isServiceHost()) {
+                NativeLog.e(TAG, "no launchable activity in manifest");
+                return;
+            }
+            NativeLog.i(TAG, "no launchable activity; booting as a service host");
         }
         // The default process name on Android is the package name; from here
         // on the uncaught reports can carry the "Process: <name>" clause that
         // RuntimeInit.logUncaught prints.
-        sProcessName = manifest.packageName;
+        sPackageName = manifest.packageName;
+        sProcessName = chooseProcessName(manifest, System.getenv("MACAPK_PROCESS_NAME"));
+        if (!sProcessName.equals(manifest.packageName)) {
+            NativeLog.i(TAG, "process name " + sProcessName + " (package " + manifest.packageName + ")");
+        }
 
         // Components the manifest puts in a DIFFERENT process than the app's
         // default one. AOSP resolves android:process by prefixing a leading
@@ -1320,11 +1426,12 @@ public final class Boot {
             java.util.Map<String, String> foreign = new java.util.HashMap<>();
             for (java.util.Map.Entry<String, String> e
                     : manifest.componentProcesses.entrySet()) {
-                String raw = e.getValue();
-                if (raw == null || raw.isEmpty()) continue;
-                String resolved = raw.charAt(0) == ':'
-                    ? manifest.packageName + raw : raw;
-                if (resolved.equals(manifest.packageName)) continue;
+                String resolved = manifest.resolveProcessName(e.getValue());
+                if (resolved == null) continue;
+                // Foreign = not THIS process's. For the default process that is
+                // what it always meant; in a spawned `:background` process a
+                // `:phoenix` component is foreign and a `:background` one is not.
+                if (resolved.equals(sProcessName)) continue;
                 foreign.put(e.getKey(), resolved);
             }
             ClassFileRewriter.setForeignProcessComponents(foreign);
@@ -1540,7 +1647,7 @@ public final class Boot {
         // Cocoa layer observes AppleInterfaceStyle change, the way a device
         // delivers a uiMode Configuration change instead of demanding a relaunch.
         boolean nightYes = macapkSystemIsDark();
-        cfg.uiMode = Configuration.UI_MODE_TYPE_NORMAL
+        cfg.uiMode = TvMode.uiModeType()
             | (nightYes ? Configuration.UI_MODE_NIGHT_YES : Configuration.UI_MODE_NIGHT_NO);
         System.setProperty("macapk.nightMode", nightYes ? "yes" : "no");
         sNightApplied = nightYes;
@@ -1556,7 +1663,9 @@ public final class Boot {
         // is that push (MACAPK_SYSTEM_RES_FOLLOW, gated inside Resources);
         // without it Resources.getSystem() answered 720x1280 forever and
         // Solitaire CG sized its cards for a 720px screen.
-        Resources.updateSystemConfiguration(cfg, metrics, null);
+        Configuration systemConfig = new Configuration(cfg);
+        systemConfig.setLocales(android.os.LocaleList.macapkGetSystemLocales());
+        Resources.updateSystemConfiguration(systemConfig, metrics, null);
         // Wire the resource index so openRawResource(id) works. Since
         // v1.0.1589/1590 the index reads the installed apk set in place
         // (every member's resources.arsc + its file rows); apkPath is what
@@ -1759,6 +1868,8 @@ public final class Boot {
         String dataSubdir = new File(appDir).getName();
         File persistentDataDir = new File(androidRoot,
                 "data/data/" + dataSubdir);
+        android.app.LocaleManager.macapkRestoreApplicationLocales(
+                manifest.packageName, persistentDataDir, resources);
         File filesDir = new File(persistentDataDir, "files"); filesDir.mkdirs();
         File cacheDir = new File(persistentDataDir, "cache"); cacheDir.mkdirs();
         NativeLog.i(TAG, "data dir: " + persistentDataDir.getAbsolutePath());
@@ -1889,6 +2000,27 @@ public final class Boot {
         // JDK TLS path -- see MacApkConscryptProvider for the rationale.
         android.security.MacApkConscryptProvider.install();
         NativeLog.i(TAG, "Conscrypt provider alias installed");
+        // The default TrustManagerFactory answers a bundled Conscrypt's TLS 1.3
+        // authType "GENERIC" the way Android's does (MacApkTrustProvider).
+        android.security.MacApkTrustProvider.install();
+
+        // Real Android's HttpsURLConnection.getDefaultHostnameVerifier() returns
+        // com.android.okhttp.internal.tls.OkHostnameVerifier.INSTANCE, which does
+        // real RFC 2818/6125 hostname matching. The host OpenJDK's default is
+        // HttpsURLConnection$DefaultHostnameVerifier, whose verify() returns FALSE
+        // unconditionally (the JDK does endpoint identification internally and only
+        // consults the default verifier as a never-approving fallback; measured on
+        // JDK 21.0.11). Any Android caller that verifies a raw SSLSocket by hand via
+        // getDefaultHostnameVerifier() therefore rejects every peer on us -- e.g.
+        // GMS's SSLCertSocketFactory (defpackage.fvbv) throws
+        // "Cannot verify hostname: android.googleapis.com" on its gRPC/DroidGuard
+        // TLS even after a correct BoringSSL handshake through GMS's own Conscrypt.
+        // Install the device-authentic verifier as the JVM default so that call
+        // answers the way a device answers. General (every process, every app),
+        // and detection-preserving (a genuinely mismatched cert still fails).
+        javax.net.ssl.HttpsURLConnection.setDefaultHostnameVerifier(
+                com.android.okhttp.internal.tls.OkHostnameVerifier.INSTANCE);
+        NativeLog.i(TAG, "default HostnameVerifier installed (OkHostnameVerifier)");
 
         // Real Android ships a BouncyCastle-derived "BC" security provider, so
         // BC-named algorithms resolve out of the box. The host OpenJDK does not
@@ -2458,7 +2590,11 @@ public final class Boot {
                 // com.google.android.c2dm.intent.RECEIVE intent to the app -- the
                 // exact path an app's own FirebaseInstanceIdReceiver consumes.
                 try {
-                    if (com.macapk.loader.PlayServices.pushBackendEnabled()) {
+                    // With the REAL Google Play services running (Settings > Use
+                    // Google GMS), it owns the push connection, as on a device;
+                    // Mac.apk's own MCS stand-in steps aside in every app.
+                    if (com.macapk.loader.PlayServices.pushBackendEnabled()
+                            && !SystemClient.enabled()) {
                         final android.app.Application fapp = application;
                         final com.macapk.gms.McsClient.Dispatcher deliver = (pkg, extras) -> {
                             try {
@@ -2504,6 +2640,11 @@ public final class Boot {
                 } catch (Throwable t) {
                     NativeLog.w(TAG, "FCM receive channel not started: " + t);
                 }
+                // Attach to the system broker before onCreate, where a device's
+                // ActivityThread.attach -> AMS.attachApplication sits, so binds
+                // into and out of this app work from onCreate on. No-op unless
+                // MACAPK_BROKER=1 (SystemClient).
+                SystemClient.attach(application, manifest.packageName);
                 try {
                     application.onCreate();
                 } catch (Throwable t) {
@@ -2533,6 +2674,7 @@ public final class Boot {
                 appInitLatch.countDown();
             }
         };
+        awaitSystemReady();
         bootClock("providers installed; Application init handed to the main thread");
         try {
             activityTask.put(appInitTask);
@@ -2587,8 +2729,10 @@ public final class Boot {
         // calls inside the activity (setContentView, etc.) hop to
         // main via dispatch_async in the bridge.
         final Intent intent = new Intent(Intent.ACTION_MAIN);
-        intent.addCategory(manifest.launchableCategory);
-        intent.setClassName(manifest.packageName, manifest.launchableActivity);
+        if (manifest.launchableCategory != null) intent.addCategory(manifest.launchableCategory);
+        if (manifest.launchableActivity != null) {
+            intent.setClassName(manifest.packageName, manifest.launchableActivity);
+        }
         // Generic diagnostic launch override (env-gated, OFF by default).
         // Mirrors `adb shell am start -n <pkg>/<activity> -e k v ...` so a
         // test harness can deterministically open a specific screen (e.g.
@@ -2765,7 +2909,15 @@ public final class Boot {
                     try { NativeLog.nativeBoostCurrentThreadQos(); } catch (Throwable ignored) {}
                 }
                 try {
-                    ActivityHost.start(rootIntent[0]);
+                    // A service host was started by the broker to answer another
+                    // app's bind: like a device's background process, it runs no
+                    // activity (MACAPK_SERVICE_HOST=1; the window stays hidden).
+                    if (SystemClient.isServiceHost()) {
+                        NativeLog.i(TAG, "service host: no launcher activity");
+                        ActivityHost.runMainLoopOnly();
+                    } else {
+                        ActivityHost.start(rootIntent[0]);
+                    }
                 } catch (Throwable t) {
                     NativeLog.e(TAG, "Activity thread failed: " + t);
                     t.printStackTrace();
@@ -3334,10 +3486,10 @@ public final class Boot {
         return built;
     }
 
-    /** DisplayConfig's entry: the rebuilt index, or null (logged) when there is
+    /** Configuration-change entry: the rebuilt index, or null (logged) when there is
      *  no APK yet or the build fails -- the caller then keeps the live one,
      *  which is the same choice the appearance flip makes. */
-    static ResourceIndex macapkNewResourceIndex(Configuration cfg) {
+    public static ResourceIndex macapkNewResourceIndex(Configuration cfg) {
         if (sApkPath == null || cfg == null) return null;
         synchronized (sNightLock) {
             try {
@@ -3431,12 +3583,16 @@ public final class Boot {
                     // thread). `next` was copied before that, so applying it as
                     // is would revert the new size. Take the display fields from
                     // the live configuration -- a flip changes uiMode only --
-                    // and rebuild if the index was selected for the old size.
+                    // and retain any locale selected while the worker ran.
+                    // Rebuild if the index was selected for an older size or locale.
                     ResourceIndex useIdx = idx;
-                    if (DisplayConfig.adoptDisplayFields(res.getConfiguration(), next)
-                            && idx.macapkSelectionChangesFor(next)) {
+                    Configuration live = res.getConfiguration();
+                    DisplayConfig.adoptDisplayFields(live, next);
+                    next.setLocales(live.getLocales());
+                    if (idx.macapkSelectionChangesFor(next)) {
                         ResourceIndex again = macapkNewResourceIndex(next);
-                        if (again != null) useIdx = again;
+                        if (again == null) return;
+                        useIdx = again;
                     }
                     Resources.macapkSetResourceIndex(useIdx);
                     // The Application and every Activity share ONE Resources
@@ -3711,7 +3867,27 @@ public final class Boot {
                 // protected-fleet apps. Flip MACAPK_PROVIDER_PROCESS_GATE=1 to
                 // measure it on its own, which is the only way its effect is
                 // attributable.
-                if (macapkProviderProcessGate()) {
+                //
+                // ... except in a split package (SystemClient.splitActive: the system
+                // broker runs each android:process as its own runtime), where this IS
+                // the AOSP behaviour and not a deviation: a provider is installed only
+                // by the process it is declared for, and every other process reaches it
+                // through the broker (ContentProviderRegistry -> SystemClient
+                // .remoteProvider -> GET_PROVIDER). Nothing is lost by skipping it here:
+                // its authority is served from the process that owns it.
+                if (SystemClient.splitActive() && sManifest != null && sProcessName != null) {
+                    // ComponentInfo.processName, not the foreign table: a provider
+                    // that names no android:process belongs to the APPLICATION's
+                    // process, which in a package with an application-level
+                    // android:process is not the one every other process runs.
+                    String owner = sManifest.processNameOf(entry.name);
+                    if (!owner.equals(sProcessName)) {
+                        NativeLog.i(TAG, "provider " + entry.name
+                                  + " skipped: it lives in process " + owner
+                                  + " (this is " + sProcessName + "; reached through the broker)");
+                        continue;
+                    }
+                } else if (macapkProviderProcessGate()) {
                     String proc = foreignProcessFor(entry.name);
                     if (proc != null) {
                         NativeLog.i(TAG, "provider " + entry.name
@@ -3731,8 +3907,11 @@ public final class Boot {
                     (android.content.ContentProvider) instance;
                 android.content.pm.ProviderInfo info =
                     new android.content.pm.ProviderInfo();
+                // The STRING a "@string/x" android:authorities names, as AOSP's
+                // parser hands it on (Manifest.ProviderEntry.resolvedAuthorities).
+                final String authorities = entry.resolvedAuthorities(application.getResources());
                 info.name        = entry.name;
-                info.authority   = entry.authorities;
+                info.authority   = authorities;
                 info.packageName = application.getPackageName();
                 info.initOrder   = entry.initOrder;
                 info.exported    = entry.exported;
@@ -3763,9 +3942,9 @@ public final class Boot {
                 // against a content:// URI actually dispatch to this
                 // provider. Manifest-driven (authorities come straight
                 // from android:authorities), so it is app-agnostic.
-                if (entry.authorities != null && !entry.authorities.isEmpty()) {
+                if (authorities != null && !authorities.isEmpty()) {
                     android.content.ContentProviderRegistry.register(
-                        entry.authorities, provider);
+                        authorities, provider);
                 }
             } catch (ClassNotFoundException cnf) {
                 // Many APKs declare optional providers (different
@@ -3833,6 +4012,26 @@ public final class Boot {
                 docs.attachInfo(application, dinfo);
                 docs.onCreate();
                 android.content.ContentProviderRegistry.register(dinfo.authority, docs);
+            }
+            // Google Services Framework's gservices settings, answered from
+            // the device's real checkin (see GservicesProvider's header). App
+            // providers are already installed, so a hosted package that serves
+            // the authority itself keeps it, and a real GSF in another process
+            // (the broker) is preferred over this stand-in.
+            if (PlayServices.gmsLayerEnabled()
+                    && android.content.ContentProviderRegistry.getLocal(
+                           com.macapk.gms.GservicesProvider.AUTHORITY) == null) {
+                com.macapk.gms.GservicesProvider gs = new com.macapk.gms.GservicesProvider();
+                android.content.pm.ProviderInfo ginfo = new android.content.pm.ProviderInfo();
+                ginfo.name        = com.macapk.gms.GservicesProvider.class.getName();
+                ginfo.authority   = com.macapk.gms.GservicesProvider.AUTHORITY;
+                ginfo.packageName = "com.google.android.gsf";
+                ginfo.exported    = true;
+                gs.attachInfo(application, ginfo);
+                gs.onCreate();
+                // A FALLBACK: when the real Google Services Framework runs in its
+                // own process (Settings > Use Google GMS), its provider answers.
+                android.content.ContentProviderRegistry.registerFallback(ginfo.authority, gs);
             }
         } catch (Throwable t) {
             NativeLog.w(TAG, "installSystemProviders failed: " + t + " -- continuing");
@@ -4025,7 +4224,7 @@ public final class Boot {
             cfg.screenHeightDp = 640;
             cfg.smallestScreenWidthDp = 360;
             cfg.orientation = Configuration.ORIENTATION_PORTRAIT;
-            cfg.uiMode = Configuration.UI_MODE_TYPE_NORMAL
+            cfg.uiMode = TvMode.uiModeType()
                 | (macapkSystemIsDark() ? Configuration.UI_MODE_NIGHT_YES : Configuration.UI_MODE_NIGHT_NO);
             Resources resources = new Resources(assets, metrics, cfg);
             ResourceIndex resIdx = new ResourceIndex(cfg, apkPath);

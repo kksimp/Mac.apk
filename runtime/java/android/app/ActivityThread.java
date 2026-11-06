@@ -42,6 +42,7 @@ public final class ActivityThread {
      *  package name (mPackages); a Mac.apk process runs exactly one app, so one
      *  field is the whole map. */
     private LoadedApk mBoundLoadedApk;
+    private String mBoundProcessName;
     private Application mInitialApplication;
 
     /** AOSP peekPackageInfo(String, boolean). Instrumentation.getFactory calls
@@ -85,12 +86,18 @@ public final class ActivityThread {
      *  order com.macapk.loader.Boot already implements. */
     private void handleBindApplication(AppBindData data) {
         mBoundLoadedApk = data.info;
+        mBoundProcessName = data.processName;
         // Pass null for the Instrumentation, exactly as AOSP :6959 does. The
         // parameter's only job in LoadedApk's body is to gate
         // callApplicationOnCreate; null keeps that block dead, so onCreate can
         // never double-run against Boot's own call.
         mInitialApplication = data.info.makeApplicationInner(
                 data.restrictedBackupMode, /*instrumentation=*/ null);
+        // Pin the process Application authoritatively. A GMS Chimera
+        // ModuleApplication the app constructs later must not displace it in
+        // Application.sInstance (it carries an empty, never-attached PM); see
+        // Application() for the failure that caused.
+        Application.macapkSetProcessApplication(mInitialApplication);
     }
 
     /** Mac.apk-namespaced entry point: com.macapk.loader.Boot calls this to bind
@@ -108,7 +115,10 @@ public final class ActivityThread {
         AppBindData data = new AppBindData();
         data.info = new LoadedApk(this, packageName, appClassName,
                                   appComponentFactoryName, cl);
-        data.processName = packageName;
+        // AOSP AppBindData.processName: the process being bound, which is the
+        // package name only in the package's default process (Boot publishes it).
+        String proc = com.macapk.loader.Boot.processName();
+        data.processName = proc != null ? proc : packageName;
         data.restrictedBackupMode = false;
         handleBindApplication(data);
         return mInitialApplication;
@@ -132,11 +142,33 @@ public final class ActivityThread {
      *  Returned via a separate static method, NOT via getApplication
      *  (some SDKs call this without a Context). */
     public static String currentPackageName() {
+        LoadedApk bound = INSTANCE.mBoundLoadedApk;
+        if (bound != null) return bound.getPackageName();
+        // Boot's default constructor path has no LoadedApk bind, but publishes
+        // this manifest identity before loading any Application subclass.
+        String bootPackage = com.macapk.loader.Boot.packageName();
+        if (bootPackage != null) return bootPackage;
         Application app = Application.macapk_get();
         return app != null ? app.getPackageName() : "";
     }
     public static String currentProcessName() {
-        return currentPackageName();
+        // The process this runtime IS, as AOSP's ActivityThread reports it
+        // (mBoundApplication.processName): the package name for a package's
+        // default process, `<pkg>:background` (or a global name) for a process the
+        // system broker spawned for components the manifest declares in another
+        // android:process. Finsky's install machinery (InstallQueuePhoneskyJob, the
+        // InstallerV2 jobs, the AtomicInstall receiver) is declared
+        // android:process=":background" and gates on
+        //   bore.ae() == bgsx.b(bgsy.rb()).equals(BACKGROUND)
+        // where bgsy.rb() reflects THIS method -- it is true only in the process
+        // that really is `com.android.vending:background`. That process now exists
+        // (com.macapk.loader.SystemServer spawns one runtime per android:process
+        // and tells it its name), so the answer is simply true there and false in
+        // the main process, with no override.
+        String bound = INSTANCE.mBoundProcessName;
+        if (bound != null) return bound;
+        String bootProcess = com.macapk.loader.Boot.processName();
+        return bootProcess != null ? bootProcess : currentPackageName();
     }
 
     /** Returns the per-process Application. Equivalent to
@@ -155,8 +187,7 @@ public final class ActivityThread {
      *  (X.1do.A00 -> X.3Dm.A04 -> InstagramAppShell.onCreate) calls it via
      *  currentActivityThread().getProcessName(); without it the call is a
      *  NoSuchMethodError that aborts onCreate and leaves the app's DI half-set.
-     *  We have no multi-process model, so the process name is the package name
-     *  (== currentProcessName()). */
+     *  Same answer as currentProcessName(): the process this runtime is. */
     public String getProcessName() {
         return currentProcessName();
     }

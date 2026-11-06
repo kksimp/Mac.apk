@@ -336,6 +336,14 @@ public final class ClassFileRewriter {
                 hits += patternFNeutralizeRunFinalizersOnExit(cf, code, className);
             }
 
+            // ---- Pattern J -- Jato's ART-field probe (JNIHook.nativeInit) ----
+            // See patternJNeutralizeJatoNativeInit for the full write-up.
+            for (MethodEntry m : cf.methods) {
+                CodeAttr code = m.code;
+                if (code == null) continue;
+                hits += patternJNeutralizeJatoNativeInit(cf, code, className);
+            }
+
             // ---- Pattern H -- contain a FOREIGN-PROCESS component's exit ----
             // A component declared `android:process=":something"` runs, on
             // real Android, in a SEPARATE OS process. Mac.apk hosts every
@@ -566,6 +574,10 @@ public final class ClassFileRewriter {
         "java/lang/Object".getBytes(java.nio.charset.StandardCharsets.UTF_8);
     private static final byte[] NEEDLE_RUN_FINALIZERS_ON_EXIT =
         "runFinalizersOnExit".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    // Pattern J: the Jato library owner prefix; a class that calls into it
+    // carries this exact UTF8 constant. The method-name test is done in the parse.
+    private static final byte[] NEEDLE_JATO_PKG =
+        "com/bytedance/common/jato/".getBytes(java.nio.charset.StandardCharsets.UTF_8);
     // Patterns A/B only ever inspect <clinit> (see the `!"<clinit>".
     // equals(name)` guard in the loop above that calls
     // scanAndRewriteClinit). A class without a <clinit> method
@@ -610,6 +622,10 @@ public final class ClassFileRewriter {
             }
             if (containsNeedle(raw, NEEDLE_RUN_FINALIZERS_ON_EXIT)
                 || containsNeedle(raw, FROM_BYTES_G)) {
+                return true;
+            }
+            // Pattern J (Jato nativeInit): a class that names the Jato package.
+            if (containsNeedle(raw, NEEDLE_JATO_PKG)) {
                 return true;
             }
             // Pattern L: a getDeclaredField call AND a libcore field name
@@ -1157,6 +1173,87 @@ public final class ClassFileRewriter {
         if (ntIdx < 0) return false;
         return "runFinalizersOnExit".equals(cf.utf8(cf.nameAndTypeName(ntIdx)))
             && "(Z)V".equals(cf.utf8(cf.nameAndTypeDescriptor(ntIdx)));
+    }
+
+    // -----------------------------------------------------------------
+    // Pattern J -- neutralize ByteDance Jato's ART-internals probe
+    // -----------------------------------------------------------------
+    //
+    // THE BUG (found on Red Fruit com.phoenix.read 7.2.5.32, issue #111).
+    // com.bytedance.common.jato.util.JNIHook.<clinit> calls the private
+    // native JNIHook.nativeInit(Method, int), whose native body does a JNI
+    // GetFieldID(java.lang.reflect.Executable, "artMethod", "J"). That field
+    // exists in ART's Executable and not in HotSpot's, so our JNI layer
+    // throws NoSuchFieldError -- an Error, not an Exception. The app's
+    // lego InitTaskDispatcher.m only catches Exception around a task's run(),
+    // so QualityP1Task (which calls JatoXL.init) is left "started, never
+    // completed", Application.onCreate is aborted, and SplashActivity.onCreate
+    // then spins forever in InitTaskDispatcher.t waiting for the dependency
+    // chain QualityP1Task -> APP_SUPER2ONCREATEEND_END -> SPLASH_*.
+    //
+    // WHY THIS IS NOT FIXED IN THE RIGHT LAYER. The right layer would give
+    // java.lang.reflect.Executable an ART-shaped long field `artMethod`
+    // (and then also back it with something Jato's hook engine could use).
+    // Executable is a java.base bootstrap class: it cannot be shadowed or
+    // given a field by us, and faking the field at the JNI GetFieldID layer
+    // would hand Jato's native hook engine a bogus ArtMethod pointer, which
+    // is worse than not initialising it. Jato is a startup/perf booster
+    // (cpuset, JIT block, log cut, render-thread boost); the app does not
+    // depend on its hooks for correctness.
+    //
+    // THE PATCH. Keyed on the LIBRARY (owner class under
+    // com/bytedance/common/jato/, method nativeInit, descriptor
+    // (Ljava/lang/reflect/Method;I)V), NOT on any app package: replace the
+    // 3-byte `invokestatic` in place with `pop; pop; nop` (same length, same
+    // net stack effect -- two category-1 values consumed, nothing pushed -- so
+    // no PC / StackMapTable shift and valid even under full verification).
+    // JNIHook's other natives are untouched; with the hook engine never
+    // initialised they stay inert.
+    //
+    // REMOVAL CONDITION: retire this when either (a) Executable's ART fields
+    // are provided in the right layer such that Jato's nativeInit completes
+    // and its hooks are safe, or (b) JNI GetFieldID for ART-only fields
+    // yields a failure the guest can catch (an Exception), at which point
+    // this library no longer takes the app's init scheduler down.
+
+    /** Scan one method for `invokestatic com/bytedance/common/jato/.../X.
+     *  nativeInit:(Ljava/lang/reflect/Method;I)V` and replace each with
+     *  pop; pop; nop. Returns the number of call sites neutralized. */
+    private static int patternJNeutralizeJatoNativeInit(
+            ClassFile cf, CodeAttr code, String className) {
+        int repairs = 0;
+        byte[] bc = code.code;
+        int codeEnd = code.codeOffset + code.codeLen;
+        int pc = code.codeOffset;
+        while (pc < codeEnd) {
+            int op = bc[pc] & 0xFF;
+            int len = instructionLength(op, bc, pc);
+            if (len <= 0) break;
+            if (op == OP_INVOKESTATIC && isJatoNativeInit(cf, u2(bc, pc + 1))) {
+                bc[pc]     = (byte) OP_POP;
+                bc[pc + 1] = (byte) OP_POP;
+                bc[pc + 2] = (byte) OP_NOP;
+                if (DEBUG) {
+                    System.err.println("[rewriter] " + className
+                        + ": Pattern-J pc=" + pc
+                        + " neutralized invokestatic Jato nativeInit(Method,int)V");
+                }
+                repairs++;
+            }
+            pc += len;
+        }
+        return repairs;
+    }
+
+    private static boolean isJatoNativeInit(ClassFile cf, int methodrefIdx) {
+        int classIdx = cf.methodrefClass(methodrefIdx);
+        if (classIdx < 0) return false;
+        String owner = cf.classNameOf(classIdx);
+        if (owner == null || !owner.startsWith("com/bytedance/common/jato/")) return false;
+        int ntIdx = cf.methodrefNameAndType(methodrefIdx);
+        if (ntIdx < 0) return false;
+        return "nativeInit".equals(cf.utf8(cf.nameAndTypeName(ntIdx)))
+            && "(Ljava/lang/reflect/Method;I)V".equals(cf.utf8(cf.nameAndTypeDescriptor(ntIdx)));
     }
 
     // -----------------------------------------------------------------

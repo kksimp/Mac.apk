@@ -5,11 +5,11 @@
 [![Latest release](https://img.shields.io/github/v/release/kksimp/Mac.apk?label=latest&color=6c5ce7)](../../releases/latest)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE) [![Commercial license available](https://img.shields.io/badge/commercial%20license-available-blue)](COMMERCIAL.md)
 [![Signed and notarized](https://img.shields.io/badge/signed-notarized%20by%20Apple-000000)](https://github.com/kksimp/Mac.apk/wiki/Installation)
-[![Sponsor](https://img.shields.io/badge/sponsor-kksimp-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/kksimp) [![pump.fun](https://img.shields.io/badge/pump.fun-Mac.apk%20coin-00d18c)](https://pump.fun/coin/2EzKeRpRvJGx6hC2s2B87fNcx7DWghLscdvXw4jjpump)
+[![Sponsor](https://img.shields.io/badge/sponsor-kksimp-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/kksimp)
 
 ### 📱 [Which apps work? See the compatibility list →](COMPATIBILITY.md)
 
-[![Apps tested: 71](https://img.shields.io/badge/apps%20tested-71-6c5ce7)](COMPATIBILITY.md) [![Fully playable: 58](https://img.shields.io/badge/fully%20playable-58-2ea44f)](COMPATIBILITY.md) [![Partly works: 10](https://img.shields.io/badge/partly%20works-10-dfb317)](COMPATIBILITY.md) [![Not yet: 3](https://img.shields.io/badge/not%20yet-3-e05d44)](COMPATIBILITY.md)
+[![Apps tested: 76](https://img.shields.io/badge/apps%20tested-76-6c5ce7)](COMPATIBILITY.md) [![Fully playable: 62](https://img.shields.io/badge/fully%20playable-62-2ea44f)](COMPATIBILITY.md) [![Partly works: 9](https://img.shields.io/badge/partly%20works-9-dfb317)](COMPATIBILITY.md) [![Not yet: 5](https://img.shields.io/badge/not%20yet-5-e05d44)](COMPATIBILITY.md)
 
 ---
 
@@ -39,7 +39,7 @@ on top of macOS directly. [How it works →](https://github.com/kksimp/Mac.apk/w
 |---|---|
 | **Getting started** | [Installation](https://github.com/kksimp/Mac.apk/wiki/Installation) |
 | **Installing apps** | [Installing apps](https://github.com/kksimp/Mac.apk/wiki/Installing-Apps) · [App stores](https://github.com/kksimp/Mac.apk/wiki/App-Stores) · [How apps are installed](https://github.com/kksimp/Mac.apk/wiki/How-Apps-Are-Installed) · [Managing apps](https://github.com/kksimp/Mac.apk/wiki/Managing-Apps) |
-| **Using apps** | [Controls and input](https://github.com/kksimp/Mac.apk/wiki/Controls-and-Input) · [Windows and appearance](https://github.com/kksimp/Mac.apk/wiki/Windows-and-Appearance) · [Files and privacy](https://github.com/kksimp/Mac.apk/wiki/Files-and-Privacy) · [Google accounts and Play Services](https://github.com/kksimp/Mac.apk/wiki/Google-Accounts-and-Play-Services) |
+| **Using apps** | [Controls and input](https://github.com/kksimp/Mac.apk/wiki/Controls-and-Input) · [Windows and appearance](https://github.com/kksimp/Mac.apk/wiki/Windows-and-Appearance) · [Files and privacy](https://github.com/kksimp/Mac.apk/wiki/Files-and-Privacy) · [Google accounts and Play Services](https://github.com/kksimp/Mac.apk/wiki/Google-Accounts-and-Play-Services) · [Google Play Store](https://github.com/kksimp/Mac.apk/wiki/Google-Play-Store) |
 | **Flags and advanced settings** | [Flags](https://github.com/kksimp/Mac.apk/wiki/Flags) · [Flags reference](https://github.com/kksimp/Mac.apk/wiki/Flags-Reference) · [Developer menu](https://github.com/kksimp/Mac.apk/wiki/Developer-Menu) |
 | **Help** | [Known issues](https://github.com/kksimp/Mac.apk/wiki/Known-Issues) · [Troubleshooting](https://github.com/kksimp/Mac.apk/wiki/Troubleshooting) · [Reporting problems](https://github.com/kksimp/Mac.apk/wiki/Reporting-Problems) |
 | **About Mac.apk** | [How Mac.apk works](https://github.com/kksimp/Mac.apk/wiki/How-Mac.apk-Works) · [Design decisions](https://github.com/kksimp/Mac.apk/wiki/Design-Decisions) · [For developers and publishers](https://github.com/kksimp/Mac.apk/wiki/For-Developers-and-Publishers) |
@@ -76,10 +76,14 @@ stores are in the [Installation](https://github.com/kksimp/Mac.apk/wiki/Installa
 > in the Mac.apk window cleans it up and can keep your saves for a reinstall.
 > [More →](https://github.com/kksimp/Mac.apk/wiki/Managing-Apps)
 
-## Known issues in v1.0.2303
+## Known issues in v1.0.2379
 
 See [Known issues](https://github.com/kksimp/Mac.apk/wiki/Known-Issues) for this release, and the
 [compatibility list](COMPATIBILITY.md) for every app tested by hand.
+
+## Contributors
+
+Mac.apk has had a lot of help from people outside the project: @5566brs, @defia, @chuenlok, @Mistarille224, @m9rco, @wishbone305, @kushu7, @YuKongA, @hlwhl, @lxy2500798479 and @blueagler. Thank you. See [CONTRIBUTORS.md](CONTRIBUTORS.md) for who did what, and [CONTRIBUTING.md](CONTRIBUTING.md) if you would like to join in.
 
 ## Reporting problems
 
@@ -101,23 +105,6 @@ as code.
 Mac.apk serves no ads and supports no in-app purchases, by design. If you publish an
 app that runs on Mac.apk and want to talk about a partnership, or would rather it
 not run here, email Kaleb@voltare.us. [Details →](https://github.com/kksimp/Mac.apk/wiki/For-Developers-and-Publishers)
-
-## Mac.apk coin
-
-Mac.apk has a coin on [pump.fun](https://pump.fun/coin/2EzKeRpRvJGx6hC2s2B87fNcx7DWghLscdvXw4jjpump).
-It is optional. You do not need it to use Mac.apk, it unlocks nothing in the app, and
-it does not change the [license](#license) or give any rights to the code.
-
-Contract address (Solana):
-
-```
-2EzKeRpRvJGx6hC2s2B87fNcx7DWghLscdvXw4jjpump
-```
-
-[pump.fun](https://pump.fun/coin/2EzKeRpRvJGx6hC2s2B87fNcx7DWghLscdvXw4jjpump) · [Solscan](https://solscan.io/token/2EzKeRpRvJGx6hC2s2B87fNcx7DWghLscdvXw4jjpump)
-
-Always check the address above against this repository before you trade anything.
-This is not financial advice.
 
 ## License
 
@@ -159,6 +146,5 @@ build recipe) is attached to that release on the
 
 - **Project page:** https://projects.voltare.us/macapk
 - **Wiki:** https://github.com/kksimp/Mac.apk/wiki
-- **Coin:** https://pump.fun/coin/2EzKeRpRvJGx6hC2s2B87fNcx7DWghLscdvXw4jjpump
 - **Commercial licensing:** Kaleb@voltare.us
 - **Bug reports:** Kaleb@voltare.us or [open an issue](../../issues/new)

@@ -33,6 +33,26 @@ public final class MacApkNativeLoad {
 
     public static void runtimeLoad(Runtime r, String path) { loadFrom(callerLoader(), path); }
 
+    /**
+     * The ClassLoader of the guest class whose {@code System.load} is running on
+     * THIS thread, or null outside a load. Set by {@link #loadFrom} around the
+     * real load and read by the native FindClass guard.
+     *
+     * WHY. A guest class may be defined by a CHILD ClassLoader (an app-embedded
+     * dex loaded by a custom loader), not by ActivityHost's main app loader.
+     * AppClassLoader loads the native against an AppClassLoader, so HotSpot's
+     * NativeLibraries.getFromClass() names that loader, not the one the guest's
+     * class came from -- and a JNI_OnLoad FindClass for the guest's own class
+     * then misses. Android resolves it through the loader that loaded the
+     * library, which is this one.
+     */
+    public static ClassLoader currentJniOnLoadContext() {
+        return JNI_ONLOAD_CONTEXT.get();
+    }
+
+    private static final ThreadLocal<ClassLoader> JNI_ONLOAD_CONTEXT =
+        new ThreadLocal<>();
+
     private static ClassLoader callerLoader() {
         // The converter re-points the call site, so the frame above this one is
         // the guest's own.
@@ -44,15 +64,21 @@ public final class MacApkNativeLoad {
     }
 
     private static void loadFrom(ClassLoader cl, String path) {
-        if (cl instanceof AppClassLoader) {
-            ((AppClassLoader) cl).macapkLoadNative(path);
-            return;
+        ClassLoader prev = JNI_ONLOAD_CONTEXT.get();
+        JNI_ONLOAD_CONTEXT.set(cl);
+        try {
+            if (cl instanceof AppClassLoader) {
+                ((AppClassLoader) cl).macapkLoadNative(path);
+                return;
+            }
+            ClassLoader app = ActivityHost.macapkAppClassLoader();
+            if (app instanceof AppClassLoader) {
+                ((AppClassLoader) app).macapkLoadNative(path);
+                return;
+            }
+            System.load(path);
+        } finally {
+            JNI_ONLOAD_CONTEXT.set(prev);
         }
-        ClassLoader app = ActivityHost.macapkAppClassLoader();
-        if (app instanceof AppClassLoader) {
-            ((AppClassLoader) app).macapkLoadNative(path);
-            return;
-        }
-        System.load(path);
     }
 }

@@ -61,7 +61,12 @@ public class DexClassLoader extends BaseDexClassLoader {
                     // Plain bytecode jar: load as-is.
                     urls.add(f.toURI().toURL());
                 } else {
-                    urls.add(MacApkDexConverter.convertFileToJarUrl(f));
+                    URL code = MacApkDexConverter.convertFileToJarUrl(f);
+                    // ART's element keeps the original archive for resources.
+                    // Integrity manifests and marker resources must still name
+                    // that archive, not the generated class-file cache.
+                    urls.add(f.toURI().toURL());
+                    urls.add(code);
                 }
             } catch (Exception skip) {
                 // leave unusable; findClass will throw for its classes

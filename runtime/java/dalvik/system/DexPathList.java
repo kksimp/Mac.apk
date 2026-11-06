@@ -2,6 +2,7 @@ package dalvik.system;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.JarURLConnection;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.ByteBuffer;
@@ -9,6 +10,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Enumeration;
 import java.util.List;
+import java.util.function.Function;
+import java.util.jar.JarFile;
 import java.util.zip.ZipFile;
 
 /** Android's reflective dex-element surface, backed by converted JVM code.
@@ -92,6 +95,10 @@ public final class DexPathList {
         private int memoryIndex;
         private java.util.Set<String> memoryNames = Collections.emptySet();
         private volatile URLClassLoader resources;
+        // Open before ephemeral paths are unlinked; class reads must use these
+        // handles rather than JarURLConnection reopening a deleted pathname.
+        private final java.util.Map<String, JarFile> classJars = new java.util.HashMap<>();
+        private Function<String, byte[]> dexSource;
         private volatile boolean closed;
         Element(File path) throws IOException { this(path, new URL[]{path.toURI().toURL()}); }
         Element(File path, URL[] urls) { this.path = path; this.urls = urls; }
@@ -117,7 +124,19 @@ public final class DexPathList {
         }
         private URLClassLoader resources() {
             if (resources == null) synchronized (this) {
-                if (resources == null) resources = new URLClassLoader(urls, null);
+                if (resources == null) {
+                    for (URL url : urls) {
+                        if (!"file".equals(url.getProtocol()) || classJars.containsKey(url.toExternalForm())) continue;
+                        try {
+                            File file = new File(url.toURI());
+                            if (file.isFile()) classJars.put(url.toExternalForm(),
+                                new JarFile(file, true, ZipFile.OPEN_READ, JarFile.runtimeVersion()));
+                        } catch (IOException | java.net.URISyntaxException | IllegalArgumentException ignored) {
+                            // URLClassLoader also skips missing/non-archive code paths.
+                        }
+                    }
+                    resources = new URLClassLoader(urls, null);
+                }
             }
             return resources;
         }
@@ -127,20 +146,40 @@ public final class DexPathList {
         Enumeration<URL> findResources(String name) throws IOException {
             return closed || memoryGroup != null ? Collections.emptyEnumeration() : resources().findResources(name);
         }
-        byte[] findClassBytes(String name) throws IOException {
+        synchronized byte[] findClassBytes(String name) throws IOException {
             if (closed) return null;
             if (memoryGroup != null) {
                 return name.endsWith(".class") ? memoryClassBytes(name.substring(0, name.length() - 6)) : null;
             }
             URL resource = findResource(name);
-            if (resource == null) return null;
-            try (var in = resource.openStream()) { return in.readAllBytes(); }
+            if (resource != null) {
+                if ("jar".equals(resource.getProtocol())) {
+                    JarURLConnection connection = (JarURLConnection) resource.openConnection();
+                    JarFile jar = classJars.get(connection.getJarFileURL().toExternalForm());
+                    if (jar != null) {
+                        var entry = jar.getJarEntry(connection.getEntryName());
+                        if (entry != null) try (var in = jar.getInputStream(entry)) { return in.readAllBytes(); }
+                    }
+                }
+                try (var in = resource.openStream()) { return in.readAllBytes(); }
+            }
+            return dexSource != null && name.endsWith(".class")
+                ? dexSource.apply(name.substring(0, name.length() - 6)) : null;
         }
         synchronized void close() throws IOException {
             closed = true;
             memoryGroup = null;
             memoryNames = Collections.emptySet();
-            if (resources != null) resources.close();
+            dexSource = null;
+            IOException failure = null;
+            try { if (resources != null) resources.close(); }
+            catch (IOException ex) { failure = ex; }
+            for (JarFile jar : classJars.values()) {
+                try { jar.close(); }
+                catch (IOException ex) { if (failure == null) failure = ex; else failure.addSuppressed(ex); }
+            }
+            classJars.clear();
+            if (failure != null) throw failure;
         }
         @Override public String toString() {
             return path == null && urls.length == 0 ? "in-memory dex file" : "dex file \"" + (path == null ? urls[0] : path) + "\"";
@@ -210,10 +249,10 @@ public final class DexPathList {
         for (int i = 0; i < current.length; i++) if (current[i] != initial[i]) return true;
         return false;
     }
-    /** Bind the original APK resources to the initial converted-code element.
-     * They then follow that element's position/removal rather than a global
+    /** Bind original APK resources and on-demand code to the initial element.
+     * Both follow that element's position/removal rather than a global
      * fallback that can bypass a reflective path replacement. */
-    synchronized void addInitialResources(URL[] resources) {
+    synchronized void addInitialResources(URL[] resources, Function<String, byte[]> dexSource) {
         if(resources.length==0)return;
         if(changed())throw new IllegalStateException("Initial resources must precede path mutation");
         java.util.LinkedHashSet<URL> combined=new java.util.LinkedHashSet<>();
@@ -222,6 +261,7 @@ public final class DexPathList {
         java.util.Collections.addAll(combined,resources);
         Element[] next=dexElements.length==0?new Element[1]:dexElements.clone();
         next[0]=new Element(first==null?null:first.path,combined.toArray(new URL[0]));
+        next[0].dexSource=dexSource;
         dexElements=next;
         initial=next.clone();
     }

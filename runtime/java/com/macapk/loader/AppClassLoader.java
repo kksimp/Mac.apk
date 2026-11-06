@@ -170,6 +170,7 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
                           File translatorBin, String apkPath) {
         super(urls, parent);
         UnverifiedClasses.init(urls);
+        this.initialCodeUrls = urls.clone();
         this.stubLibraryPath = stubLibraryPath;
         this.appDir          = appDir;
         this.translatorBin   = translatorBin;
@@ -177,12 +178,15 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         this.apkFile         = apkSet.isEmpty() ? null : apkSet.get(0);
         this.apkZips         = new java.util.zip.ZipFile[apkSet.size()];
         this.apkZipFailed    = new boolean[apkSet.size()];
-        // APK resources belong to the original dex element, so reflective
-        // replacement/reordering applies to their lookup as well.
+        // APK resources and on-demand code belong to the original element,
+        // so reflective append/prepend/removal applies to both lookups.
         try {
             URL[] resources = new URL[apkSet.size()];
             for (int i = 0; i < resources.length; i++) resources[i] = apkSet.get(i).toURI().toURL();
-            macapkAddInitialResources(resources);
+            macapkAddInitialResources(resources, name -> {
+                dalvik.system.LazyDexSource source = lazySource();
+                return source == null ? null : source.classBytes(name);
+            });
         } catch (java.net.MalformedURLException impossible) {
             throw new IllegalArgumentException("Invalid APK resource path", impossible);
         }
@@ -676,6 +680,8 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
     // python process we would not use is pure cost.
     private volatile dalvik.system.LazyDexSource lazyDex;
     private volatile boolean lazyDexTried;
+    /** Code paths belonging to the original APK, before any addDexPath calls. */
+    private final URL[] initialCodeUrls;
 
     private dalvik.system.LazyDexSource lazySource() {
         if (lazyDexTried) return lazyDex;
@@ -714,13 +720,12 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         }
     }
 
-    /** True when this loader's classpath carries a classes.jar that actually
-     *  exists on disk. Asked of the URLs rather than of a guessed path,
-     *  because the loader's classpath IS the definition of where eager classes
-     *  come from and nothing else has to stay in sync with it. */
+    /** True when an original code URL carries an eager jar that exists on
+     *  disk. A later addDexPath jar belongs to a different element and cannot
+     *  disable the original APK's on-demand code. */
     private boolean hasEagerClassesJar() {
         try {
-            for (URL u : getURLs()) {
+            for (URL u : initialCodeUrls) {
                 if (u == null || !"file".equals(u.getProtocol())) continue;
                 String p = u.getPath();
                 if (p == null || !p.endsWith(".jar")) continue;
@@ -842,6 +847,8 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         // eager behaviour is byte-for-byte unchanged. Bytes still go through
         // ClassFileRewriter -- the interception point is the same one the
         // eager path uses, so a rewrite fix applies to both.
+        // A mutated path already consulted lazy code at its owning element's
+        // position. Do not retry it globally after that element was removed.
         dalvik.system.LazyDexSource lazy = macapkDexPathChanged() ? null : lazySource();
         if (lazy != null) {
             byte[] raw = remapRewrite(lazy.classBytes(srcDotted.replace('.', '/')));

@@ -171,8 +171,9 @@ public class BaseDexClassLoader extends URLClassLoader {
         return pathList.findClassBytes(resourcePath);
     }
 
-    protected final void macapkAddInitialResources(URL[] resources) {
-        pathList.addInitialResources(resources);
+    protected final void macapkAddInitialResources(URL[] resources,
+            java.util.function.Function<String, byte[]> dexSource) {
+        pathList.addInitialResources(resources, dexSource);
     }
 
     @Override public URL findResource(String name) {

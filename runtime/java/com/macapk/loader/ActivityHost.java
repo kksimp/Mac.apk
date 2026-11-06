@@ -2783,7 +2783,12 @@ public final class ActivityHost {
         if (intent.hasFileDescriptors()) {
             throw new IllegalArgumentException("File descriptors passed in Intent");
         }
-        final String own = app != null ? app.getPackageName() : null;
+        // Routing identity belongs to the installed process, not a virtual
+        // Application getter (protected-app wrappers may return an empty or
+        // different package). Boot records the parsed manifest before init.
+        final String installedPackage = Boot.packageName();
+        final String own = installedPackage != null && !installedPackage.isEmpty()
+                ? installedPackage : app != null ? app.getPackageName() : null;
         final ComponentName cn = intent.getComponent();
         if (cn != null) {
             final String pkg = cn.getPackageName();

@@ -92,8 +92,43 @@ public class BaseDexClassLoader extends URLClassLoader {
             Class<?> a = bootClasspathArray(bn);
             if (a != null) return a;
         }
-        return super.loadClass(bn, resolve);
+        ClassLoader parent = getParent();
+        if (!UNLOCKED_DELEGATION || parent == null) return super.loadClass(bn, resolve);
+        // libcore's ClassLoader.loadClass, which takes no lock: the loaded
+        // check, then the parent, then findClass. HotSpot's version holds
+        // getClassLoadingLock(name) across the parent call, and since this
+        // loader is parallel-capable that lock is per class name. An app that
+        // puts its own loader above this one, whose findClass calls back into
+        // ours, then deadlocks: one thread holds class Y's lock and waits for
+        // the plugin loader's monitor, while the thread inside that monitor
+        // defines a subclass of Y and waits for Y's lock. ByteDance's Mira
+        // (MiraClassLoader) does this; Tomato Novel deadlocked between "main"
+        // and PushThreadHandler in Application.onCreate. ART cannot deadlock
+        // this way, and neither did this loader when it locked itself as a
+        // whole. Two threads that both reach findClass for one name race to
+        // define it, and the loser gets the winner's class (findClass here and
+        // in AppClassLoader), as on ART. A loader class that is not registered
+        // as parallel-capable (DexClassLoader, InMemoryDexClassLoader, an app's
+        // own subclass) is still locked as a whole by HotSpot itself in
+        // defineClass and in JVM-initiated loads; this does not change that.
+        Class<?> c = findLoadedClass(bn);
+        if (c == null) {
+            try {
+                c = parent.loadClass(bn);
+            } catch (ClassNotFoundException notInParent) {
+                // Not the parent's: define it from this loader's path below.
+            }
+            if (c == null) c = findClass(bn);
+        }
+        if (resolve) resolveClass(c);
+        return c;
     }
+
+    /** MACAPK_UNLOCKED_DELEGATION (default ON; =0 restores HotSpot's
+     *  ClassLoader.loadClass, which holds the per-name lock while it asks the
+     *  parent). */
+    static final boolean UNLOCKED_DELEGATION =
+        !"0".equals(System.getenv("MACAPK_UNLOCKED_DELEGATION"));
 
     /** MACAPK_BOOT_ARRAY_LOADCLASS (default ON; =0 restores the old HotSpot answer, a
      *  ClassNotFoundException for EVERY array name). */
@@ -156,7 +191,17 @@ public class BaseDexClassLoader extends URLClassLoader {
 
     @Override
     protected Class<?> findClass(String name) throws ClassNotFoundException {
-        return super.findClass(binaryName(name));
+        String bn = binaryName(name);
+        try {
+            return super.findClass(bn);
+        } catch (LinkageError le) {
+            // Another thread defined the class first ("attempted duplicate
+            // class definition"; loadClass no longer serializes the two).
+            // ART's DefineClass returns the class that thread inserted.
+            Class<?> winner = findLoadedClass(bn);
+            if (winner != null) return winner;
+            throw le;
+        }
     }
 
     /** DexFile.loadClass(name, loader) entry point: define {@code binaryName}
@@ -169,10 +214,17 @@ public class BaseDexClassLoader extends URLClassLoader {
      *  as is (ART's DefineClass returns the class another thread inserted first).
      *  Package-private: only dalvik.system.DexFile reaches it. */
     final Class<?> defineClassFromDexFile(String binaryName, byte[] bytes) {
-        synchronized (getClassLoadingLock(binaryName)) {
-            Class<?> c = findLoadedClass(binaryName);
-            if (c != null) return c;
+        // No per-class lock, for the reason loadClass gives: defining resolves
+        // supertypes through the parent. A thread that loses the define race
+        // gets the winner's class.
+        Class<?> c = findLoadedClass(binaryName);
+        if (c != null) return c;
+        try {
             return macapkDefineDexFileClass(binaryName, bytes);
+        } catch (LinkageError le) {
+            Class<?> winner = findLoadedClass(binaryName);
+            if (winner != null) return winner;
+            throw le;
         }
     }
 

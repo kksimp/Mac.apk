@@ -1353,6 +1353,18 @@ public final class Boot {
         System.setProperty("java.vm.vendor", "The Android Project");
         System.setProperty("java.vm.specification.vendor", "The Android Project");
         System.setProperty("java.vm.specification.name", "Dalvik Virtual Machine Specification");
+        // java.vm.version is the exception to leaving versions at the host's:
+        // the JDK does not parse it, and apps do. androidx MultiDex's
+        // isVMMultidexCapable accepts only "major.minor[.micro]" with
+        // major.minor >= 2.1 and otherwise runs its legacy install, which needs
+        // DexPathList.makeDexElements and throws without it, aborting the
+        // app's attachBaseContext. A host JDK's value passes only by chance
+        // ("21.0.11" does; Temurin's "21.0.13+9-LTS" and Homebrew's
+        // "21.0.13.0.3" do not). ART reports "2.1.0" (HttpAgent.ART_VM_VERSION).
+        // MACAPK_VM_VERSION_ART=0 keeps the host's value.
+        if (!"0".equals(System.getenv("MACAPK_VM_VERSION_ART"))) {
+            System.setProperty("java.vm.version", HttpAgent.ART_VM_VERSION);
+        }
         // AOSP RuntimeInit.commonInit sets the default HTTP User-Agent here.
         HttpAgent.install();
 

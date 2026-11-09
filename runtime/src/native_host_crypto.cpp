@@ -54,8 +54,9 @@ void RegisterHostCryptoNativeMethods(JNIEnv* env) {
     if(!initialize || env->ExceptionCheck()) {
         if(env->ExceptionCheck())env->ExceptionDescribe();
         std::fprintf(stderr,"[macapk] cannot initialize native_host_crypto\n");
-        std::abort();
+        if(env->ExceptionCheck())env->ExceptionClear();
+        // TLS availability is a service/request error, never a process abort.
     }
-    env->DeleteLocalRef(type);
+    if(type)env->DeleteLocalRef(type);
 }
 } // namespace macapk

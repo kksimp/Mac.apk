@@ -21,21 +21,12 @@ public final class HostCrypto {
         if (initialized) return;
         capture();
         if (startup == null) return; // bare-JVM framework regression harness
-        if (System.getProperty("javax.net.ssl.trustStoreProvider") == null
-                && System.getProperty("javax.net.ssl.trustStoreType") == null) {
-            try {
-                java.security.KeyStore host = java.security.KeyStore.getInstance(java.security.KeyStore.getDefaultType());
-                System.setProperty("javax.net.ssl.trustStoreProvider", host.getProvider().getName());
-            } catch (java.security.KeyStoreException failure) {
-                throw new IllegalStateException("Host trust store is unavailable", failure);
-            }
-        }
         HostHttps.install();
         initialized = true;
     }
     public static Scope use() {
-        if(startup==null) throw new IllegalStateException("Host crypto was not captured by this runtime");
-        return new Scope(begin(startup));
+        Object providers = startup;
+        return providers == null ? new Scope(null, false) : use(providers);
     }
     /** Install the host implementation of Android's platform HTTPS default.
      * Explicit application factories remain under application control. */
@@ -45,18 +36,24 @@ public final class HostCrypto {
     /** Configure an in-process system-service request independently of the
      * guest's mutable HTTPS defaults. Call while a host crypto scope is active. */
     public static void configureServiceHttps(javax.net.ssl.HttpsURLConnection connection) throws java.io.IOException {
-        HostHttps.configureService(connection);
+        if (startup != null) HostHttps.configureService(connection);
     }
-    static Object currentProviders() { return providerList(); }
-    static Scope use(Object providers) { return new Scope(begin(providers)); }
+    static Object currentProviders() {
+        if (startup == null) return null;
+        return providerList();
+    }
+    static Scope use(Object providers) {
+        return providers == null ? new Scope(null, false) : new Scope(begin(providers), true);
+    }
     public static final class Scope implements AutoCloseable {
         private final Object previous;
+        private final boolean active;
         private final Thread owner=Thread.currentThread();
         private boolean closed;
-        private Scope(Object previous) { this.previous=previous; }
+        private Scope(Object previous, boolean active) { this.previous=previous; this.active=active; }
         @Override public void close() {
             if(Thread.currentThread()!=owner) throw new IllegalStateException("Crypto scope closed on another thread");
-            if(!closed) { end(previous);closed=true; }
+            if(!closed) { if(active) end(previous);closed=true; }
         }
     }
 }

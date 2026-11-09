@@ -106,22 +106,30 @@ public final class HostHttpsCompatibilitySmoke {
             c.disconnect();
             check(Security.getProvider(POISON.getName()) == POISON, "app provider preserved after HTTPS");
 
-            CountDownLatch callback = new CountDownLatch(1);
-            AtomicBoolean callbackContext = new AtomicBoolean();
-            try (var s = (SSLSocket) platform.createSocket("localhost", server.port())) {
-                s.setSoTimeout(4000);
-                HandshakeCompletedListener listener = e -> {
-                    callbackContext.set(e.getSocket() == s && Security.getProvider(POISON.getName()) == POISON);
-                    callback.countDown();
-                };
-                s.addHandshakeCompletedListener(listener);
-                // Stream I/O must cover implicit handshakes as well.
-                s.getOutputStream().write("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".getBytes());
-                s.getOutputStream().flush();
-                check(s.getInputStream().read() == 'H', "implicit stream TLS handshake");
-                check(callback.await(4, TimeUnit.SECONDS) && callbackContext.get(), "listener sees application providers and wrapper socket");
-                s.removeHandshakeCompletedListener(listener);
-                check(s.isConnected() && s.getRemoteSocketAddress() != null, "socket state delegated");
+            for (int registrations : new int[] {2, 1}) {
+                CountDownLatch callback = new CountDownLatch(registrations);
+                AtomicInteger calls = new AtomicInteger();
+                AtomicBoolean callbackContext = new AtomicBoolean();
+                try (var s = (SSLSocket) platform.createSocket("localhost", server.port())) {
+                    s.setSoTimeout(4000);
+                    HandshakeCompletedListener listener = e -> {
+                        callbackContext.set(e.getSocket() == s && Security.getProvider(POISON.getName()) == POISON);
+                        calls.incrementAndGet();
+                        callback.countDown();
+                    };
+                    s.addHandshakeCompletedListener(listener);
+                    s.addHandshakeCompletedListener(listener);
+                    if (registrations == 1) s.removeHandshakeCompletedListener(listener);
+                    s.getOutputStream().write("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".getBytes());
+                    s.getOutputStream().flush();
+                    check(s.getInputStream().read() == 'H', "implicit stream TLS handshake");
+                    check(callback.await(4, TimeUnit.SECONDS) && callbackContext.get()
+                            && calls.get() == registrations, "duplicate listener notifications: " + calls.get());
+                    for (int i = 0; i < registrations; i++) s.removeHandshakeCompletedListener(listener);
+                    try { s.removeHandshakeCompletedListener(listener); throw new AssertionError("extra remove accepted"); }
+                    catch (IllegalArgumentException expected) { }
+                    check(s.isConnected() && s.getRemoteSocketAddress() != null, "socket state delegated");
+                }
             }
             rejected(connection("127.0.0.1", server.port()), "wrong certificate hostname");
             check(Security.getProvider(POISON.getName()) == POISON, "failure restores app providers");

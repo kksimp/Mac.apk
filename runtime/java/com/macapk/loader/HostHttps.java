@@ -110,7 +110,7 @@ final class HostHttps {
 
     private static final class ScopedSocket extends SSLSocket {
         private final SSLSocket delegate;
-        private final Map<HandshakeCompletedListener, HandshakeCompletedListener> listeners = new HashMap<>();
+        private final Map<HandshakeCompletedListener, List<HandshakeCompletedListener>> listeners = new HashMap<>();
         private BiFunction<SSLSocket, List<String>, String> selector;
         private InputStream input;
         private OutputStream output;
@@ -133,15 +133,16 @@ final class HostHttps {
                     listener.handshakeCompleted(new HandshakeCompletedEvent(this, event.getSession()));
                 }
             };
-            HandshakeCompletedListener old = listeners.put(listener, bridge);
-            if (old != null) delegate.removeHandshakeCompletedListener(old);
             delegate.addHandshakeCompletedListener(bridge);
+            listeners.computeIfAbsent(listener, key -> new java.util.ArrayList<>()).add(bridge);
         }
         @Override public synchronized void removeHandshakeCompletedListener(HandshakeCompletedListener listener) {
             if (listener == null) throw new IllegalArgumentException("listener is null");
-            HandshakeCompletedListener bridge = listeners.remove(listener);
-            if (bridge == null) throw new IllegalArgumentException("listener not registered");
-            delegate.removeHandshakeCompletedListener(bridge);
+            List<HandshakeCompletedListener> bridges = listeners.get(listener);
+            if (bridges == null || bridges.isEmpty()) throw new IllegalArgumentException("listener not registered");
+            delegate.removeHandshakeCompletedListener(bridges.get(0));
+            bridges.remove(0);
+            if (bridges.isEmpty()) listeners.remove(listener);
         }
         @Override public void setHandshakeApplicationProtocolSelector(BiFunction<SSLSocket, List<String>, String> value) {
             Object providers = HostCrypto.currentProviders();

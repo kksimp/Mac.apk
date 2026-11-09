@@ -14106,6 +14106,7 @@ static bool MacapkNoteDisplaySize(JNIEnv* env, MTKView* view, int w, int h) {
             }
         }
     } else if (angleInitOk && view.window
+               && !macapk::g_native_egl_surface_live.load(std::memory_order_relaxed)
                && macapk::AngleBoundLayer() != (__bridge void*)self.angleLayer) {
         // This view drew before and its ANGLE surface was taken by another
         // view since. The framework EGL surface is process-wide: AngleInit
@@ -14121,6 +14122,12 @@ static bool MacapkNoteDisplaySize(JNIEnv* env, MTKView* view, int w, int h) {
         // resume; this is that step. Only a window-attached view draws (see
         // g_active_render_view above), so two views can't trade the surface
         // back and forth, and a steady-state tick costs one pointer compare.
+        // Not once a native-EGL engine owns rendering: AngleInit makes the
+        // framework context current again after AngleFinish drained and
+        // released it, and the guest_owns path below neither ends that frame
+        // nor drains again, so a framework buffer would be stranded on the
+        // shared Metal FIFO -- the v1.0.573 hazard the AngleResize calls guard
+        // the same way. Such an engine presents on its own layer anyway.
         CGSize sz = self.angleLayer.drawableSize;
         if (sz.width > 0 && sz.height > 0) {
             angleInitOk = macapk::AngleInit((__bridge void*)self.angleLayer,

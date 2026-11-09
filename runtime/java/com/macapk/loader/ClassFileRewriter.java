@@ -415,6 +415,29 @@ public final class ClassFileRewriter {
                 }
             }
 
+            // ART permits accessible writes to app-owned static final fields.
+            if (containsNeedle(raw, NEEDLE_REFLECT_FIELD)) {
+                for (MethodEntry m : cf.methods) if (m.code != null) {
+                    byte[] bc=m.code.code;
+                    int end=m.code.codeOffset+m.code.codeLen;
+                    for(int pc=m.code.codeOffset;pc<end;) {
+                        int op=bc[pc]&0xff, len=instructionLength(op,bc,pc);
+                        if(len<=0) break;
+                        if(op==OP_INVOKEVIRTUAL && isMethodref(cf,u2(bc,pc+1),"java/lang/reflect/Field","set","(Ljava/lang/Object;Ljava/lang/Object;)V")) {
+                            int cls=cf.findOrAddClass("com/macapk/loader/ArtReflection");
+                            int nt=cf.findOrAddNameAndType("set","(Ljava/lang/reflect/Field;Ljava/lang/Object;Ljava/lang/Object;)V");
+                            bc[pc]=(byte)OP_INVOKESTATIC; writeU2(bc,pc+1,cf.findOrAddMethodref(cls,nt)); hits++;
+                        }
+                        else if(op==OP_INVOKEVIRTUAL && isMethodref(cf,u2(bc,pc+1),"java/lang/reflect/Field","get","(Ljava/lang/Object;)Ljava/lang/Object;")) {
+                            int cls=cf.findOrAddClass("com/macapk/loader/ArtReflection");
+                            int nt=cf.findOrAddNameAndType("get","(Ljava/lang/reflect/Field;Ljava/lang/Object;)Ljava/lang/Object;");
+                            bc[pc]=(byte)OP_INVOKESTATIC; writeU2(bc,pc+1,cf.findOrAddMethodref(cls,nt)); hits++;
+                        }
+                        pc+=len;
+                    }
+                }
+            }
+
             // ---- Pattern L -- libcore private-field names on HotSpot ----
             // Apps reflect libcore's private fields by NAME; the host JDK names
             // some of them differently (java.io.FileDescriptor: libcore
@@ -624,6 +647,7 @@ public final class ClassFileRewriter {
                 || containsNeedle(raw, FROM_BYTES_G)) {
                 return true;
             }
+            if (containsNeedle(raw, NEEDLE_REFLECT_FIELD)) return true;
             // Pattern J (Jato nativeInit): a class that names the Jato package.
             if (containsNeedle(raw, NEEDLE_JATO_PKG)) {
                 return true;
@@ -1026,6 +1050,7 @@ public final class ClassFileRewriter {
      *  every getDeclaredField call site alone. */
     static final boolean LIBCORE_FIELD_NAMES =
         !"0".equals(System.getenv("MACAPK_LIBCORE_FIELD_NAMES"));
+    private static final byte[] NEEDLE_REFLECT_FIELD = "java/lang/reflect/Field".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
     private static final byte[] NEEDLE_GET_DECLARED_FIELD =
         "getDeclaredField".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
     /** The libcore field names LibcoreFields maps; any one is enough to parse. */

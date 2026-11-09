@@ -34,10 +34,26 @@ public final class WrappedApplicationInfoSmoke {
                 throw new AssertionError("attached Application must expose installed native-library metadata");
             if (delegate.getBaseContext().getApplicationInfo() != installed)
                 throw new AssertionError("Application and base Context must agree");
+            for (int mode = 0; mode < 3; mode++) {
+                final int behavior = mode;
+                DelegateApplication fallback = new DelegateApplication();
+                fallback.macapkSetDataDir(root.toFile());
+                fallback.attachTo(new ContextWrapper(null) {
+                    @Override public ApplicationInfo getApplicationInfo() {
+                        if (behavior == 0) return null;
+                        if (behavior == 1) throw new IllegalStateException("fixture");
+                        return new ApplicationInfo();
+                    }
+                });
+                ApplicationInfo safe = fallback.getApplicationInfo();
+                if (safe == null || !root.toString().equals(safe.dataDir))
+                    throw new AssertionError("delegate fallback/dataDir repair");
+            }
             System.out.println("wrapped-app-info: PASS (attached record, cached pre-attach query, real library path)");
         } finally {
-            Files.deleteIfExists(root.resolve("lib"));
-            Files.deleteIfExists(root);
+            try (var files = Files.walk(root)) {
+                for (Path file : files.sorted(java.util.Comparator.reverseOrder()).toList()) Files.deleteIfExists(file);
+            }
         }
     }
 }

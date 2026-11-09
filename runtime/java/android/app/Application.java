@@ -1008,12 +1008,16 @@ public class Application extends ContextWrapper
         // record belongs to the attached base, just like its resources/assets;
         // consult it before an empty pre-attach fallback cached on this object.
         Context delegate = macapkUninitDelegate();
-        if (delegate != null) return delegate.getApplicationInfo();
+        android.content.pm.ApplicationInfo delegated = null;
+        if (delegate != null) {
+            try { delegated = delegate.getApplicationInfo(); }
+            catch (Throwable ignored) { /* retain the non-null, non-throwing fallback */ }
+        }
         android.content.pm.ApplicationInfo cached = cachedApplicationInfo;
-        if (cached != null) return cached;
-        android.content.pm.ApplicationInfo info = null;
+        if (delegated == null && cached != null) return cached;
+        android.content.pm.ApplicationInfo info = delegated;
         try {
-            PackageManager pm = macapkPackageManagerReal();
+            PackageManager pm = info == null ? macapkPackageManagerReal() : null;
             if (pm != null && packageName != null) {
                 info = pm.getApplicationInfo(packageName,
                         PackageManager.GET_SHARED_LIBRARY_FILES);

@@ -3720,18 +3720,15 @@ public class Activity extends ContextThemeWrapper
     // PlayerPrefs file name `<pkg>.v2.playerprefs`; an empty one builds an empty
     // core::String whose c_str() is NULL -> strlen(NULL) crash at native init).
     @Override public String getPackageName() {
-        // AOSP attaches an Activity to its own ContextImpl, independently of
-        // the Application's overridable getter. Our base is the Application,
-        // so use the installed process record once Boot has bound it.
-        String installed = com.macapk.loader.Boot.packageName();
-        if (installed != null && !installed.isEmpty()) return installed;
         if (application != null) {
             String p = application.getPackageName();
             if (p != null && !p.isEmpty()) return p;
         }
         android.app.Application a = android.app.Application.macapk_get();
         String p = (a != null) ? a.getPackageName() : null;
-        return (p != null) ? p : "";
+        if (p != null && !p.isEmpty()) return p;
+        String installed = com.macapk.loader.Boot.packageName();
+        return installed != null ? installed : "";
     }
     @Override public File getFilesDir()           { return application != null ? application.getFilesDir() : new File("."); }
     @Override public File getCacheDir()           { return application != null ? application.getCacheDir() : new File("."); }

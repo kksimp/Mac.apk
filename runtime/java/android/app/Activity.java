@@ -3726,7 +3726,9 @@ public class Activity extends ContextThemeWrapper
         }
         android.app.Application a = android.app.Application.macapk_get();
         String p = (a != null) ? a.getPackageName() : null;
-        return (p != null) ? p : "";
+        if (p != null && !p.isEmpty()) return p;
+        String installed = com.macapk.loader.Boot.packageName();
+        return installed != null ? installed : "";
     }
     @Override public File getFilesDir()           { return application != null ? application.getFilesDir() : new File("."); }
     @Override public File getCacheDir()           { return application != null ? application.getCacheDir() : new File("."); }

@@ -14105,6 +14105,30 @@ static bool MacapkNoteDisplaySize(JNIEnv* env, MTKView* view, int w, int h) {
                 std::fprintf(stderr, "[E] cocoa_v2: AngleInit failed -- frames will no-op\n");
             }
         }
+    } else if (angleInitOk && view.window
+               && macapk::AngleBoundLayer() != (__bridge void*)self.angleLayer) {
+        // This view drew before and its ANGLE surface was taken by another
+        // view since. The framework EGL surface is process-wide: AngleInit
+        // rebinds it to whichever MTKView initializes LAST, so when an
+        // activity starts on top (a translucent WebView activity, say), its
+        // fresh view moves the surface to its own angleLayer. When that
+        // activity finishes and this view is back in the window, nothing
+        // moved the surface back -- angleInitTried was already YES here -- so
+        // every frame kept presenting into the departed view's layer and the
+        // window froze on the last frame drawn before the activity started,
+        // while the app itself kept running and taking input. Android gives
+        // the returning activity's SurfaceView a valid surface again on
+        // resume; this is that step. Only a window-attached view draws (see
+        // g_active_render_view above), so two views can't trade the surface
+        // back and forth, and a steady-state tick costs one pointer compare.
+        CGSize sz = self.angleLayer.drawableSize;
+        if (sz.width > 0 && sz.height > 0) {
+            angleInitOk = macapk::AngleInit((__bridge void*)self.angleLayer,
+                                             (int)sz.width, (int)sz.height);
+            std::fprintf(stderr,
+                "[I] cocoa_v2: ANGLE surface rebound to the returning view's layer%s\n",
+                angleInitOk ? "" : " FAILED -- frames will no-op");
+        }
     }
     // v1.0.573: once a native-EGL engine (Unity / bgfx-RenderDragon / custom)
     // owns rendering, STOP driving the framework's OWN ANGLE context here. The

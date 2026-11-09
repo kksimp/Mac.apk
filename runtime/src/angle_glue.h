@@ -51,7 +51,8 @@ void AngleEndFrame();
 void AngleMarkFrameWithheld(bool withheld);
 
 // The CAMetalLayer the framework's one EGL window surface is bound to right now
-// (nullptr before AngleInit). Diagnostics only (MACAPK_WINDOW_TREE_DUMP).
+// (nullptr before AngleInit). Main thread. Read by MACAPK_WINDOW_TREE_DUMP and by
+// drawInMTKView, which rebinds a returning view whose layer lost the surface.
 void* AngleBoundLayer();
 
 // v1.0.573: fully drain + release the framework's ANGLE context (glFinish

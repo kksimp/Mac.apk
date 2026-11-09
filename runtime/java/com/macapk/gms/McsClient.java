@@ -284,7 +284,7 @@ public final class McsClient {
         for (int port : PORTS) {
             Socket plain = null;
             boolean complete = false;
-            try {
+            try (com.macapk.loader.HostCrypto.Scope crypto = com.macapk.loader.HostCrypto.use()) {
                 plain = com.macapk.loader.HostProxy.connect(HOST, port, CONNECT_TIMEOUT_MS);
                 plain.setKeepAlive(true);
                 plain.setTcpNoDelay(true);

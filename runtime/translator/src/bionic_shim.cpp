@@ -39522,22 +39522,16 @@ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
             // dyld searches a translated wrapper's Mach-O dependencies too.
             // A guest which dlopens itself can therefore receive libSystem's
             // pthread/stdio/varargs ABI instead of the Bionic adapter used by
-            // its ordinary ELF imports. Keep the wrapper's own exports, then
-            // adapt an inherited dependency symbol exactly like resolve_external.
+            // its ordinary ELF imports. Preserve guest dependency exports;
+            // adapt only definitions actually owned by the host's libSystem.
             std::string ours = std::string("__macapk_arm64_") + name;
             if (void* adapted = dlsym(RTLD_DEFAULT, ours.c_str())) {
                 Dl_info provider{};
-                bool local_export = false;
-                if (::dladdr(p, &provider) && provider.dli_fname) {
-                    const char* base = std::strrchr(provider.dli_fname, '/');
-                    std::string file = base ? base + 1 : provider.dli_fname;
-                    const size_t suffix = file.rfind(".dylib");
-                    if (suffix != std::string::npos && suffix + 6 == file.size()) {
-                        file.replace(suffix, 6, ".so");
-                        local_export = file == wrapper_soname;
-                    }
-                }
-                if (local_export) return p;
+                if (!::dladdr(p, &provider) || !provider.dli_fname) return p;
+                const std::string image = provider.dli_fname;
+                const bool host_libc = image.compare(0, 19, "/usr/lib/system/lib") == 0
+                    || image == "/usr/lib/libSystem.B.dylib";
+                if (!host_libc) return p;
                 if (void* defined = macapk_wrapper_elf_dlsym(handle, name)) return defined;
                 return adapted;
             }
@@ -49212,7 +49206,7 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         case 38:  return (long)__macapk_arm64_renameat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, (const char*)macapk_untag_ptr((void*)a4));  // renameat
         case 43:  return (long)__macapk_arm64_statfs((const char*)macapk_untag_ptr((void*)a1), (void*)macapk_untag_ptr((void*)a2));  // statfs
         case 44:  return (long)__macapk_arm64_fstatfs((int)a1, (void*)macapk_untag_ptr((void*)a2));  // fstatfs
-        case 48:  return (long)__macapk_arm64_faccessat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, (int)a4);  // faccessat
+        case 48:  return (long)__macapk_arm64_faccessat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, 0);  // raw faccessat has three arguments
         case 53:  return (long)__macapk_arm64_fchmodat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (mode_t)a3, (int)a4);  // fchmodat
         case 56:  return (long)__macapk_arm64_openat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, (mode_t)a4);  // openat
         // 36/37/45/49/54/88 added with the S0 path shims (2026-09-26), by this

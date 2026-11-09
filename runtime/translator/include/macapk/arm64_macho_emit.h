@@ -74,6 +74,9 @@ namespace macapk::translator {
 //   shim_dir         -- directory containing the shim, added as a
 //                        second LC_RPATH so dyld can find it.
 //   verbose          -- emit progress to stderr.
+//   deferred_jni_onload -- the JNI_OnLoad entry was added because the ELF may
+//                        publish it from a constructor; use JNI's version-1.1
+//                        default only when no real hook exists after loading.
 //
 // Returns 0 on success, non-zero on any failure (the caller treats a
 // non-zero return as a translation failure, exactly like clang's).
@@ -85,6 +88,7 @@ int emit_arm64_wrapper_dylib(const std::string& out_path,
                              const std::string& soname,
                              const std::string& shim_install_name,
                              const std::string& shim_dir,
-                             bool verbose);
+                             bool verbose,
+                             bool deferred_jni_onload = false);
 
 }  // namespace macapk::translator

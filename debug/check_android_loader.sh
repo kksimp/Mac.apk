@@ -4,7 +4,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 . "$ROOT/debug/jdk25_select.sh"
 JDK_HOME="$(macapk_jdk_home)"
-LIB="$ROOT/runtime/build/lib"
+LIB="${MACAPK_TEST_LIB:-$ROOT/runtime/build/lib}"
 [ -f "$LIB/android-framework.jar" ] || { echo 'Run debug/build_java_only.sh first' >&2; exit 2; }
 TMP="$(mktemp -d /tmp/macapk-compat-smoke.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT

@@ -14,3 +14,22 @@ Run `debug/build_java_only.sh`, then `debug/check_android_loader.sh` with a JDK 
 同步上游时保留原生库按需加载、并行类加载、Jato 重写与原有反射初始化修复。
 
 在原有 `debug/check_android_loader.sh` 外，运行 `debug/check_in_memory_dex_path.sh` 和 `debug/check_live_memory_dex.sh`。它们生成真实 DEX，覆盖 heap/direct/read-only buffer、非零位置/长度、延迟恢复的方法体、跨 DEX 接口静态方法、重复定义、定义 loader 身份、元素重排/删除、格式错误与无持久化 DEX/JAR。
+
+## Review regressions
+
+Converted DEX classes precede original `.class` entries in mixed archives. APK
+resource URLs retain the configured device/diagnostic path spelling after path
+mutation, without making removed elements visible. Closing a loader seals element
+registration and preserves the original close exception with suppressed failures.
+
+In-memory DEX keeps class/type metadata fixed at the factory boundary. Each class
+lookup refreshes only its live method code items (including exception handlers),
+so delayed method preparation and retries do not copy the entire DEX. The
+allocation regression uses a 16 MiB DEX and an explicit per-lookup allocation
+budget. Ordinary public reflection uses JDK accessors directly; non-public
+accessors are cached per caller and declaring class, with typed method handles.
+Caller permissions and the accessible-only final-field write rule remain tested.
+
+Run `debug/check_review_loader.sh`, `debug/check_live_memory_dex.sh`,
+`debug/check_loader_mutation_regressions.sh`, and `debug/check_android_loader.sh`.
+`debug/ArtReflectionCostSmoke.java` is a microbenchmark, not an app-startup metric.

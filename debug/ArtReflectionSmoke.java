@@ -38,7 +38,14 @@ public class ArtReflectionSmoke {
             Path source=dir.resolve("FieldsFixture.java");Files.writeString(source,code);
             if(ToolProvider.getSystemJavaCompiler().run(null,null,null,"-d",dir.toString(),source.toString())!=0)throw new AssertionError("compile");
             try(AppClassLoader loader=new AppClassLoader(new URL[]{dir.toUri().toURL()},ArtReflectionSmoke.class.getClassLoader(),null,dir.toFile(),null,null)) {
-                if(!Boolean.TRUE.equals(loader.loadClass("FieldsFixture").getMethod("check").invoke(null)))throw new AssertionError("field compatibility");
+                Class<?> fixture = loader.loadClass("FieldsFixture");
+                if(!Boolean.TRUE.equals(fixture.getMethod("check").invoke(null)))throw new AssertionError("field compatibility");
+                java.lang.reflect.Field privateField = fixture.getDeclaredField("ordinary");
+                Object receiver = fixture.getConstructor().newInstance();
+                try { com.macapk.loader.ArtReflection.get(privateField, receiver); throw new AssertionError("cached getter crossed caller boundary"); }
+                catch (IllegalAccessException expected) { }
+                try { com.macapk.loader.ArtReflection.set(privateField, receiver, 3); throw new AssertionError("cached setter crossed caller boundary"); }
+                catch (IllegalAccessException expected) { }
             }
             System.out.println("art-fields: PASS (real rewritten clinit, app lock, primitive widening, caller access, final denial, type mismatch, host denial)");
         } finally { try(var files=Files.walk(dir)){for(Path file:files.sorted(Comparator.reverseOrder()).toList())Files.deleteIfExists(file);} }

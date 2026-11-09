@@ -22,18 +22,30 @@ public final class DexPathList {
     volatile Element[] dexElements = new Element[0];
     List<File> nativeLibraryDirectories = new ArrayList<>();
     private Element[] initial = dexElements;
-    private final java.util.Set<Element> opened = java.util.concurrent.ConcurrentHashMap.newKeySet();
-    private Element use(Element e) { opened.add(e); return e; }
+    private final java.util.Set<Element> opened = new java.util.HashSet<>();
+    private boolean closed;
+    private synchronized Element use(Element e) {
+        if (closed) {
+            try { e.close(); } catch (IOException ignored) { /* already detached */ }
+        } else opened.add(e);
+        return e;
+    }
     void open() {
         for (Element e : dexElements) use(e).findResource("META-INF/MACAPK-OPEN-NOW");
     }
     void close() throws IOException {
+        Element[] snapshot;
+        synchronized (this) {
+            if (closed) return;
+            closed = true;
+            snapshot = opened.toArray(new Element[0]);
+            opened.clear();
+        }
         IOException failure = null;
-        for (Element e : opened) {
+        for (Element e : snapshot) {
             try { e.close(); }
             catch (IOException ex) { if (failure == null) failure = ex; else failure.addSuppressed(ex); }
         }
-        opened.clear();
         if (failure != null) throw failure;
     }
 
@@ -43,6 +55,7 @@ public final class DexPathList {
     private static final class MemoryDexGroup {
         private final List<ByteBuffer> buffers = new ArrayList<>();
         private final List<byte[]> images = new ArrayList<>();
+        private final List<java.util.Map<String, int[]>> codeOffsets = new ArrayList<>();
         private final java.util.Map<String, Integer> firstOwners = new java.util.HashMap<>();
         private final java.util.Map<Integer, com.macapk.dex.DexConverter.Session> duplicateSessions = new java.util.HashMap<>();
         private com.macapk.dex.DexConverter.Session session;
@@ -51,13 +64,64 @@ public final class DexPathList {
             int index = buffers.size();
             buffers.add(buffer.duplicate());
             images.add(image);
+            java.util.Map<String, int[]> offsets = new java.util.HashMap<>();
+            for (com.macapk.dex.DexClass cls : com.macapk.dex.DexFile.parse(image).classes()) {
+                offsets.put(cls.name(), cls.methods().stream().mapToInt(com.macapk.dex.DexMethod::codeOffset)
+                        .filter(offset -> offset != 0).toArray());
+            }
+            codeOffsets.add(offsets);
             for (String name : names) firstOwners.putIfAbsent(name, index);
             return index;
         }
+        private static int leb(ByteBuffer data, boolean signed) throws IOException {
+            int result = 0, shift = 0, value;
+            do {
+                if (shift >= 35 || !data.hasRemaining()) throw new IOException("Invalid live DEX handler");
+                value = data.get() & 255;
+                result |= (value & 127) << shift;
+                shift += 7;
+            } while ((value & 128) != 0);
+            if (signed && shift < 32 && (value & 64) != 0) result |= -1 << shift;
+            return result;
+        }
+        private static int codeEnd(ByteBuffer data, int offset) throws IOException {
+            try {
+                int tries = data.getShort(offset + 6) & 65535;
+                long end = (long) offset + 16 + Integer.toUnsignedLong(data.getInt(offset + 12)) * 2;
+                if (tries != 0) end = ((end + 3) & ~3L) + tries * 8L;
+                if (end > data.limit() || end < offset) throw new IOException("Invalid live DEX code size");
+                if (tries == 0) return (int) end;
+                ByteBuffer handlers = data.duplicate();
+                handlers.position((int) end);
+                int count = leb(handlers, false);
+                if (count < 0 || count > handlers.remaining()) throw new IOException("Invalid handler count");
+                for (int i = 0; i < count; i++) {
+                    int size = leb(handlers, true);
+                    long pairs = Math.abs((long) size);
+                    if (pairs > handlers.remaining() / 2) throw new IOException("Invalid handler size");
+                    for (long j = 0; j < pairs; j++) { leb(handlers, false); leb(handlers, false); }
+                    if (size <= 0) leb(handlers, false);
+                }
+                return handlers.position();
+            } catch (IndexOutOfBoundsException | java.nio.BufferUnderflowException ex) {
+                throw new IOException("Truncated live DEX code", ex);
+            }
+        }
         synchronized byte[] classBytes(int index, String name) throws IOException {
-            byte[] current = Element.snapshot(buffers.get(index));
-            if (!java.util.Arrays.equals(images.get(index), current)) {
-                images.set(index, current);
+            // Class metadata is fixed when the DEX is opened, like ART's
+            // mapped DexFile. Packers may prepare code later. Copy just this
+            // class's code, not the entire DEX on every lookup.
+            ByteBuffer live = buffers.get(index).duplicate().slice().order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            byte[] image = images.get(index);
+            boolean changed = false;
+            for (int offset : codeOffsets.get(index).getOrDefault(name, new int[0])) {
+                int end = codeEnd(live, offset);
+                for (int at = offset; at < end; at++) {
+                    byte value = live.get(at);
+                    if (image[at] != value) { image[at] = value; changed = true; }
+                }
+            }
+            if (changed) {
                 session = null;
                 duplicateSessions.clear();
             }
@@ -140,10 +204,10 @@ public final class DexPathList {
             }
             return resources;
         }
-        URL findResource(String name) {
+        synchronized URL findResource(String name) {
             return closed || memoryGroup != null ? null : resources().findResource(name);
         }
-        Enumeration<URL> findResources(String name) throws IOException {
+        synchronized Enumeration<URL> findResources(String name) throws IOException {
             return closed || memoryGroup != null ? Collections.emptyEnumeration() : resources().findResources(name);
         }
         synchronized byte[] findClassBytes(String name) throws IOException {

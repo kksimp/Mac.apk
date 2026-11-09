@@ -210,7 +210,7 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
     @Override
     public URL findResource(String name) {
         URL u = super.findResource(name);
-        if (u != null || macapkDexPathChanged()) return u;
+        if (u != null || macapkDexPathChanged()) return macapkResourceUrl(u, name);
         return apkEntryUrl(name);
     }
 
@@ -218,13 +218,32 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
     public java.util.Enumeration<URL> findResources(String name)
             throws IOException {
         java.util.Enumeration<URL> base = super.findResources(name);
-        if (macapkDexPathChanged()) return base;
+        if (macapkDexPathChanged()) {
+            java.util.List<URL> all = new java.util.ArrayList<>();
+            while (base.hasMoreElements()) all.add(macapkResourceUrl(base.nextElement(), name));
+            return java.util.Collections.enumeration(all);
+        }
         java.util.List<URL> apk = apkEntryUrls(name);
         if (apk.isEmpty()) return base;
         java.util.List<URL> all = new java.util.ArrayList<>();
         while (base.hasMoreElements()) all.add(base.nextElement());
         all.addAll(apk);
         return java.util.Collections.enumeration(all);
+    }
+
+    private synchronized URL macapkResourceUrl(URL url, String name) {
+        if (url == null || !"jar".equals(url.getProtocol())) return url;
+        String value = url.toExternalForm();
+        for (int i = 0; i < apkSet.size(); i++) {
+            try {
+                String prefix = "jar:" + apkSet.get(i).toURI().toURL() + "!/";
+                if (value.startsWith(prefix)) {
+                    URL mapped = apkEntryUrlIn(i, name.startsWith("/") ? name.substring(1) : name);
+                    return mapped != null ? mapped : url;
+                }
+            } catch (java.net.MalformedURLException ignored) { }
+        }
+        return url;
     }
 
     /** jar:file: URL for an entry of the installed set -- the FIRST member,

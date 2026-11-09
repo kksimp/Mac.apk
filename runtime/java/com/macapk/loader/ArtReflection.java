@@ -1,6 +1,8 @@
 package com.macapk.loader;
 
 import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodType;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 
@@ -11,6 +13,38 @@ import java.lang.reflect.Modifier;
 public final class ArtReflection {
     private ArtReflection() {}
     private static final StackWalker WALKER = StackWalker.getInstance(StackWalker.Option.RETAIN_CLASS_REFERENCE);
+    // ClassValue at both boundaries keeps cache entries tied to both loaders.
+    // Do not keep a global map with strong Class/Field keys for plugin classes.
+    private static final ClassValue<ClassValue<java.util.concurrent.ConcurrentMap<Field, MethodHandle[]>>> ACCESSORS =
+            new ClassValue<>() {
+        @Override protected ClassValue<java.util.concurrent.ConcurrentMap<Field, MethodHandle[]>> computeValue(Class<?> caller) {
+            return new ClassValue<>() {
+                @Override protected java.util.concurrent.ConcurrentMap<Field, MethodHandle[]> computeValue(Class<?> owner) {
+                    return new java.util.concurrent.ConcurrentHashMap<>();
+                }
+            };
+        }
+    };
+    private static boolean publicAccess(Field field) {
+        Class<?> owner = field.getDeclaringClass();
+        return Modifier.isPublic(field.getModifiers()) && Modifier.isPublic(owner.getModifiers())
+                && owner.getModule().isExported(owner.getPackageName());
+    }
+    private static MethodHandle accessor(Field field, Class<?> caller, boolean write) throws IllegalAccessException {
+        var fields = ACCESSORS.get(caller).get(field.getDeclaringClass());
+        MethodHandle[] pair = fields.computeIfAbsent(field, ignored -> new MethodHandle[2]);
+        int index = write ? 1 : 0;
+        synchronized (pair) {
+            if (pair[index] == null) {
+                var lookup = MethodHandles.privateLookupIn(caller, MethodHandles.lookup());
+                MethodHandle handle = write ? lookup.unreflectSetter(field) : lookup.unreflectGetter(field);
+                if (Modifier.isStatic(field.getModifiers())) handle = MethodHandles.dropArguments(handle, 0, Object.class);
+                pair[index] = handle.asType(write ? MethodType.methodType(void.class, Object.class, Object.class)
+                        : MethodType.methodType(Object.class, Object.class));
+            }
+            return pair[index];
+        }
+    }
     private static native Object readStatic(Field field) throws IllegalAccessException;
     private static native void writeStatic(Field field, Object value) throws IllegalAccessException;
     // The bare-JVM regression harness has no runtime JNI bindings. Use the
@@ -32,13 +66,12 @@ public final class ArtReflection {
     public static void set(Field field, Object receiver, Object value) throws IllegalAccessException {
         // Preserve the original caller's ordinary access rules. Moving a
         // reflective call into a helper must not grant the helper's access.
-        if (!field.isAccessible()) {
+        if (!field.isAccessible() && !publicAccess(field)) {
             Class<?> caller = WALKER.getCallerClass();
             try {
-                var setter = MethodHandles.privateLookupIn(caller, MethodHandles.lookup()).unreflectSetter(field);
+                var setter = accessor(field, caller, true);
                 Object converted = convert(field.getType(), value);
-                if (Modifier.isStatic(field.getModifiers())) setter.invokeWithArguments(converted);
-                else setter.invokeWithArguments(receiver, converted);
+                setter.invokeExact(receiver, converted);
                 return;
             } catch (IllegalAccessException ex) { throw ex; }
             catch (ClassCastException | java.lang.invoke.WrongMethodTypeException ex) { throw new IllegalArgumentException(ex); }
@@ -48,7 +81,7 @@ public final class ArtReflection {
         try { field.set(receiver,value); return; }
         catch (IllegalAccessException denied) {
             int mods=field.getModifiers();
-            if (!Modifier.isStatic(mods) || !Modifier.isFinal(mods)
+            if (!field.isAccessible() || !Modifier.isStatic(mods) || !Modifier.isFinal(mods)
                     || !(field.getDeclaringClass().getClassLoader() instanceof dalvik.system.BaseDexClassLoader)
                     || field.getDeclaringClass().isRecord() || field.getDeclaringClass().isHidden()) throw denied;
         }
@@ -60,11 +93,10 @@ public final class ArtReflection {
     }
     @SuppressWarnings("deprecation")
     public static Object get(Field field, Object receiver) throws IllegalAccessException {
-        if (!field.isAccessible()) {
+        if (!field.isAccessible() && !publicAccess(field)) {
             Class<?> caller = WALKER.getCallerClass();
             try {
-                var getter=MethodHandles.privateLookupIn(caller,MethodHandles.lookup()).unreflectGetter(field);
-                return Modifier.isStatic(field.getModifiers()) ? getter.invokeWithArguments() : getter.invokeWithArguments(receiver);
+                return (Object) accessor(field, caller, false).invokeExact(receiver);
             } catch (IllegalAccessException ex) { throw ex; }
             catch (ClassCastException | java.lang.invoke.WrongMethodTypeException ex) { throw new IllegalArgumentException(ex); }
             catch (RuntimeException | Error ex) { throw ex; }

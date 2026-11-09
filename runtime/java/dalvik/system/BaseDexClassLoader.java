@@ -190,7 +190,16 @@ public class BaseDexClassLoader extends URLClassLoader {
     }
 
     @Override public void close() throws java.io.IOException {
-        try { super.close(); } finally { pathList.close(); }
+        Throwable failure = null;
+        try { super.close(); }
+        catch (java.io.IOException | RuntimeException | Error ex) { failure = ex; throw ex; }
+        finally {
+            try { pathList.close(); }
+            catch (java.io.IOException ex) {
+                if (failure != null) failure.addSuppressed(ex);
+                else throw ex;
+            }
+        }
     }
 
     /** DexFile.loadClass(name, loader) entry point: define {@code binaryName}

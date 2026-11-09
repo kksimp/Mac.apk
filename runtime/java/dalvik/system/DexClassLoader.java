@@ -65,8 +65,8 @@ public class DexClassLoader extends BaseDexClassLoader {
                     // ART's element keeps the original archive for resources.
                     // Integrity manifests and marker resources must still name
                     // that archive, not the generated class-file cache.
-                    urls.add(f.toURI().toURL());
                     urls.add(code);
+                    urls.add(f.toURI().toURL());
                 }
             } catch (Exception skip) {
                 // leave unusable; findClass will throw for its classes

@@ -9491,8 +9491,23 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     public void onWindowSystemUiVisibilityChanged(int visible) { }
     public void postInvalidateDelayed(long delayMilliseconds, int left, int top, int right, int bottom) { postInvalidateDelayed(delayMilliseconds); }
     public void postInvalidateOnAnimation(int left, int top, int right, int bottom) { postInvalidateOnAnimation(); }
-    public void releasePointerCapture() { }
-    public void requestPointerCapture() { }
+    /** AOSP View.releasePointerCapture / requestPointerCapture (API 26). AOSP
+     *  asks ViewRootImpl for the window server to grant the capture and calls
+     *  dispatchPointerCaptureChanged back once it is granted or lost; Mac.apk
+     *  owns that state itself (TouchDispatcher), because what "capture" means
+     *  here is that the host cursor is taken and the pointer becomes a delta
+     *  (cocoa_bridge.mm). Answering hasPointerCapture from it is what lets an
+     *  app that supports a mouse -- Minecraft reads SOURCE_MOUSE_RELATIVE while
+     *  it holds the capture and shows a real pointer in its menus -- drive the
+     *  mode switch instead of the runtime guessing from mouse motion. */
+    public void releasePointerCapture() {
+        com.macapk.loader.TouchDispatcher.releaseHostPointerCapture();
+        dispatchPointerCaptureChanged(false);
+    }
+    public void requestPointerCapture() {
+        com.macapk.loader.TouchDispatcher.requestHostPointerCapture(this);
+        dispatchPointerCaptureChanged(true);
+    }
     public void setAccessibilityTraversalBefore(int beforeId) {
         // Was a discard; now records the id so the AOSP getter added below
         // (getAccessibilityTraversalBefore) can answer it. Nothing else in
@@ -9576,11 +9591,12 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         mOnCapturedPointerListener = l;
     }
     /** AOSP View.hasPointerCapture() asks mAttachInfo.mHasWindowFocus &&
-     *  ViewRootImpl's captured-pointer state. Mac.apk never grants pointer
-     *  capture (requestPointerCapture() is a no-op here, matching a device that
-     *  declines), so the honest answer is false -- the same answer a real device
-     *  gives before capture is granted. */
-    public boolean hasPointerCapture() { return false; }
+     *  ViewRootImpl's captured-pointer state. Mac.apk grants it per view in
+     *  TouchDispatcher (see requestPointerCapture above), so the answer is true
+     *  exactly for the view the app asked for and until it releases. */
+    public boolean hasPointerCapture() {
+        return com.macapk.loader.TouchDispatcher.hasHostPointerCapture(this);
+    }
     /** AOSP View.dispatchCapturedPointerEvent:16716. */
     public boolean dispatchCapturedPointerEvent(MotionEvent event) {
         if (!hasPointerCapture()) return false;

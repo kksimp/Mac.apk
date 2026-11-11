@@ -11372,6 +11372,141 @@ static bool MacApkMousePointerEnabled() {
     return YES;
 }
 
+// RELATIVE MOUSE (MACAPK_MOUSE_RELATIVE, default OFF): the mcpelauncher recipe
+// (game-window src/window_sdl3.cpp:347-379 and mcpelauncher-client
+// src/window_callbacks.cpp:221-239). An absolute pointer can never turn a
+// camera: once the window holds the pointer, everything is a DELTA. Taking the
+// pointer away is CGAssociateMouseAndMouseCursorPosition(false) (SDL equivalent:
+// SDL_SetWindowRelativeMouseMode) plus a hidden cursor, and each motion is then
+// handed over as SOURCE_MOUSE_RELATIVE + HOVER_MOVE with x/y = dx/dy -- the pair
+// Android's CursorInputMapper sends for a captured pointer, which our own NDK
+// shim already forwards verbatim (bionic_shim_nativeactivity.cpp:632,
+// :658-660). Default OFF and opt-in per app (launcher Get Info > environment):
+// the capture is process-wide and hides the Mac cursor for every window this
+// runtime owns.
+//
+// WHO decides: the app, through Android's own captured-pointer API
+// (View.requestPointerCapture / releasePointerCapture, granted by
+// TouchDispatcher). Taking the cursor on the first motion instead hid the
+// pointer before the first click: Minecraft's menus own an ordinary pointer
+// and became unreachable. macapkHostPointerCaptureWanted polls the app's
+// request, so a menu that released the capture keeps its cursor.
+static bool MacApkMouseRelativeEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("MACAPK_MOUSE_RELATIVE");
+        // An extension of the host-mouse path, not a replacement: with
+        // MACAPK_MOUSE_POINTER=0 the clicks still go out as a finger and a held
+        // cursor would leave the app with a frozen pointer, a delta stream and
+        // a touchscreen click at that stuck point.
+        return v && std::strcmp(v, "1") == 0 && MacApkMousePointerEnabled();
+    }();
+    return on;
+}
+static bool g_rel_mouse_on = false;   // main thread only, like g_host_mouse_buttons
+// Set when the user asked the cursor back (Cmd). A capture that returned on the
+// very next motion would make that request useless: the pointer is frozen
+// exactly where it was released, inside the view, so every attempt to move it
+// away would re-capture it and the cursor could never reach the menu bar or the
+// Dock. Only a press re-engages look mode.
+static bool g_rel_mouse_released = false;
+
+// Mirrors the capture state into TouchDispatcher.setHostMouseRelative, so a
+// click made while the cursor is held stays a mouse click (SOURCE_MOUSE with a
+// button) instead of falling back to the touchscreen-finger path a TAKEN input
+// queue otherwise gives it (TouchDispatcher.dispatchHostMouse).
+- (void)macapkSetRelativeMouse:(BOOL)on {
+    if (!MacApkMouseRelativeEnabled() || on == g_rel_mouse_on) return;
+    g_rel_mouse_on = on;
+    // Both effects are process-local: the WindowServer drops the association
+    // and NSCursor's hidden count when this process exits, so a crash cannot
+    // leave the Mac without a cursor. Paired by state, never by call count.
+    CGAssociateMouseAndMouseCursorPosition(!on);
+    if (on) [NSCursor hide]; else [NSCursor unhide];
+    if (!macapk::g_touch_vm || !macapk::g_touch_dispatcher) return;
+    JNIEnv* env = nullptr;
+    JavaVM* vm = macapk::g_touch_vm;
+    jint r = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_21);
+    if (r == JNI_EDETACHED) {
+        if (vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK) return;
+    } else if (r != JNI_OK || !env) return;
+    static jmethodID mid = nullptr;
+    static bool looked = false;
+    if (!looked) {
+        looked = true;
+        jclass cls = env->GetObjectClass(macapk::g_touch_dispatcher);
+        mid = env->GetMethodID(cls, "setHostMouseRelative", "(Z)V");
+        if (!mid && env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(cls);
+    }
+    if (!mid) return;
+    env->CallVoidMethod(macapk::g_touch_dispatcher, mid, (jboolean) on);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+// Gives the cursor back and keeps it free until the user presses in the view.
+- (void)macapkReleaseRelativeMouse {
+    g_rel_mouse_released = true;
+    [self macapkSetRelativeMouse:NO];
+}
+
+// One motion as a relative event. AppKit's deltaX/deltaY are exactly what
+// SDL3's cocoa backend passes as xrel / yrel, so sign and scale match
+// mcpelauncher's stream with nothing to convert; the game applies its own
+// sensitivity. Return YES = handled (the absolute paths must not run too).
+- (BOOL)macapkHostMouseRelative:(NSEvent*)event {
+    if (!MacApkMouseRelativeEnabled() || !g_rel_mouse_on) return NO;
+    if (!macapk::g_touch_vm || !macapk::g_touch_dispatcher) return NO;
+    JNIEnv* env = nullptr;
+    JavaVM* vm = macapk::g_touch_vm;
+    jint r = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_21);
+    if (r == JNI_EDETACHED) {
+        if (vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK) return NO;
+    } else if (r != JNI_OK || !env) return NO;
+    static jmethodID mid = nullptr;
+    static bool looked = false;
+    if (!looked) {
+        looked = true;
+        jclass cls = env->GetObjectClass(macapk::g_touch_dispatcher);
+        mid = env->GetMethodID(cls, "dispatchHostMouseRelative", "(FF)V");
+        if (!mid && env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(cls);
+    }
+    if (!mid) return NO;
+    macapk::MacApkInputPriorityBegin();
+    env->CallVoidMethod(macapk::g_touch_dispatcher, mid,
+                        (jfloat) [event deltaX], (jfloat) [event deltaY]);
+    macapk::MacApkInputPriorityEnd();
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+    return YES;
+}
+
+// Does the APP hold pointer capture? Polled rather than pushed: the runtime
+// has no Java-to-Cocoa callback in this build, and the only moment the answer
+// matters is an event that arrives while the cursor is still free.
+- (BOOL)macapkHostPointerCaptureWanted {
+    if (!MacApkMouseRelativeEnabled()) return NO;
+    if (!macapk::g_touch_vm || !macapk::g_touch_dispatcher) return NO;
+    JNIEnv* env = nullptr;
+    JavaVM* vm = macapk::g_touch_vm;
+    jint r = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_21);
+    if (r == JNI_EDETACHED) {
+        if (vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK) return NO;
+    } else if (r != JNI_OK || !env) return NO;
+    static jmethodID mid = nullptr;
+    static bool looked = false;
+    if (!looked) {
+        looked = true;
+        jclass cls = env->GetObjectClass(macapk::g_touch_dispatcher);
+        mid = env->GetMethodID(cls, "hostPointerCaptureWanted", "()Z");
+        if (!mid && env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(cls);
+    }
+    if (!mid) return NO;
+    jboolean want = env->CallBooleanMethod(macapk::g_touch_dispatcher, mid);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return NO; }
+    return want == JNI_TRUE;
+}
+
 // HOVER (GitHub #25, MACAPK_HOVER_EVENTS default ON): AppKit sends mouseMoved: /
 // mouseExited: to a view only through a tracking area. Pointer movement with no
 // button held goes through macapkHostMouse:press:0 (an unchanged, empty button
@@ -11388,7 +11523,10 @@ static bool MacApkHoverEnabled() {
 }
 - (void)updateTrackingAreas {
     [super updateTrackingAreas];
-    if (!MacApkHoverEnabled() || !MacApkMousePointerEnabled()) return;
+    if (!MacApkMousePointerEnabled()) return;
+    // Relative mode needs this area too: its NSTrackingMouseMoved option is the
+    // only way a buttonless motion reaches the view at all.
+    if (!MacApkHoverEnabled() && !MacApkMouseRelativeEnabled()) return;
     for (NSTrackingArea* ta in [self.trackingAreas copy]) {
         if (ta.owner == self && ta.userInfo[@"macapk.hover"]) [self removeTrackingArea:ta];
     }
@@ -11401,6 +11539,20 @@ static bool MacApkHoverEnabled() {
     [self addTrackingArea:ta];
 }
 - (void)mouseMoved:(NSEvent*)event {
+    // While the cursor is held there is no pointer left to hover: the motion is
+    // a delta. Capture is taken only while the app holds it (its own
+    // requestPointerCapture) and is given back as soon as the app drops it, so a
+    // menu that released the capture gets its pointer on the very next motion.
+    // It also ends in macapkWindowResignedKey:, flagsChanged: (Cmd) or
+    // viewWillMoveToWindow:; after an explicit release it takes a press, see
+    // g_rel_mouse_released.
+    if (MacApkMouseRelativeEnabled() && !g_rel_mouse_released
+            && [[self window] isKeyWindow] && [self macapkHostPointerCaptureWanted]) {
+        [self macapkSetRelativeMouse:YES];
+    } else if (g_rel_mouse_on) {
+        [self macapkSetRelativeMouse:NO];
+    }
+    if ([self macapkHostMouseRelative:event]) return;
     if (!MacApkHoverEnabled() || ![self macapkHostMouse:event press:0]) [super mouseMoved:event];
 }
 - (void)mouseExited:(NSEvent*)event {
@@ -11440,12 +11592,34 @@ static bool MacApkHoverEnabled() {
         [w makeKeyAndOrderFront:nil];
         [NSApp activate];
     }
+    // A press is the deliberate way back into look mode after a release, but
+    // only the app can make look mode available at all: without its capture
+    // request this click stays an ordinary click in the menu.
+    if (MacApkMouseRelativeEnabled() && [[self window] isKeyWindow]
+            && [self macapkHostPointerCaptureWanted]) {
+        g_rel_mouse_released = false;
+        [self macapkSetRelativeMouse:YES];
+    }
     if ([self macapkHostMouse:event press:1]) return;
     [self dispatchMouseAction:0 atEvent:event];
 }
 - (void)mouseDragged:(NSEvent*)event {
+    if ([self macapkHostMouseRelative:event]) return;
     if ([self macapkHostMouse:event press:0]) return;
     [self dispatchMouseAction:2 atEvent:event];
+}
+
+// Cmd is the way back out of a held cursor: the game consumes Esc, and every
+// Mac gesture the user may need next (Cmd+Tab, Cmd+Q, Cmd+click on the Dock)
+// needs a real pointer. The cursor stays free (macapkReleaseRelativeMouse) so
+// the pointer can actually travel to where it is needed; a press over the view
+// re-engages look mode.
+- (void)flagsChanged:(NSEvent*)event {
+    if (MacApkMouseRelativeEnabled()
+            && ([event modifierFlags] & NSEventModifierFlagCommand) != 0) {
+        [self macapkReleaseRelativeMouse];
+    }
+    [super flagsChanged:event];
 }
 
 // HOST TRACKPAD CONTACTS -> Android multi-pointer (MACAPK_TRACKPAD_MULTITOUCH, default ON).
@@ -11492,10 +11666,12 @@ static int g_tpNextId = 0;
 // tells the mapper every contact is gone (it CANCELs a live hold and forgets them),
 // so no ghost pointer outlives the view that owned it.
 - (void)viewWillMoveToWindow:(NSWindow*)newWindow {
-    if (MacapkTrackpadMultitouchOn()) {
+    // Loss of key ends BOTH a live trackpad contact and a held cursor, so the
+    // observer is registered for either feature.
+    if (MacapkTrackpadMultitouchOn() || MacApkMouseRelativeEnabled()) {
         NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
         if (self.window) {
-            [self macapkTrackpadReset];
+            if (MacapkTrackpadMultitouchOn()) [self macapkTrackpadReset];
             [nc removeObserver:self name:NSWindowDidResignKeyNotification object:self.window];
         }
         if (newWindow) {
@@ -11503,12 +11679,18 @@ static int g_tpNextId = 0;
                        name:NSWindowDidResignKeyNotification object:newWindow];
         }
     }
+    // A view leaving its window can never legitimately keep the cursor: the
+    // window it held it for is gone.
+    if (!newWindow) [self macapkSetRelativeMouse:NO];
     [super viewWillMoveToWindow:newWindow];
 }
 
 - (void)macapkWindowResignedKey:(NSNotification*)note {
     (void)note;
-    [self macapkTrackpadReset];
+    // Plain release, no latch: a window the user comes back to hands the cursor
+    // over again on the first motion over the view, as before.
+    [self macapkSetRelativeMouse:NO];
+    if (MacapkTrackpadMultitouchOn()) [self macapkTrackpadReset];
 }
 
 - (void)macapkTrackpadReset {
@@ -11537,8 +11719,14 @@ static int g_tpNextId = 0;
     [self macapkTrackpadClaimForButton];
     if (![self macapkHostMouse:event press:1]) [super otherMouseDown:event];
 }
-- (void)rightMouseDragged:(NSEvent*)event { if (![self macapkHostMouse:event press:0]) [super rightMouseDragged:event]; }
-- (void)otherMouseDragged:(NSEvent*)event { if (![self macapkHostMouse:event press:0]) [super otherMouseDragged:event]; }
+- (void)rightMouseDragged:(NSEvent*)event {
+    if ([self macapkHostMouseRelative:event]) return;
+    if (![self macapkHostMouse:event press:0]) [super rightMouseDragged:event];
+}
+- (void)otherMouseDragged:(NSEvent*)event {
+    if ([self macapkHostMouseRelative:event]) return;
+    if (![self macapkHostMouse:event press:0]) [super otherMouseDragged:event];
+}
 - (void)rightMouseUp:(NSEvent*)event { if (![self macapkHostMouse:event press:-1]) [super rightMouseUp:event]; }
 - (void)otherMouseUp:(NSEvent*)event { if (![self macapkHostMouse:event press:-1]) [super otherMouseUp:event]; }
 

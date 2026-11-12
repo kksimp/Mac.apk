@@ -23,9 +23,9 @@ import sun.misc.Unsafe;
  *    concludes "no methods here" and falls back to the reflection path, which
  *    on this VM has no hidden-API list in front of it and simply works.
  *
- * 2. THE ADDRESS IS NOT MAPPED. HotSpot already converts the fault into
- *    java.lang.InternalError rather than dying; ART would have crashed the
- *    app outright. The libraries that reach this point catch
+ * 2. THE ADDRESS IS NOT MAPPED. Some HotSpot unsafe accesses convert the fault
+ *    into java.lang.InternalError, but a scalar absolute null read can kill
+ *    the VM. ART would have crashed the app outright. The libraries catch
  *    ReflectiveOperationException and nothing else, so the InternalError
  *    escapes and takes the caller's whole method with it -- in Aurora Store's
  *    case Application.onCreate, and with it every init that followed. We
@@ -271,6 +271,11 @@ public final class MacApkUnsafe {
     }
 
     public static int getInt(Unsafe u, long addr) {
+        // Meco's HiddenApiBypass reads the method-table count even when the
+        // Class.methods probe above returned EMPTY (0). HotSpot's scalar
+        // Unsafe read is not fault-recoverable here: catch(InternalError)
+        // cannot intercept SIGSEGV. Keep the empty table empty before JNI.
+        if (addr == 0) return 0;
         try { return u.getInt(addr); }
         catch (InternalError e) { noteFault(addr, "read", e); return 0; }
     }

@@ -54,6 +54,7 @@
 #include <atomic>
 #include <capstone/capstone.h>  // generic x18 platform-register rewriter
 #include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <utility>
 #include <cstdio>
@@ -6803,7 +6804,20 @@ void Image::apply_v8_flag_override() {
         set_flags = reinterpret_cast<set_flags_t>(
             lookup("_ZN2v82V818SetFlagsFromStringEPKcm"));
     }
-    if (!set_flags) return;   // not a V8-embedding image -> nothing to do
+    // Older V8/J2V8 releases take an int length, not size_t. They still
+    // require the same W^X policy; absence of the size_t overload does not
+    // mean that this image has no V8. Keep the function types distinct.
+    typedef void (*set_flags_int_t)(const char*, int);
+    set_flags_int_t set_flags_int = nullptr;
+    if (!set_flags) {
+        set_flags_int = reinterpret_cast<set_flags_int_t>(
+            lookup("_ZN2v88internal8FlagList18SetFlagsFromStringEPKci"));
+        if (!set_flags_int) {
+            set_flags_int = reinterpret_cast<set_flags_int_t>(
+                lookup("_ZN2v82V818SetFlagsFromStringEPKci"));
+        }
+    }
+    if (!set_flags && !set_flags_int) return;
 
     // Only fire once per process (the first V8-embedding image wins; there is one
     // V8 per process).
@@ -6838,8 +6852,18 @@ void Image::apply_v8_flag_override() {
 
     std::fprintf(stderr,
         "[v8-flags] %s: exports V8 SetFlagsFromString; applying \"%s\" "
-        "(setter=%p)\n", dbg_name_, flags, (void*)set_flags);
-    set_flags(flags, std::strlen(flags));
+        "(setter=%p)\n", dbg_name_, flags,
+        set_flags ? (void*)set_flags : (void*)set_flags_int);
+    if (set_flags) {
+        set_flags(flags, std::strlen(flags));
+    } else {
+        const size_t length = std::strlen(flags);
+        if (length > static_cast<size_t>(INT_MAX)) {
+            std::fprintf(stderr, "[v8-flags] flag string exceeds int length\n");
+            return;
+        }
+        set_flags_int(flags, static_cast<int>(length));
+    }
     std::fprintf(stderr, "[v8-flags] %s: applied\n", dbg_name_);
 }
 

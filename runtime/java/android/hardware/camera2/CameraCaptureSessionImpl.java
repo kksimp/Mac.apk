@@ -50,6 +50,7 @@
 package android.hardware.camera2;
 
 import android.graphics.ImageFormat;
+import android.hardware.camera2.params.OutputConfiguration;
 import android.graphics.SurfaceTexture;
 import android.media.ImageReader;
 import android.os.Handler;
@@ -106,9 +107,12 @@ final class CameraCaptureSessionImpl extends CameraCaptureSession {
      * memory layout, where (0, 0) is the top-left corner."
      *
      * Our RGBA copies put the image's top row at buffer row 0 (the buffer
-     * queue memory layout), the Mac's sensor is unrotated
-     * (SENSOR_ORIENTATION 0, so no rotation term), and there is no crop, so
-     * pure flip-V is the exact AOSP answer, not an approximation. Column-major
+     * queue memory layout), there is no crop, and no rotation term is
+     * applied, so for an unmirrored stream with SENSOR_ORIENTATION 0 pure
+     * flip-V is the AOSP answer (mirrored streams: transformFor). With a
+     * non-zero SENSOR_ORIENTATION (a landscape window; see CameraBackend)
+     * AOSP's transform would also rotate by it, which this does not yet do.
+     * Column-major
      * for glUniformMatrix4fv, per the SurfaceTexture.getTransformMatrix
      * contract. macapkQueueFrame clones it, so sharing one instance is safe.
      */
@@ -118,6 +122,44 @@ final class CameraCaptureSessionImpl extends CameraCaptureSession {
         0f,  0f, 1f, 0f,
         0f,  1f, 0f, 1f,
     };
+
+    /**
+     * MTX_FLIP_V plus a horizontal mirror (s' = 1 - s, t' = 1 - t). Column-major.
+     *
+     * Used for OutputConfiguration.MIRROR_MODE_H, and for MIRROR_MODE_AUTO (the
+     * default) on a FRONT-facing camera: on a device, CameraUtils::
+     * getRotationTransform (frameworks/av camera/CameraUtils.cpp, applied to
+     * each output by Camera3Device) adds NATIVE_WINDOW_TRANSFORM_FLIP_H in
+     * both cases,
+     * and consumers rely on it -- WebRTC's Camera2Session undoes the front
+     * camera's mirror and the app re-mirrors for a selfie view. Same constant,
+     * same reason, as android.hardware.Camera's MTX_FLIP_V_FRONT.
+     */
+    private static final float[] MTX_FLIP_V_MIRROR_H = {
+        -1f,  0f, 0f, 0f,
+         0f, -1f, 0f, 0f,
+         0f,  0f, 1f, 0f,
+         1f,  1f, 0f, 1f,
+    };
+
+    /**
+     * MIRROR_MODE_V: the stream is mirrored vertically (getRotationTransform
+     * adds NATIVE_WINDOW_TRANSFORM_FLIP_V), which cancels GLConsumer's own flip-V,
+     * leaving the identity.
+     */
+    private static final float[] MTX_IDENTITY = {
+        1f, 0f, 0f, 0f,
+        0f, 1f, 0f, 0f,
+        0f, 0f, 1f, 0f,
+        0f, 0f, 0f, 1f,
+    };
+
+    /** LENS_FACING_FRONT, read once: what MIRROR_MODE_AUTO means for this camera. */
+    private final boolean mFrontFacing;
+    /** Each output's OutputConfiguration mirror mode; absent means MIRROR_MODE_AUTO. */
+    private final Map<Surface, Integer> mMirrorModes;
+    /** Per SurfaceTexture output, the transform its frames are queued with. */
+    private volatile Map<SurfaceTexture, float[]> mTextureTransforms = Collections.emptyMap();
 
     private volatile boolean mConfigured;
     private volatile boolean mClosed;
@@ -177,12 +219,28 @@ final class CameraCaptureSessionImpl extends CameraCaptureSession {
     }
 
     CameraCaptureSessionImpl(CameraDeviceImpl device, long handle, List<Surface> outputs,
+            Map<Surface, Integer> mirrorModes,
             CameraCaptureSession.StateCallback callback, CameraDispatch dispatch) {
         mDevice = device;
         mHandle = handle;
         mOutputs = new ArrayList<>(outputs);
         mStateCallback = callback;
         mStateDispatch = dispatch;
+        int index = CameraBackend.deviceIndexForId(device.getId());
+        mFrontFacing = index >= 0
+                && CameraBridge.getDeviceFacing(index) == CameraBridge.FACING_FRONT;
+        mMirrorModes = mirrorModes != null ? mirrorModes : Collections.emptyMap();
+    }
+
+    /** The SurfaceTexture transform for one output, from its mirror mode. */
+    private float[] transformFor(Surface output) {
+        int mode = mMirrorModes.getOrDefault(output, OutputConfiguration.MIRROR_MODE_AUTO);
+        switch (mode) {
+            case OutputConfiguration.MIRROR_MODE_NONE: return MTX_FLIP_V;
+            case OutputConfiguration.MIRROR_MODE_H:    return MTX_FLIP_V_MIRROR_H;
+            case OutputConfiguration.MIRROR_MODE_V:    return MTX_IDENTITY;
+            default:                                   return mFrontFacing ? MTX_FLIP_V_MIRROR_H : MTX_FLIP_V;
+        }
     }
 
     // ---- Configuration ---------------------------------------------------
@@ -224,6 +282,7 @@ final class CameraCaptureSessionImpl extends CameraCaptureSession {
         //    path and is named in the log as receiving nothing.
         List<ImageReader> readers = new ArrayList<>();
         List<SurfaceTexture> textures = new ArrayList<>();
+        Map<SurfaceTexture, float[]> transforms = new HashMap<>();
         List<Surface> unsupported = new ArrayList<>();
         for (Surface s : mOutputs) {
             ImageReader r = ImageReader.macapkReaderForSurface(s);
@@ -234,6 +293,7 @@ final class CameraCaptureSessionImpl extends CameraCaptureSession {
             SurfaceTexture st = s.macapkGetSurfaceTexture();
             if (st != null && !st.isReleased()) {
                 textures.add(st);
+                transforms.put(st, transformFor(s));
                 continue;
             }
             unsupported.add(s);
@@ -355,6 +415,7 @@ final class CameraCaptureSessionImpl extends CameraCaptureSession {
             st.macapkAttachCameraSource(mHandle, nw, nh);
         }
         mReaders = readers;
+        mTextureTransforms = transforms;
         mSurfaceTextures = textures;
         mConfigured = true;
 
@@ -808,6 +869,7 @@ final class CameraCaptureSessionImpl extends CameraCaptureSession {
             st.macapkDetachCameraSource();
         }
         mSurfaceTextures = Collections.emptyList();
+        mTextureTransforms = Collections.emptyMap();
 
         // Stop the AVFoundation session but leave the device open: AOSP's
         // session close does not close the CameraDevice, and an app may
@@ -970,8 +1032,9 @@ final class CameraCaptureSessionImpl extends CameraCaptureSession {
         if (!textures.isEmpty()) {
             long pts = CameraBridge.latestFrameTimestamp(mHandle);
             if (pts == 0) pts = timestampNs;
+            Map<SurfaceTexture, float[]> transforms = mTextureTransforms;
             for (SurfaceTexture st : textures) {
-                st.macapkQueueFrame(pts, MTX_FLIP_V, 0);
+                st.macapkQueueFrame(pts, transforms.getOrDefault(st, MTX_FLIP_V), 0);
             }
         }
 

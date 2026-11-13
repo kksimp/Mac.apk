@@ -213,10 +213,22 @@ final class CameraBackend {
         if (facing < 0) facing = CameraCharacteristics.LENS_FACING_EXTERNAL;
         p.put(CameraCharacteristics.LENS_FACING, Integer.valueOf(facing));
 
-        // SENSOR_ORIENTATION is 0 on a Mac: the sensor does not rotate with the
-        // device, so the app must apply no preview rotation. This is the value
-        // apps feed into their display-rotation maths, so a wrong one shows a
-        // sideways preview -- it is behaviour, not documentation.
+        // SENSOR_ORIENTATION: the same value as Camera.CameraInfo.orientation,
+        // the one that, combined with the Display.getRotation() this runtime
+        // reports, makes a Camera1 app apply NO net preview rotation -- a Mac's
+        // camera image is already upright on its screen.
+        // CameraBridge.getSensorOrientation explains the formula and why it is
+        // not simply 0. Apps feed it into their display-rotation maths, so a
+        // wrong one shows a sideways preview -- it is behaviour, not
+        // documentation.
+        //
+        // ⚠ camera2 is NOT yet consistent with it: on a device,
+        // CameraUtils::getRotationTransform also folds SENSOR_ORIENTATION into
+        // each SurfaceTexture output's transform, and consumers such as
+        // WebRTC's Camera2Session undo that rotation. CameraCaptureSessionImpl
+        // applies only the mirror half, so such a consumer still turns the
+        // picture 90 degrees in a landscape window, as it did when this was 0.
+        // Untested with a camera2 app; Camera1 is the measured path.
         p.put(CameraCharacteristics.SENSOR_ORIENTATION,
                 Integer.valueOf(CameraBridge.getSensorOrientation(index)));
 

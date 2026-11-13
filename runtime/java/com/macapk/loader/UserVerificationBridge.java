@@ -12,10 +12,13 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class UserVerificationBridge {
     private UserVerificationBridge(){}
     public static final int STRONG=0x000f, WEAK=0x00ff, DEVICE_CREDENTIAL=0x8000;
-    private static final boolean ON="1".equals(System.getenv("MACAPK_USER_VERIFICATION_HOST"));
     private static final AtomicLong IDS=new AtomicLong();
     private static final Map<Long,Session> SESSIONS=new ConcurrentHashMap<>();
     private static native boolean nativeBound();
+    /** Whether this app may use host verification at all: the Mac.apk Settings
+     *  switch, overridden per app by MACAPK_USER_VERIFICATION_HOST (native On()
+     *  holds the one rule, so Java and native can never disagree). */
+    private static native boolean nativeEnabled();
     private static native int nativeCanAuthenticate(int mask);
     private static native boolean nativeBegin(long id,int mask,String reason,Object crypto,String negativeText);
     private static native void nativeCancel(long id);
@@ -23,7 +26,13 @@ public final class UserVerificationBridge {
     private static native long nativeLastAuthenticationTime(int mask);
     private static native void nativeBeginKeyOperation(Object spi);
     private static native boolean nativeConsumeAuthorization(Object spi,boolean perUse,int seconds,int mask);
-    public static boolean available(){try{return ON&&nativeBound();}catch(UnsatisfiedLinkError e){return false;}}
+    public static boolean available() {
+        try {
+            return nativeBound() && nativeEnabled();
+        } catch (UnsatisfiedLinkError e) {
+            return false;   // natives not registered in this process
+        }
+    }
     public static int canAuthenticate(int mask){return available()?nativeCanAuthenticate(mask):12;}
     public static long lastAuthenticationTime(int mask){return available()?nativeLastAuthenticationTime(mask):-1;}
     /** Revokes a previous operation's authorization. This never grants access. */
@@ -49,7 +58,7 @@ public final class UserVerificationBridge {
         synchronized void begin(int mask,String reason,Object crypto,String negativeText){
             if(done)return;
             if(signal!=null&&signal.isCanceled()){finish(false,0,5,"User verification was canceled");return;}
-            if(!available()){finish(false,0,12,"Host user verification is not enabled in this runtime");return;}
+            if(!available()){finish(false,0,12,"Touch ID and password are turned off for this app (Mac.apk Settings > Touch ID, or MACAPK_USER_VERIFICATION_HOST)");return;}
             int capability=nativeCanAuthenticate(mask);
             if(capability!=0){finish(false,0,capability==11?11:capability==1?1:12,capability==-2?"The host cannot provide the requested Android authenticator strength or type":"The requested user verification method is unavailable");return;}
             nativeStarted=nativeBegin(id,mask,reason==null||reason.isBlank()?"Verify your identity":reason,crypto,negativeText);

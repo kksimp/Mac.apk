@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <string>
+#include <pwd.h>
+#include <unistd.h>
 
 namespace macapk {
 namespace {
@@ -36,7 +38,28 @@ std::unordered_map<jlong,std::shared_ptr<Request>> uvRequests;
 std::vector<Operation> uvOperations;
 std::vector<Grant> uvGrants;
 std::vector<Authentication> uvAuthentications;
-bool On(){const char* s=std::getenv("MACAPK_USER_VERIFICATION_HOST");return s&&std::string(s)=="1";}
+// Whether this app may use the Mac's Touch ID and password at all. Decided
+// once per process, so it takes effect the next time an app opens:
+//   1. MACAPK_USER_VERIFICATION_HOST, when set, wins either way ("1" on,
+//      anything else off). It is how one app is turned off (or on) through
+//      its Environment overrides, whatever the Settings switch says.
+//   2. Otherwise Mac.apk Settings > Touch ID decides: the launcher creates
+//      this file to turn it on, as it does for "Use Google GMS"
+//      (SystemClient.useGoogleGmsFile), because an app opened from the Dock
+//      gets no environment from the launcher. Default off: no file.
+// The path comes from the account's home directory record rather than $HOME,
+// which the runtime may repoint for the Android app.
+bool On(){
+    static const bool on=[]{
+        const char* env=std::getenv("MACAPK_USER_VERIFICATION_HOST");
+        if(env&&*env)return std::string(env)=="1";
+        const passwd* pw=getpwuid(getuid());
+        if(!pw||!pw->pw_dir)return false;
+        std::string setting=std::string(pw->pw_dir)+"/Library/Application Support/Mac.apk/use-touch-id";
+        return access(setting.c_str(),F_OK)==0;
+    }();
+    return on;
+}
 uint64_t Now(){mach_timebase_info_data_t t;mach_timebase_info(&t);return (uint64_t)((__uint128_t)mach_continuous_time()*t.numer/t.denom/1000000);}
 JNIEnv* Env(){JNIEnv* e=nullptr;if(!uvVm)return nullptr;jint r=uvVm->GetEnv((void**)&e,JNI_VERSION_21);if(r==JNI_EDETACHED&&uvVm->AttachCurrentThreadAsDaemon((void**)&e,nullptr)!=JNI_OK)return nullptr;return e;}
 NSString* String(JNIEnv* e,jstring value){if(!value)return nil;const char* p=e->GetStringUTFChars(value,nullptr);NSString* out=p?[NSString stringWithUTF8String:p]:nil;if(p)e->ReleaseStringUTFChars(value,p);return out;}
@@ -158,6 +181,7 @@ void Start(std::shared_ptr<Request> request){
     else Finish(request,Error(error),0);
 }
 static jboolean Bound(JNIEnv*,jclass){return true;}
+static jboolean Enabled(JNIEnv*,jclass){return On();}
 static jint CanAuthenticate(JNIEnv*,jclass,jint mask){return Query(mask);}
 static jboolean Begin(JNIEnv* e,jclass,jlong id,jint mask,jstring reason,jobject crypto,jstring negative){
     if(!On()||!ValidMask(mask))return false;
@@ -220,6 +244,7 @@ void RegisterUserVerificationNativeMethods(JNIEnv* e){
     uvCompleted=e->GetStaticMethodID(c,"onNativeCompleted","(J)V");
     const JNINativeMethod methods[]={
         {(char*)"nativeBound",(char*)"()Z",(void*)Bound},
+        {(char*)"nativeEnabled",(char*)"()Z",(void*)Enabled},
         {(char*)"nativeCanAuthenticate",(char*)"(I)I",(void*)CanAuthenticate},
         {(char*)"nativeBegin",(char*)"(JILjava/lang/String;Ljava/lang/Object;Ljava/lang/String;)Z",(void*)Begin},
         {(char*)"nativeCancel",(char*)"(J)V",(void*)Cancel},

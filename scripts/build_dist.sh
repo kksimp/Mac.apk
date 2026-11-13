@@ -376,7 +376,20 @@ fi
 # wipes the guest's x18 on every EL0 exception return.
 # Inside-out order matters: these are all inside $APP, which is sealed below.
 [ -f "$RES/jre/lib/jspawnhelper" ]   && sign "$RES/jre/lib/jspawnhelper" --entitlements "$ENT"
-[ -f "$RES/appstub/MacApkAppStub" ]  && sign "$RES/appstub/MacApkAppStub" --identifier org.macapk.appstub
+# The per-app stub template MUST carry $ENT too. Every generated app bundle's
+# Contents/MacOS/<name> is a copy of it, and TCC attributes an app's camera and
+# microphone requests to that RESPONSIBLE binary, not to macapk-runtime, which
+# it execs. Under the hardened runtime TCC refuses WITHOUT A PROMPT when the
+# responsible binary lacks the device entitlement -- measured 2026-11-12 on
+# OurFamilyWizard 2026.11.1: tccd logged "Prompting policy for hardened
+# runtime; service: kTCCServiceCamera requires entitlement
+# com.apple.security.device.camera but it is missing for responsible=
+# {identifier=org.macapk.appstub ...}" (and the same for kTCCServiceMicrophone
+# / device.audio-input), the app never appeared under Privacy & Security, and
+# its camera open timed out. Same failure, same fix, as the Location helper
+# below. build_launcher.sh's dev stub is signed WITHOUT --options runtime, so
+# dev builds never showed it.
+[ -f "$RES/appstub/MacApkAppStub" ]  && sign "$RES/appstub/MacApkAppStub" --entitlements "$ENT" --identifier org.macapk.appstub
 [ -f "$BIN/macapk-elfexec" ]         && sign "$BIN/macapk-elfexec" --entitlements "$ENT"
 [ -f "$BIN/macapk-installhelper" ]   && sign "$BIN/macapk-installhelper"
 # "Mac.apk Location" (launcher/LocationHelperMain.swift): a nested app that must
@@ -402,6 +415,12 @@ fi
 "$PROJECT_DIR/debug/entitlements_check.sh" "$RES/macapk-runtime" || exit 1
 if [ -f "$BIN/macapk-elfexec" ]; then
     "$PROJECT_DIR/debug/entitlements_check.sh" "$BIN/macapk-elfexec" || exit 1
+fi
+# The app stub too: without its device entitlements macOS refuses every app's
+# camera and microphone with no prompt (see the stub's signing above), and
+# nothing else would notice.
+if [ -f "$RES/appstub/MacApkAppStub" ]; then
+    "$PROJECT_DIR/debug/entitlements_check.sh" "$RES/appstub/MacApkAppStub" || exit 1
 fi
 
 # ---------------------------------------------------------------------------

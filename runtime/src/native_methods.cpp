@@ -37,6 +37,8 @@
 // straight to ANGLE's libGLESv2 symbols (we already link the dylib).
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#include <EGL/egl.h>      // EGLImage-backed external textures (see MacapkUseExternalImages)
+#include <EGL/eglext.h>
 #include "angle_glue.h"   // AngleMarkFrameWithheld
 #endif
 
@@ -933,6 +935,184 @@ jboolean Gles_init(JNIEnv*, jclass, jlong layer, jint w, jint h) {
 void Gles_beginFrame(JNIEnv*, jclass) { GlesBeginFrame(); }
 void Gles_endFrame(JNIEnv*, jclass)   { GlesEndFrame(); }
 
+// ---- EGLImage-backed external textures (2026-11-12) ---------------------
+// How a device delivers a SurfaceTexture frame: GLConsumer binds the frame's
+// buffer to the consumer's GL_TEXTURE_EXTERNAL_OES texture as an EGLImage, so
+// every consumer -- Java through android.opengl, NATIVE code calling libGLESv2
+// directly -- samples a real external texture with a samplerExternalOES
+// shader. Mac.apk's camera frames arrive as RGBA in memory, so the same shape
+// is built from parts: SurfaceTexture uploads into a private GL_TEXTURE_2D
+// "staging" texture, makes an EGLImage from it (EGL_KHR_gl_texture_2D_image),
+// and attaches that image to the consumer's external texture
+// (GL_OES_EGL_image). Later frames update the staging texture in place, which
+// updates every sibling of the image.
+//
+// WHY, measured on OurFamilyWizard 2026.11.1: Twilio's virtual-background
+// compositor runs in native code (libFrameProcessor.so) and binds the camera
+// texture as GL_TEXTURE_EXTERNAL_OES itself. The JNI-level name translation
+// (MacapkExternalAs2D) cannot reach native callers, so with it the native
+// bind failed (INVALID_OPERATION) and the composite sampled nothing: a black
+// person over the new background, and a black image with blur.
+//
+// Decided once per EGL display, on the first call with a context current on
+// it. ANGLE's Vulkan backend has all three extensions; its Metal backend has
+// no external textures, and there the name translation remains the fallback
+// (Java consumers only). Per display, not per process: in a process started
+// with ANGLE_DEFAULT_PLATFORM=vulkan, EGL14's default display is Vulkan while
+// the EGL10 facade's and the framework's stay on Metal (egl14_bridges.inc,
+// THE DISPLAY), so one answer for the process would be wrong for one of them.
+// The translation and SurfaceTexture both ask on the CALLER's current context,
+// so they always agree for that context.
+#ifdef MACAPK_HAS_ANGLE
+static bool MacapkHasExtToken(const char* list, const char* name) {
+    if (!list || !name) return false;
+    size_t n = std::strlen(name);
+    for (const char* p = list; (p = std::strstr(p, name)) != nullptr; p += n) {
+        bool startOk = (p == list) || p[-1] == ' ';
+        bool endOk = p[n] == '\0' || p[n] == ' ';
+        if (startOk && endOk) return true;
+    }
+    return false;
+}
+#endif
+#ifdef MACAPK_HAS_ANGLE
+// One entry per EGL display a context was current on (a handful at most).
+// Read on every external bind and every camera latch, so a lookup is one
+// short locked map probe; the extension strings are parsed once per display.
+static std::mutex g_macapk_ext_mtx;
+static std::unordered_map<EGLDisplay, bool> g_macapk_ext_by_display;
+#endif
+static bool MacapkUseExternalImages() {
+#ifdef MACAPK_HAS_ANGLE
+    EGLDisplay dpy = eglGetCurrentDisplay();
+    if (dpy == EGL_NO_DISPLAY) return false;     // no context yet: decide later
+    {
+        std::lock_guard<std::mutex> lk(g_macapk_ext_mtx);
+        auto it = g_macapk_ext_by_display.find(dpy);
+        if (it != g_macapk_ext_by_display.end()) return it->second;
+    }
+    const char* gl = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+    if (!gl) return false;
+    const char* egl = eglQueryString(dpy, EGL_EXTENSIONS);
+    bool ok = MacapkHasExtToken(gl, "GL_OES_EGL_image_external")
+           && MacapkHasExtToken(gl, "GL_OES_EGL_image")
+           && MacapkHasExtToken(egl, "EGL_KHR_gl_texture_2D_image")
+           && eglGetProcAddress("eglCreateImageKHR") != nullptr
+           && eglGetProcAddress("glEGLImageTargetTexture2DOES") != nullptr;
+    bool first;
+    {
+        std::lock_guard<std::mutex> lk(g_macapk_ext_mtx);
+        first = g_macapk_ext_by_display.emplace(dpy, ok).second;
+    }
+    if (first)
+        std::fprintf(stderr, "[I] gles: SurfaceTexture frames reach external textures via %s "
+                             "(EGL display %p)\n",
+                     ok ? "EGLImage (as on a device)"
+                        : "TEXTURE_2D name translation (backend lacks external textures)",
+                     dpy);
+    return ok;
+#else
+    return false;
+#endif
+}
+jboolean Gles_externalImagesSupported(JNIEnv*, jclass) {
+    return MacapkUseExternalImages() ? JNI_TRUE : JNI_FALSE;
+}
+#ifdef MACAPK_HAS_ANGLE
+// The display each live image was made on. An EGLImage belongs to its display,
+// not to a context or thread, so SurfaceTexture.release() may free one from a
+// thread with no context current; eglDestroyImageKHR needs the display, which
+// that thread cannot query.
+static std::mutex g_macapk_image_mtx;
+static std::unordered_map<EGLImageKHR, EGLDisplay> g_macapk_image_dpy;
+#endif
+
+/** EGLImage from level 0 of a complete GL_TEXTURE_2D in the CURRENT context;
+ *  0 on failure (logged once). */
+jlong Gles_createImageFromTexture2D(JNIEnv*, jclass, jint tex) {
+#ifdef MACAPK_HAS_ANGLE
+    static auto create = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(
+        eglGetProcAddress("eglCreateImageKHR"));
+    EGLDisplay dpy = eglGetCurrentDisplay();
+    EGLContext ctx = eglGetCurrentContext();
+    if (!create || dpy == EGL_NO_DISPLAY || ctx == EGL_NO_CONTEXT || tex == 0) return 0;
+    const EGLint attrs[] = { EGL_GL_TEXTURE_LEVEL_KHR, 0, EGL_NONE };
+    EGLImageKHR img = create(dpy, ctx, EGL_GL_TEXTURE_2D_KHR,
+                             reinterpret_cast<EGLClientBuffer>(static_cast<uintptr_t>(tex)), attrs);
+    if (img == EGL_NO_IMAGE_KHR) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr, "[W] gles: eglCreateImageKHR(TEXTURE_2D %d) failed: 0x%x\n",
+                         (int) tex, (unsigned) eglGetError());
+        }
+        return 0;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_macapk_image_mtx);
+        g_macapk_image_dpy[img] = dpy;
+    }
+    return static_cast<jlong>(reinterpret_cast<uintptr_t>(img));
+#else
+    (void) tex;
+    return 0;
+#endif
+}
+/** Attach an EGLImage to `tex` as GL_TEXTURE_EXTERNAL_OES, restoring the
+ *  caller's external binding. Calls ANGLE directly: the JNI translation must
+ *  not turn this bind into a 2D one. */
+jboolean Gles_attachImageToExternal(JNIEnv*, jclass, jint tex, jlong image) {
+#ifdef MACAPK_HAS_ANGLE
+    static auto target = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
+        eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+    if (!target || image == 0 || tex == 0) return JNI_FALSE;
+    GLint prev = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_EXTERNAL_OES, &prev);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, (GLuint) tex);
+    target(GL_TEXTURE_EXTERNAL_OES,
+           reinterpret_cast<GLeglImageOES>(static_cast<uintptr_t>(image)));
+    // A known limit: glGetError returns the OLDEST pending error, so an error
+    // the app left unchecked before this frame is read here, reported as a
+    // failed attach (retried on the next frame) and no longer seen by the
+    // app's own glGetError. Checking first would consume it the same way.
+    // This runs only when the attachment changes (a new size or texture).
+    GLenum err = glGetError();
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, (GLuint) prev);
+    if (err != GL_NO_ERROR) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr, "[W] gles: glEGLImageTargetTexture2DOES(tex %d) failed: 0x%x\n",
+                         (int) tex, (unsigned) err);
+        }
+        return JNI_FALSE;
+    }
+    return JNI_TRUE;
+#else
+    (void) tex; (void) image;
+    return JNI_FALSE;
+#endif
+}
+/** Free an image from createImageFromTexture2D, from any thread. */
+void Gles_destroyImage(JNIEnv*, jclass, jlong image) {
+#ifdef MACAPK_HAS_ANGLE
+    static auto destroy = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(
+        eglGetProcAddress("eglDestroyImageKHR"));
+    EGLImageKHR img = reinterpret_cast<EGLImageKHR>(static_cast<uintptr_t>(image));
+    EGLDisplay dpy = EGL_NO_DISPLAY;
+    {
+        std::lock_guard<std::mutex> lk(g_macapk_image_mtx);
+        auto it = g_macapk_image_dpy.find(img);
+        if (it == g_macapk_image_dpy.end()) return;   // 0, or not one of ours
+        dpy = it->second;
+        g_macapk_image_dpy.erase(it);
+    }
+    if (destroy) destroy(dpy, img);
+#else
+    (void) image;
+#endif
+}
+
 const JNINativeMethod kNativeGlesMethods[] = {
     {const_cast<char*>("init"),       const_cast<char*>("(JII)Z"),
      reinterpret_cast<void*>(Gles_init)},
@@ -940,6 +1120,14 @@ const JNINativeMethod kNativeGlesMethods[] = {
      reinterpret_cast<void*>(Gles_beginFrame)},
     {const_cast<char*>("endFrame"),   const_cast<char*>("()V"),
      reinterpret_cast<void*>(Gles_endFrame)},
+    {const_cast<char*>("externalImagesSupported"), const_cast<char*>("()Z"),
+     reinterpret_cast<void*>(Gles_externalImagesSupported)},
+    {const_cast<char*>("createImageFromTexture2D"), const_cast<char*>("(I)J"),
+     reinterpret_cast<void*>(Gles_createImageFromTexture2D)},
+    {const_cast<char*>("attachImageToExternal"), const_cast<char*>("(IJ)Z"),
+     reinterpret_cast<void*>(Gles_attachImageToExternal)},
+    {const_cast<char*>("destroyImage"), const_cast<char*>("(J)V"),
+     reinterpret_cast<void*>(Gles_destroyImage)},
 };
 
 // ---------- android.opengl.GLES20 ----------
@@ -1066,14 +1254,102 @@ void GLES20_glActiveTexture(JNIEnv*, jclass, jint unit) {
     glActiveTexture(unit);
 #endif
 }
+// ---- External textures as GL_TEXTURE_2D: the FALLBACK (2026-11-12) -------
+// Used only where the GL backend has NO external textures (ANGLE Metal);
+// where it has them (ANGLE Vulkan) SurfaceTexture delivers frames as
+// EGLImages instead, the device way, and this translation switches itself
+// off (MacapkExternalAs2D -> MacapkUseExternalImages, above).
+//
+// On the fallback, android.graphics.SurfaceTexture uploads RGBA into the
+// consumer's texture name as GL_TEXTURE_2D (SurfaceTexture.latchViaTexture2D).
+// A consumer written for Android binds that name to GL_TEXTURE_EXTERNAL_OES
+// and samples it through a samplerExternalOES shader; ANGLE Metal rejects
+// both (the bind is INVALID_ENUM, the shader does not compile). So here both
+// are mapped to their 2D equivalents, and the upload and the sampling meet on
+// one texture: binds, tex-parameter calls and queries on the external target,
+// GL_TEXTURE_BINDING_EXTERNAL_OES, and samplerExternalOES in shader source.
+//
+// Limits, notated rather than hidden:
+//   * Only calls through the Java GLES bridge are translated. Native code
+//     calling libGLESv2 directly is not, so a native external-texture consumer
+//     cannot work on this backend -- as it could not without the translation.
+//   * MACAPK_EXTERNAL_OES_AS_2D=0 turns the translation off (pass-through), for
+//     diagnosis only: SurfaceTexture still uploads 2D on the fallback, so its
+//     consumers there show black with it.
+//
+// Why this was written first, measured on OurFamilyWizard 2026.11.1 (Twilio
+// Video / WebRTC camera preview, which runs on ANGLE Vulkan): with neither
+// mechanism, SurfaceTexture's glBindTexture(GL_TEXTURE_2D, tex) on a name the
+// app had made external failed with INVALID_OPERATION (0x502) and the preview
+// sampled an empty external texture -- black, at 30 fps. The translation fixed
+// the Java preview; Twilio's native virtual-background compositor then showed
+// that only EGLImage delivery reaches native consumers, hence the split.
+static constexpr GLenum kMacapkTexExternalOES = 0x8D65;        // GL_TEXTURE_EXTERNAL_OES
+static constexpr GLenum kMacapkTexBindingExternalOES = 0x8D67; // GL_TEXTURE_BINDING_EXTERNAL_OES
+static bool MacapkUseExternalImages();
+static bool MacapkExternalAs2D() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_EXTERNAL_OES_AS_2D");
+        return !(e && e[0] == '0');
+    }();
+    // Where the backend supports EGLImage external textures, frames are
+    // delivered the device way (see MacapkUseExternalImages) and no name may
+    // be translated: a translated bind would make the consumer's texture 2D
+    // and break native consumers that bind it as external.
+    return on && !MacapkUseExternalImages();
+}
+static inline GLenum MacapkTexTarget(jint t) {
+    return ((GLenum) t == kMacapkTexExternalOES && MacapkExternalAs2D())
+        ? (GLenum) GL_TEXTURE_2D : (GLenum) t;
+}
+static inline GLenum MacapkTexQuery(jint pname) {
+    return ((GLenum) pname == kMacapkTexBindingExternalOES && MacapkExternalAs2D())
+        ? (GLenum) GL_TEXTURE_BINDING_2D : (GLenum) pname;
+}
+// samplerExternalOES -> sampler2D, and the extension directive (ESSL1
+// GL_OES_EGL_image_external, ESSL3 GL_OES_EGL_image_external_essl3) blanked
+// in place so line numbers in the compiler's log still match the app's
+// source. texture2D()/texture() take a sampler2D unchanged.
+static std::string MacapkTranslateExternalShader(const char* src) {
+    std::string s(src);
+    if (!MacapkExternalAs2D()) return s;
+    if (s.find("samplerExternalOES") == std::string::npos &&
+        s.find("GL_OES_EGL_image_external") == std::string::npos) return s;
+    std::string out;
+    out.reserve(s.size());
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t eol = s.find('\n', pos);
+        size_t end = eol == std::string::npos ? s.size() : eol;
+        std::string line = s.substr(pos, end - pos);
+        size_t first = line.find_first_not_of(" \t");
+        bool directive = first != std::string::npos
+            && line.compare(first, 10, "#extension") == 0
+            && line.find("GL_OES_EGL_image_external") != std::string::npos;
+        if (!directive) out += line;
+        if (eol != std::string::npos) out += '\n';
+        pos = end + 1;
+    }
+    const std::string from = "samplerExternalOES", to = "sampler2D";
+    for (size_t at = out.find(from); at != std::string::npos; at = out.find(from, at + to.size()))
+        out.replace(at, from.size(), to);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        std::fprintf(stderr, "[I] gles: external-texture shader translated to sampler2D "
+                             "(MACAPK_EXTERNAL_OES_AS_2D=0 disables)\n");
+    }
+    return out;
+}
+
 void GLES20_glBindTexture(JNIEnv*, jclass, jint target, jint tex) {
 #ifdef MACAPK_HAS_ANGLE
-    glBindTexture(target, tex);
+    glBindTexture(MacapkTexTarget(target), tex);
 #endif
 }
 void GLES20_glTexParameteri(JNIEnv*, jclass, jint target, jint pname, jint param) {
 #ifdef MACAPK_HAS_ANGLE
-    glTexParameteri(target, pname, param);
+    glTexParameteri(MacapkTexTarget(target), pname, param);
 #endif
 }
 void GLES20_glBindBuffer(JNIEnv*, jclass, jint target, jint buf) {
@@ -1246,10 +1522,12 @@ jint GLES20_glCreateShader(JNIEnv*, jclass, jint type) {
 void GLES20_glShaderSource(JNIEnv* env, jclass, jint shader, jstring src) {
 #ifdef MACAPK_HAS_ANGLE
     if (!src) return;
-    const char* s = env->GetStringUTFChars(src, nullptr);
-    GLint len = (GLint) std::strlen(s);
+    const char* raw = env->GetStringUTFChars(src, nullptr);
+    std::string translated = MacapkTranslateExternalShader(raw);
+    env->ReleaseStringUTFChars(src, raw);
+    const char* s = translated.c_str();
+    GLint len = (GLint) translated.size();
     glShaderSource(shader, 1, &s, &len);
-    env->ReleaseStringUTFChars(src, s);
 #endif
 }
 void GLES20_glCompileShader(JNIEnv*, jclass, jint shader) {
@@ -1508,7 +1786,7 @@ void GLES20_glGetIntegerv(JNIEnv* env, jclass, jint pname, jintArray params, jin
     jsize avail = env->GetArrayLength(params) - offset;
     if (avail <= 0) return;
     std::vector<GLint> v(GlScratchCount(pname, avail), 0);
-    glGetIntegerv((GLenum) pname, v.data());
+    glGetIntegerv(MacapkTexQuery(pname), v.data());
     jsize copy = GlCopyCount(pname, avail);
     if ((size_t) copy > v.size()) copy = (jsize) v.size();
     if (copy > 0) env->SetIntArrayRegion(params, offset, copy,
@@ -2283,7 +2561,7 @@ void GLES20_glTexParameterf(JNIEnv*, jclass, jint t, jint pn, jfloat v) {
             std::fprintf(stderr, "[GLDRAW] glTexParameterf(target=0x%x pname=0x%x value=0x%x/%.1f)\n",
                          t, pn, (unsigned)v, (double)v);
     }
-    glTexParameterf((GLenum)t,(GLenum)pn,v);
+    glTexParameterf(MacapkTexTarget(t),(GLenum)pn,v);
 #endif
 }
 void GLES20_glCopyTexImage2D(JNIEnv*, jclass, jint t, jint l, jint fmt, jint x, jint y, jint w, jint h, jint b) {
@@ -2663,7 +2941,7 @@ void GLES20_glGetTexParameteriv(JNIEnv* env, jclass, jint t, jint pn, jintArray 
     // / EXT_texture_border_clamp, which ANGLE exposes) makes the driver write 4.
     // Same sizing the float sibling GLES20_glGetTexParameterfv already uses.
     GLint v[4] = {0, 0, 0, 0};
-    glGetTexParameteriv((GLenum) t, (GLenum) pn, v);
+    glGetTexParameteriv(MacapkTexTarget(t), (GLenum) pn, v);
     jsize avail = env->GetArrayLength(params) - off;
     if (avail > 4) avail = 4;
     if (avail > 0) env->SetIntArrayRegion(params, off, avail,
@@ -2812,7 +3090,7 @@ void GLES20_glTexParameterfv_arr(JNIEnv* env, jclass, jint t, jint pn, jfloatArr
     if (avail <= 0) return;
     jsize take = avail > 4 ? 4 : avail;
     env->GetFloatArrayRegion(v, off, take, f);
-    glTexParameterfv((GLenum) t, (GLenum) pn, f);
+    glTexParameterfv(MacapkTexTarget(t), (GLenum) pn, f);
 #else
     (void) env; (void) t; (void) pn; (void) v; (void) off;
 #endif
@@ -2825,7 +3103,7 @@ void GLES20_glGetTexParameterfv(JNIEnv* env, jclass, jint t, jint pn, jfloatArra
 #ifdef MACAPK_HAS_ANGLE
     if (!params || off < 0) return;
     GLfloat v[4] = {0, 0, 0, 0};
-    glGetTexParameterfv((GLenum) t, (GLenum) pn, v);
+    glGetTexParameterfv(MacapkTexTarget(t), (GLenum) pn, v);
     jsize avail = env->GetArrayLength(params) - off;
     if (avail > 4) avail = 4;
     if (avail > 0) env->SetFloatArrayRegion(params, off, avail, v);

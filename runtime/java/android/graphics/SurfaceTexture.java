@@ -74,9 +74,12 @@
 // latch) accept frames from EITHER producer transparently.
 package android.graphics;
 
+import android.opengl.GLES20;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
+
+import com.macapk.loader.NativeGles;
 
 public class SurfaceTexture {
     /**
@@ -187,6 +190,20 @@ public class SurfaceTexture {
     // these are touched only from that thread; latching holds no lock across
     // the native pixel copy, which takes milliseconds.
     private java.nio.ByteBuffer mLatchRgba;             // GL upload scratch
+    // External-texture delivery state (latchViaExternalImage), per context.
+    private long mExtCtx = 0;          // context the staging texture lives in
+    private int mExtStaging = 0;       // private GL_TEXTURE_2D receiving the pixels
+    private long mExtImage = 0;        // EGLImage made from mExtStaging
+    private int mExtW = 0, mExtH = 0;  // size mExtStaging / mExtImage were made at
+    private int mExtAttachedTex = 0;   // consumer texture mExtImage is attached to
+    // Fallback path (latchViaTexture2D): the context, texture name and size the
+    // camera upload last ALLOCATED with glTexImage2D; later frames that match
+    // all four update it in place with glTexSubImage2D.
+    private long mGlAllocCtx = 0;
+    private int mGlAllocTex = 0;
+    private int mGlAllocW = 0;
+    private int mGlAllocH = 0;
+    private final int[] mGlIntScratch = new int[1];   // glGetInteger
     private int[] mLatchArgb;                           // Bitmap scratch
     private Bitmap mLatchBitmap;                        // software-latched frame
     private final int[] mLatchDims = new int[2];
@@ -381,17 +398,17 @@ public class SurfaceTexture {
     }
 
     /**
-     * Pull the newest camera frame as RGBA and upload it into texture `tex`
+     * Pull the newest camera frame as RGBA and deliver it to texture `tex`
      * on the CALLER's current GL context -- updateTexImage's pixel half.
      *
-     * The target is GL_TEXTURE_2D: ANGLE's Metal backend does not expose
-     * GL_OES_EGL_image_external (DisplayMtl.mm: EGLImageExternalOES = false),
-     * so an external-target name cannot exist here -- the consumer's
-     * glBindTexture(GL_TEXTURE_EXTERNAL_OES) was an INVALID_ENUM no-op and
-     * its name is still typeless, free to become a 2D texture now. Sampling
-     * through a samplerExternalOES shader still needs the GLES-bridge
-     * translation to sampler2D; this upload puts the image where that
-     * translation will look for it.
+     * Two routes, chosen per EGL display (NativeGles.externalImagesSupported):
+     * where the backend has external textures (ANGLE Vulkan), the frame goes
+     * into a private 2D texture whose EGLImage is attached to the consumer's
+     * GL_TEXTURE_EXTERNAL_OES texture, as GLConsumer delivers it on a device
+     * (latchViaExternalImage); where it has none (ANGLE Metal: DisplayMtl.mm,
+     * EGLImageExternalOES = false), the frame is uploaded into the consumer's
+     * name as GL_TEXTURE_2D and the GLES bridge translates the consumer's
+     * external binds and shaders to match (latchViaTexture2D).
      *
      * Failure never throws into the app: no context / no frame / a broken
      * upload each leave the previously latched image in place, which is
@@ -438,56 +455,12 @@ public class SurfaceTexture {
                 // (macapkLatchBitmap) does not use one either.
                 return;
             }
-            // Save and restore the caller's 2D binding on the active unit; a
-            // consumer between draw calls must not find its state moved.
-            int[] saved = new int[1];
-            android.opengl.GLES20.glGetIntegerv(GL_TEXTURE_BINDING_2D, saved, 0);
-            android.opengl.GLES20.glBindTexture(
-                android.opengl.GLES20.GL_TEXTURE_2D, tex);
-            if (mGlParamsSetForTex != tex) {
-                mGlParamsSetForTex = tex;
-                // The OES_EGL_image_external defaults, which are also the only
-                // values that extension permits: LINEAR + CLAMP_TO_EDGE. Also
-                // load-bearing here: a fresh texture's default MIN_FILTER
-                // wants mipmaps we never supply, and an incomplete texture
-                // samples solid black.
-                android.opengl.GLES20.glTexParameteri(
-                    android.opengl.GLES20.GL_TEXTURE_2D,
-                    android.opengl.GLES20.GL_TEXTURE_MIN_FILTER,
-                    android.opengl.GLES20.GL_LINEAR);
-                android.opengl.GLES20.glTexParameteri(
-                    android.opengl.GLES20.GL_TEXTURE_2D,
-                    android.opengl.GLES20.GL_TEXTURE_MAG_FILTER,
-                    android.opengl.GLES20.GL_LINEAR);
-                android.opengl.GLES20.glTexParameteri(
-                    android.opengl.GLES20.GL_TEXTURE_2D,
-                    android.opengl.GLES20.GL_TEXTURE_WRAP_S,
-                    android.opengl.GLES20.GL_CLAMP_TO_EDGE);
-                android.opengl.GLES20.glTexParameteri(
-                    android.opengl.GLES20.GL_TEXTURE_2D,
-                    android.opengl.GLES20.GL_TEXTURE_WRAP_T,
-                    android.opengl.GLES20.GL_CLAMP_TO_EDGE);
+            final long ctxHandle = ctx.getNativeHandle();
+            if (NativeGles.externalImagesSupported()) {
+                latchViaExternalImage(tex, w, h, ctxHandle);
+            } else {
+                latchViaTexture2D(tex, w, h, ctxHandle);
             }
-            mLatchRgba.position(0);
-            android.opengl.GLES20.glTexImage2D(
-                android.opengl.GLES20.GL_TEXTURE_2D, 0,
-                android.opengl.GLES20.GL_RGBA, w, h, 0,
-                android.opengl.GLES20.GL_RGBA,
-                android.opengl.GLES20.GL_UNSIGNED_BYTE, mLatchRgba);
-            if (!mGlUploadCheckedOnce) {
-                mGlUploadCheckedOnce = true;
-                // One diagnostic error read on the first upload only, so the
-                // steady state never perturbs the app's own glGetError view.
-                int err = android.opengl.GLES20.glGetError();
-                if (err != 0) {
-                    System.err.println("[SurfaceTexture] first camera-frame GL"
-                        + " upload reported error 0x" + Integer.toHexString(err)
-                        + " (tex=" + tex + ", " + w + "x" + h + "). The texture"
-                        + " will not show camera frames.");
-                }
-            }
-            android.opengl.GLES20.glBindTexture(
-                android.opengl.GLES20.GL_TEXTURE_2D, saved[0]);
         } catch (Throwable t) {
             if (!sWarnedGlUploadFailed) {
                 sWarnedGlUploadFailed = true;
@@ -499,11 +472,195 @@ public class SurfaceTexture {
     }
 
     /**
+     * The DEVICE path, where the GL backend has external textures (ANGLE
+     * Vulkan): the frame reaches the consumer's GL_TEXTURE_EXTERNAL_OES
+     * texture as an EGLImage, which is what GLConsumer does on Android. The
+     * pixels go into a private GL_TEXTURE_2D "staging" texture in this
+     * context; an EGLImage made from it is attached to the consumer's texture
+     * once, and later frames update the staging texture in place, which
+     * updates the image every consumer samples -- Java code through
+     * android.opengl AND native code calling libGLESv2 directly.
+     *
+     * Measured need (2026-11-12, OurFamilyWizard / Twilio Video): the
+     * virtual-background compositor is native and binds the camera texture as
+     * external itself. Delivering into a TEXTURE_2D (the fallback below)
+     * left it binding a 2D texture as external -- INVALID_OPERATION -- and
+     * sampling nothing: the person came out black, and blur came out black.
+     *
+     * Staging, image and attachment are kept per context. A latch on a new
+     * context starts a new staging texture; the old one belonged to a context
+     * this SurfaceTexture no longer latches on.
+     */
+    private void latchViaExternalImage(int tex, int w, int h, long ctxHandle) {
+        final int saved2D = glGetInteger(GL_TEXTURE_BINDING_2D);
+        if (mExtCtx != ctxHandle) {
+            // An EGLImage belongs to the display, not the context, so the old
+            // one can be freed here; a consumer texture it is attached to keeps
+            // the storage alive until it is re-attached. The old staging
+            // texture cannot be deleted from this context; it is freed with
+            // the context that made it.
+            if (mExtImage != 0) NativeGles.destroyImage(mExtImage);
+            int[] name = new int[1];
+            GLES20.glGenTextures(1, name, 0);
+            mExtStaging = name[0];
+            mExtCtx = ctxHandle;
+            mExtImage = 0;
+            mExtW = 0;
+            mExtH = 0;
+            mExtAttachedTex = 0;
+        }
+        final boolean realloc = mExtImage == 0 || mExtW != w || mExtH != h;
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, mExtStaging);
+        if (realloc) setLinearClamp2D();
+        uploadRgbaIntoBound2D(w, h, realloc, ctxHandle);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, saved2D);
+        if (realloc) {
+            // glTexImage2D re-specified the staging storage, which orphans any
+            // image made from the old storage: make a new one and re-attach.
+            if (mExtImage != 0) NativeGles.destroyImage(mExtImage);
+            mExtImage = NativeGles.createImageFromTexture2D(mExtStaging);
+            mExtW = w;
+            mExtH = h;
+            mExtAttachedTex = 0;
+            if (mExtImage == 0) return;   // logged once natively; the consumer keeps its old image
+        }
+        if (mExtAttachedTex != tex
+                && NativeGles.attachImageToExternal(tex, mExtImage)) {
+            mExtAttachedTex = tex;
+        }
+        // A shared context (WebRTC's EglRenderer, a native compositor) may
+        // sample this image next; GLES requires the producer to flush first.
+        // AOSP's GLConsumer gets the same guarantee from its buffer fence.
+        GLES20.glFlush();
+    }
+
+    /**
+     * The FALLBACK, where the backend has no external textures (ANGLE Metal):
+     * upload straight into the consumer's texture name as GL_TEXTURE_2D; the
+     * GLES bridge translates the consumer's external binds and
+     * samplerExternalOES shaders to 2D to match (native_methods.cpp,
+     * MacapkExternalAs2D). Native consumers cannot be reached this way --
+     * but on this backend they could not use an external texture anyway.
+     */
+    private void latchViaTexture2D(int tex, int w, int h, long ctxHandle) {
+        // Save and restore the caller's 2D binding on the active unit; a
+        // consumer between draw calls must not find its state moved.
+        final int saved2D = glGetInteger(GL_TEXTURE_BINDING_2D);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex);
+        if (mGlParamsSetForTex != tex) {
+            mGlParamsSetForTex = tex;
+            setLinearClamp2D();
+        }
+        // Allocate once per (context, texture, size), then update IN PLACE,
+        // and flush. The consumer that samples this texture is usually on a
+        // DIFFERENT, shared context (WebRTC: SurfaceTextureHelper latches,
+        // EglRenderer draws). Re-specifying the storage with glTexImage2D on
+        // every frame and never flushing let that context sample a
+        // half-reallocated texture: measured 2026-11-12 on OurFamilyWizard's
+        // Twilio preview as the camera image alternating with solid pink.
+        // The context is part of the key because an in-place update of a name
+        // never allocated in THIS context is INVALID_OPERATION.
+        final boolean realloc = mGlAllocCtx != ctxHandle || mGlAllocTex != tex
+                || mGlAllocW != w || mGlAllocH != h;
+        uploadRgbaIntoBound2D(w, h, realloc, ctxHandle);
+        if (realloc) {
+            mGlAllocCtx = ctxHandle;
+            mGlAllocTex = tex;
+            mGlAllocW = w;
+            mGlAllocH = h;
+        }
+        GLES20.glFlush();
+        if (!mGlUploadCheckedOnce) {
+            mGlUploadCheckedOnce = true;
+            // One diagnostic error read on the first upload only, so the
+            // steady state never perturbs the app's own glGetError view.
+            int err = GLES20.glGetError();
+            if (err != 0) {
+                System.err.println("[SurfaceTexture] first camera-frame GL"
+                    + " upload reported error 0x" + Integer.toHexString(err)
+                    + " (tex=" + tex + ", " + w + "x" + h + "). The texture"
+                    + " will not show camera frames.");
+            }
+        }
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, saved2D);
+    }
+
+    /** LINEAR + CLAMP_TO_EDGE on the bound 2D texture: the OES_EGL_image_external
+     *  defaults (the only values that extension permits), and load-bearing for
+     *  completeness -- the default MIN_FILTER wants mipmaps never supplied, and
+     *  an incomplete texture samples black and cannot back an EGLImage. */
+    private static void setLinearClamp2D() {
+        final int t = GLES20.GL_TEXTURE_2D;
+        GLES20.glTexParameteri(t, GLES20.GL_TEXTURE_MIN_FILTER,
+                GLES20.GL_LINEAR);
+        GLES20.glTexParameteri(t, GLES20.GL_TEXTURE_MAG_FILTER,
+                GLES20.GL_LINEAR);
+        GLES20.glTexParameteri(t, GLES20.GL_TEXTURE_WRAP_S,
+                GLES20.GL_CLAMP_TO_EDGE);
+        GLES20.glTexParameteri(t, GLES20.GL_TEXTURE_WRAP_T,
+                GLES20.GL_CLAMP_TO_EDGE);
+    }
+
+    /**
+     * glTexImage2D (realloc) or glTexSubImage2D of the latched RGBA frame into
+     * the currently bound GL_TEXTURE_2D, ISOLATED FROM THE APP'S PIXEL-UNPACK
+     * STATE. On a device updateTexImage never uploads pixels -- it rebinds an
+     * EGLImage -- so no app setting can affect it, and apps set unpack state
+     * freely. Here the latch IS a pixel upload on the app's own context, so an
+     * app-bound GL_PIXEL_UNPACK_BUFFER (ES3) or a non-default
+     * UNPACK_ROW_LENGTH / SKIP_* / ALIGNMENT would make it read the wrong
+     * memory or fail. Save, set the defaults this tightly packed RGBA buffer
+     * needs, upload, restore.
+     */
+    private void uploadRgbaIntoBound2D(int w, int h, boolean realloc, long ctxHandle) {
+        final boolean es3 = isEs3Context(ctxHandle);
+        final int savedAlign = glGetInteger(GL_UNPACK_ALIGNMENT);
+        // ES3-only state; 0 is both its default and "nothing to restore".
+        final int savedPbo        = es3 ? glGetInteger(GL_PIXEL_UNPACK_BUFFER_BINDING) : 0;
+        final int savedRowLen     = es3 ? glGetInteger(GL_UNPACK_ROW_LENGTH) : 0;
+        final int savedSkipRows   = es3 ? glGetInteger(GL_UNPACK_SKIP_ROWS) : 0;
+        final int savedSkipPixels = es3 ? glGetInteger(GL_UNPACK_SKIP_PIXELS) : 0;
+
+        if (savedPbo != 0)        GLES20.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        if (savedRowLen != 0)     GLES20.glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        if (savedSkipRows != 0)   GLES20.glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+        if (savedSkipPixels != 0) GLES20.glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+        if (savedAlign != 4)      GLES20.glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+
+        mLatchRgba.position(0);
+        if (realloc) {
+            GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, w, h, 0,
+                    GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, mLatchRgba);
+        } else {
+            GLES20.glTexSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, w, h,
+                    GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, mLatchRgba);
+        }
+
+        if (savedAlign != 4)      GLES20.glPixelStorei(GL_UNPACK_ALIGNMENT, savedAlign);
+        if (savedSkipPixels != 0) GLES20.glPixelStorei(GL_UNPACK_SKIP_PIXELS, savedSkipPixels);
+        if (savedSkipRows != 0)   GLES20.glPixelStorei(GL_UNPACK_SKIP_ROWS, savedSkipRows);
+        if (savedRowLen != 0)     GLES20.glPixelStorei(GL_UNPACK_ROW_LENGTH, savedRowLen);
+        if (savedPbo != 0)        GLES20.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, savedPbo);
+    }
+
+    /** One glGetIntegerv result. Latch thread only (shares one scratch array). */
+    private int glGetInteger(int pname) {
+        GLES20.glGetIntegerv(pname, mGlIntScratch, 0);
+        return mGlIntScratch[0];
+    }
+
+    /**
      * GL-consumer twin of macapkLatchBitmap's decoded-video branch: upload a
      * pushed decoded-video frame (macapkQueueDecodedFrame) into the attached
      * texture, for an app that manually drives updateTexImage() on a
      * MediaCodec-targeted SurfaceTexture (a custom GL video-effects pipeline,
      * say) rather than going through TextureView's own software draw path.
+     *
+     * Not yet given the camera's external-texture route: this binds `tex` as
+     * GL_TEXTURE_2D and re-specifies it each frame, so on ANGLE Vulkan a
+     * consumer that made `tex` a GL_TEXTURE_EXTERNAL_OES texture gets
+     * GL_INVALID_OPERATION here, as camera frames did before
+     * latchViaExternalImage. No measured app needs it yet.
      *
      * Differs from latchCameraFrameToGl only in where the pixels start:
      * already-decoded ARGB_8888 ints in hand here, vs a native session to
@@ -596,6 +753,29 @@ public class SurfaceTexture {
     /** android.opengl.GLES20 does not define GL_TEXTURE_BINDING_2D; the value
      *  is the GLES 2.0 core enum (gl2.h). */
     private static final int GL_TEXTURE_BINDING_2D = 0x8069;
+    // Pixel-unpack state the camera upload saves and restores (see
+    // uploadRgbaIntoBound2D). The ES3 ones are queried only on an ES3 context.
+    private static final int GL_UNPACK_ALIGNMENT = 0x0CF5;
+    private static final int GL_UNPACK_ROW_LENGTH = 0x0CF2;
+    private static final int GL_UNPACK_SKIP_ROWS = 0x0CF3;
+    private static final int GL_UNPACK_SKIP_PIXELS = 0x0CF4;
+    private static final int GL_PIXEL_UNPACK_BUFFER = 0x88EC;
+    private static final int GL_PIXEL_UNPACK_BUFFER_BINDING = 0x88EF;
+    // ES version of the context the last latch ran on, cached by handle.
+    private long mVersionCtx;
+    private boolean mVersionCtxEs3;
+
+    /** True for an OpenGL ES 3.x context ("OpenGL ES 3..." from GL_VERSION). */
+    private boolean isEs3Context(long ctxHandle) {
+        if (ctxHandle != mVersionCtx) {
+            String v = null;
+            try { v = GLES20.glGetString(GLES20.GL_VERSION); }
+            catch (Throwable ignored) { }
+            mVersionCtxEs3 = v != null && v.startsWith("OpenGL ES 3");
+            mVersionCtx = ctxHandle;
+        }
+        return mVersionCtxEs3;
+    }
     private static volatile boolean sWarnedGlUploadFailed;
 
     /**
@@ -636,6 +816,15 @@ public class SurfaceTexture {
         if (err) {
             throw new RuntimeException("Error during detachFromGLContext (see logcat for details)");
         }
+        // Forget which consumer texture the frames were attached to or
+        // allocated in: an app may delete its texture and attach again with a
+        // recycled name in the same context, which must not be taken for the
+        // old, already-prepared texture. AOSP requires this call on the thread
+        // whose context owns the texture, the same thread that latches, which
+        // is the only one touching these fields.
+        mExtAttachedTex = 0;
+        mGlAllocCtx = 0;
+        mGlAllocTex = 0;
     }
 
     /**
@@ -733,6 +922,31 @@ public class SurfaceTexture {
         mLatchRgba = null;
         mLatchArgb = null;
         mLatchBitmap = null;
+        // External-texture delivery: abandon() releases GLConsumer's EGLImages
+        // on a device. The EGLImage belongs to the display, so it is freed
+        // here from any thread (a consumer texture it is attached to keeps the
+        // pixels until it is re-attached or deleted). The staging texture
+        // belongs to the latching context, so it is deleted only when this
+        // thread has that context current (consumers usually release on their
+        // GL thread, as WebRTC's SurfaceTextureHelper does); otherwise it goes
+        // with that context.
+        try {
+            if (mExtImage != 0) {
+                NativeGles.destroyImage(mExtImage);
+                mExtImage = 0;
+                mExtAttachedTex = 0;
+            }
+            if (mExtStaging != 0) {
+                android.opengl.EGLContext cur = android.opengl.EGL14.eglGetCurrentContext();
+                if (cur != null && cur.getNativeHandle() != 0 && cur.getNativeHandle() == mExtCtx) {
+                    GLES20.glDeleteTextures(1, new int[] { mExtStaging }, 0);
+                    mExtStaging = 0;
+                    mExtCtx = 0;
+                }
+            }
+        } catch (Throwable ignored) {
+            // Freeing is best-effort cleanup; release() itself must not throw.
+        }
     }
 
     /**

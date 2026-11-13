@@ -343,8 +343,10 @@ bool macapk_cam_device_info(int index, MacapkCamDeviceInfo* out) {
         copy_str(out->id,   sizeof(out->id),   d.uniqueID);
         copy_str(out->name, sizeof(out->name), d.localizedName);
         out->facing = facing_for(d);
-        // A Mac's camera sensor does not rotate with the device, so camera2's
-        // SENSOR_ORIENTATION is 0 and no preview rotation is implied.
+        // A Mac's camera sensor does not rotate with the device, so its BASE
+        // orientation is 0. The value apps are told is
+        // CameraBridge.getSensorOrientation, which adds what cancels the
+        // window's reported display rotation.
         out->sensorOrientation = 0;
         out->formatCount = (int32_t)d.formats.count;
         return true;
@@ -547,6 +549,45 @@ bool macapk_cam_configure(MacapkCamSession* s, int width, int height, int fps) {
         CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(best.formatDescription);
         s->width  = d.width;
         s->height = d.height;
+        // Make the DELIVERED frames match the size reported above. On macOS,
+        // startRunning re-applies the session preset (High = the camera's
+        // largest format) over an activeFormat chosen while unlocked, so the
+        // camera kept delivering 1920x1080 while this session reported the
+        // 640x480 the app asked for -- measured 2026-11-12 on OurFamilyWizard's
+        // Twilio preview (WebRTC sizes its frames from the requested format,
+        // so the 16:9 image was squeezed into 4:3). Asking the output to scale
+        // to the chosen dimensions makes the delivered size right whatever the
+        // preset does. How a differently shaped capture is fitted is
+        // AVFoundation's default for a data output, which is not set here: on
+        // the measured camera the 640x480 frames kept the picture's
+        // proportions (the same preview, 2026-11-12). A camera where they do
+        // not would want AVVideoScalingModeKey here.
+        s->output.videoSettings = @{
+            (id)kCVPixelBufferPixelFormatTypeKey : @(wanted_pixel_format()),
+            (id)kCVPixelBufferWidthKey  : @(s->width),
+            (id)kCVPixelBufferHeightKey : @(s->height),
+        };
+        // The pixel buffers must be UNMIRRORED: the front camera's mirror is
+        // applied downstream, once, by the transform matrix that
+        // android.hardware.Camera / camera2 hand to SurfaceTexture consumers
+        // (MTX_FLIP_V_FRONT), as a device's front-camera stream transform
+        // does. If AVFoundation mirrored the buffers as well, the two would
+        // cancel. Measured 2026-11-12: on a MacBook Air's built-in camera the
+        // connection was already unmirrored (supported=1 auto=0 mirrored=0),
+        // so this is a guard, not the fix for a measured fault; it pins the
+        // state for cameras or macOS versions that default otherwise.
+        AVCaptureConnection* conn = [s->output connectionWithMediaType:AVMediaTypeVideo];
+        if (conn) {
+            if (trace_on())
+                std::fprintf(stderr, "[camera] connection mirroring before: supported=%d "
+                             "auto=%d mirrored=%d\n", (int)conn.isVideoMirroringSupported,
+                             (int)conn.automaticallyAdjustsVideoMirroring,
+                             (int)conn.isVideoMirrored);
+            if (conn.isVideoMirroringSupported) {
+                conn.automaticallyAdjustsVideoMirroring = NO;
+                conn.videoMirrored = NO;
+            }
+        }
         if (trace_on())
             std::fprintf(stderr, "[camera] configured %dx%d @%dfps (asked %dx%d)\n",
                          s->width, s->height, fps, width, height);

@@ -46844,11 +46844,15 @@ extern "C" int __macapk_arm64_scandirat(int parent_fd, const char* path,
     if (!macapk_path_shims_on()) {   // MACAPK_PATH_SHIMS=0: the pre-shim binding
         // Darwin's scandirat is macOS 26.4+ (dirent.h:191); below that the import
         // had nothing to bind to, and ENOSYS is the honest stand-in.
+        // An SDK older than 26.4 does not DECLARE scandirat at all, so the call
+        // must be compiled out there (the default shim path above is unaffected).
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
         if (__builtin_available(macOS 26.4, *)) {
             return ::scandirat(parent_fd, path, reinterpret_cast<struct dirent***>(namelist),
                 reinterpret_cast<int (*)(const struct dirent*)>(filter),
                 reinterpret_cast<int (*)(const struct dirent**, const struct dirent**)>(compar));
         }
+#endif
         errno = 38;
         return -1;
     }
@@ -55736,8 +55740,7 @@ int __macapk_arm64___android_log_print(int /*prio*/, const char* /*tag*/,
         "ret\n"
     );
 }
-__attribute__((naked))
-[[noreturn]] void __macapk_arm64___android_log_assert(const char* /*cond*/,
+__attribute__((naked, noreturn)) void __macapk_arm64___android_log_assert(const char* /*cond*/,
                                                          const char* /*tag*/,
                                                          const char* /*fmt*/,
                                                          ...) {
@@ -61513,6 +61516,54 @@ static jclass macapk_findclass_onload_ctx_noinit(JNIEnv* env, const char* name) 
     return static_cast<jclass>(cls);
 }
 
+// ★ FindClass from JNI_OnLoad, take 2 (2026-11-05): the guest's class may be
+// defined by a CHILD ClassLoader -- an app-embedded dex loaded by a custom
+// loader -- rather than by ActivityHost's main app loader. AppClassLoader
+// deliberately loads the native against an AppClassLoader, so both
+// NativeLibraries.getFromClass() and the onload-context pass above name that
+// loader, and the guest's own class (o.getViewByDomId in Binance) is invisible
+// to it. MacApkNativeLoad.loadFrom records the caller's ACTUAL loader in a
+// thread-local around the load; resolve through it here, still WITHOUT
+// initializing, exactly as ART's FindClass does.
+// Returns null (no pending exception) when there is no context, it is one of
+// the loaders already tried, or the class is a genuine miss.
+static jclass macapk_findclass_threadctx_noinit(JNIEnv* env, const char* name) {
+    static jclass s_class_cls = nullptr;    // java/lang/Class (global ref)
+    static jclass s_mnl_cls = nullptr;      // MacApkNativeLoad (global ref)
+    static jmethodID s_ctx = nullptr;       // currentJniOnLoadContext()
+    static jmethodID s_for_name = nullptr;  // Class.forName(String,Z,ClassLoader)
+    static bool s_failed = false;
+    if (s_failed) return nullptr;
+    if (!s_class_cls) {
+        jclass cc = g_orig_FindClass_slot(env, "java/lang/Class");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        jclass mnl = g_orig_FindClass_slot(env, "com/macapk/loader/MacApkNativeLoad");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (!cc || !mnl) { s_failed = true; return nullptr; }
+        s_ctx = g_orig_GetStaticMethodID(env, mnl, "currentJniOnLoadContext",
+                                         "()Ljava/lang/ClassLoader;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        s_for_name = g_orig_GetStaticMethodID(env, cc, "forName",
+            "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (!s_ctx || !s_for_name) { s_failed = true; return nullptr; }
+        s_class_cls = static_cast<jclass>(env->NewGlobalRef(cc));
+        s_mnl_cls = static_cast<jclass>(env->NewGlobalRef(mnl));
+    }
+    jobject loader = env->CallStaticObjectMethod(s_mnl_cls, s_ctx);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return nullptr; }
+    if (!loader) return nullptr;
+    std::string dotted(name ? name : "");
+    for (char& ch : dotted) if (ch == '/') ch = '.';
+    jstring jn = env->NewStringUTF(dotted.c_str());
+    if (!jn) { env->DeleteLocalRef(loader); env->ExceptionClear(); return nullptr; }
+    jobject cls = env->CallStaticObjectMethod(s_class_cls, s_for_name, jn, JNI_FALSE, loader);
+    env->DeleteLocalRef(jn);
+    env->DeleteLocalRef(loader);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return nullptr; }
+    return static_cast<jclass>(cls);
+}
+
 jclass macapk_jni_FindClass_guard(JNIEnv* env, const char* name) {
     if (env->ExceptionCheck()) {
         jthrowable pend = env->ExceptionOccurred();
@@ -61536,6 +61587,10 @@ jclass macapk_jni_FindClass_guard(JNIEnv* env, const char* name) {
         if (env->ExceptionCheck()) env->ExceptionClear();  // forName's CNFE is not the guest's
         if (!ni) {
             ni = macapk_findclass_onload_ctx_noinit(env, name);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+        if (!ni) {
+            ni = macapk_findclass_threadctx_noinit(env, name);
             if (env->ExceptionCheck()) env->ExceptionClear();
         }
         if (ni) return ni;
@@ -61608,6 +61663,20 @@ jint macapk_RegisterNatives_wrap(JNIEnv* env, jclass clazz,
             n,
             (n > 0 && methods && methods[0].name) ? methods[0].name : "?",
             (n > 0 && methods && methods[0].signature) ? methods[0].signature : "");
+    }
+    // A NULL jclass reaches HotSpot's jni_RegisterNatives when the caller's
+    // FindClass missed and the guest did not check the result (Binance's
+    // protected liba8357a.so does exactly this). HotSpot dereferences it and
+    // SIGSEGVs the whole VM; ART fails the call. Return JNI_ERR and leave any
+    // pending exception with its owner instead of crashing.
+    if (!clazz) {
+        std::fprintf(stderr,
+            "[jni-reg] ⚠ RegisterNatives(NULL jclass, n=%d first=%s%s) -> "
+            "JNI_ERR (guest did not check FindClass)\n",
+            n,
+            (n > 0 && methods && methods[0].name) ? methods[0].name : "?",
+            (n > 0 && methods && methods[0].signature) ? methods[0].signature : "");
+        return JNI_ERR;
     }
     bool wrapped = false;
     std::vector<JNINativeMethod> copy(methods, methods + (n > 0 ? n : 0));

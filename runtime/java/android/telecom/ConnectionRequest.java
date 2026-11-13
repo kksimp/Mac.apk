@@ -45,7 +45,9 @@ public final class ConnectionRequest implements Parcelable {
         this(accountHandle, handle, extras, videoState, null, false, false, null);
     }
 
-    private ConnectionRequest(PhoneAccountHandle accountHandle, Uri address, Bundle extras,
+    /** Package-private (AOSP: the @hide constructor Telecom's Builder uses):
+     *  SelfManagedTelecom sets shouldShowIncomingCallUi for incoming calls. */
+    ConnectionRequest(PhoneAccountHandle accountHandle, Uri address, Bundle extras,
             int videoState, String telecomCallId, boolean shouldShowIncomingCallUi,
             boolean isAdhocConference, List<Uri> participants) {
         mAccountHandle = accountHandle;

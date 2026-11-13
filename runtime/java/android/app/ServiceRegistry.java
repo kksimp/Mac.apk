@@ -472,7 +472,54 @@ public final class ServiceRegistry {
             if (n > 1) { sJobBindings.put(className, n - 1); return false; }   // still bound
             sJobBindings.remove(className);
         }
-        if (sStartRequested.contains(className) || sClientBound.contains(className)) return false;
+        if (sStartRequested.contains(className) || sClientBound.contains(className)
+                || sTelecomBindings.containsKey(className)) return false;
+        Service svc = sLive.remove(className);
+        if (svc == null) return false;
+        if (STOP_ASYNC) { destroyLater(className, svc); return true; }
+        try { svc.onDestroy(); } catch (Throwable t) { log("onDestroy", className, t); }
+        return true;
+    }
+
+    /** Calls Telecom is tracking per ConnectionService (Telecomm's ServiceBinder
+     *  association count). */
+    private static final Map<String, Integer> sTelecomBindings = new ConcurrentHashMap<>();
+    /** MACAPK_TELECOM_UNBIND=0: keep a ConnectionService alive after its last
+     *  call, as before 2026-11-13, for one A/B. */
+    static final boolean TELECOM_UNBIND =
+        !"0".equals(System.getenv("MACAPK_TELECOM_UNBIND"));
+
+    /** Telecom's bind for one call (android.telecom.SelfManagedTelecom): the
+     *  ConnectionService, created if needed, held until the matching
+     *  telecomUnbind. Pair every non-null return with ONE telecomUnbind. Main
+     *  thread only, like ensureLive. */
+    public static Service telecomBind(Context ctx, String className) {
+        Service svc = ensureLive(ctx, className);
+        if (svc != null && TELECOM_UNBIND) {
+            synchronized (sTelecomBindings) { sTelecomBindings.merge(className, 1, Integer::sum); }
+        }
+        return svc;
+    }
+
+    /** Telecom's side when a call ends. AOSP's Telecom counts the calls it has
+     *  on each ConnectionService (ServiceBinder.incrementAssociatedCallCount /
+     *  decrementAssociatedCallCount) and unbinds when the last one is removed;
+     *  the service then goes through bringDownServiceIfNeededLocked like any
+     *  other: destroyed (onDestroy on the main thread) unless it was started or
+     *  a client or a job still holds it. Apps rely on that onDestroy:
+     *  OurFamilyWizard's ConnectionService stops its outgoing-call ringback
+     *  there, so a cancelled call kept ringing while the service lived on.
+     *  Returns true when it destroyed the service. */
+    public static boolean telecomUnbind(String className) {
+        if (!TELECOM_UNBIND || className == null) return false;
+        synchronized (sTelecomBindings) {
+            Integer n = sTelecomBindings.get(className);
+            if (n == null) return false;                       // never bound by Telecom
+            if (n > 1) { sTelecomBindings.put(className, n - 1); return false; }   // calls remain
+            sTelecomBindings.remove(className);
+        }
+        if (sStartRequested.contains(className) || sClientBound.contains(className)
+                || sJobBindings.containsKey(className)) return false;
         Service svc = sLive.remove(className);
         if (svc == null) return false;
         if (STOP_ASYNC) { destroyLater(className, svc); return true; }

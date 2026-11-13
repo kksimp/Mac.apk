@@ -437,6 +437,7 @@ public final class MediaCodec {
             if (mHasSurface) {
                 android.view.SurfaceView.macapkRegisterVideoSink(surface);
             }
+            routeVideoTo(null, mHasSurface ? surface : null);
         } else {
             mVidMime = null;
             mSurface = null;
@@ -540,18 +541,42 @@ public final class MediaCodec {
     public void setVideoScalingMode(int mode) {}
     // AOSP allows swapping the output surface after configure() (adaptive
     // surface change). Our present path targets one shared per-window video
-    // layer regardless of which Surface object was handed in (see
-    // cocoa_bridge.mm's CocoaPresentVideoFrame); what IS surface-identity-
-    // specific is the geometry -- a SurfaceView-owned Surface pins the video
-    // plane to that view's on-screen rect (SurfaceView.
-    // macapkRegisterVideoSink), which is why the registration must follow
-    // every swap.
+    // layer for a SurfaceView-owned or bare Surface, and the Surface's own
+    // SurfaceTexture when it has one (routeVideoTo, below; see cocoa_bridge.mm's
+    // CocoaPresentVideoFrame). The geometry is surface-specific too -- a
+    // SurfaceView-owned Surface pins the video plane to that view's on-screen
+    // rect (SurfaceView.macapkRegisterVideoSink) -- which is why both must
+    // follow every swap.
     public void setOutputSurface(android.view.Surface surface) {
+        android.view.Surface previous = mSurface;
         mSurface = surface;
         mHasSurface = (surface != null && surface.isValid());
         if (mHasSurface) {
             android.view.SurfaceView.macapkRegisterVideoSink(surface);
         }
+        routeVideoTo(previous, mHasSurface ? surface : null);
+    }
+
+    // Decoded frames go first to SurfaceTexture's one active video target
+    // (most recent registration wins; see SurfaceTexture.macapkOfferDecodedFrame),
+    // and only otherwise to the window's video plane. `new Surface(texture)`
+    // registers its texture, so a Surface made BEFORE the real output kept the
+    // frames: Media3 configures the codec with its PlaceholderSurface (a
+    // SurfaceTexture-backed Surface) when prepare() runs before the app's view
+    // is attached, then switches here with setOutputSurface, and the video
+    // stayed black with its sound playing (GitHub #147). So the target follows
+    // this codec's output, as the BufferQueue behind a Surface does on a
+    // device: the previous output's texture gives the target up, if it still
+    // holds it, and a texture-backed new output takes it.
+    private static void routeVideoTo(android.view.Surface previous, android.view.Surface next) {
+        android.graphics.SurfaceTexture was =
+                previous != null ? previous.macapkGetSurfaceTexture() : null;
+        android.graphics.SurfaceTexture now =
+                next != null ? next.macapkGetSurfaceTexture() : null;
+        if (was != null && was != now) was.macapkUnregisterVideoTargetIfSelf();
+        // A released texture would displace a live target with one that
+        // takes no frames (macapkHasActiveVideoTarget reads it as none).
+        if (now != null && !now.isReleased()) now.macapkRegisterVideoTarget();
     }
 
     public void start() {

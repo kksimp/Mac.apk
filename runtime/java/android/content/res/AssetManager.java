@@ -491,11 +491,84 @@ public final class AssetManager implements AutoCloseable {
         if (macapkNoMounts()) throw new IOException("no APK bound");
         Found f = macapkFind("assets/" + name);
         if (f == null) throw new IOException("asset not found: " + name);
-        // Buffer so callers can close/reopen without holding the ZipFile.
+        // GameMaker's RunnerActivity.checkIsYoYoRunner opens assets/game.droid
+        // (1 GB in a shipped game) only to test that it exists; buffering
+        // it threw OutOfMemoryError against -Xmx1g and killed onCreate. A
+        // device's AssetInputStream never materialises the asset on the heap.
+        if (f.entry.getSize() > OPEN_BUFFER_LIMIT) return new StreamingAsset(f.zip, f.entry);
         InputStream in = f.zip.getInputStream(f.entry);
         byte[] buf = in.readAllBytes();
         in.close();
         return new ByteArrayInputStream(buf);
+    }
+
+    private static final long OPEN_BUFFER_LIMIT = 16L << 20;
+
+    /** Unbuffered open() for large entries, with the observable contract of
+     *  AOSP's AssetInputStream: available() is the remaining length (capped at
+     *  Integer.MAX_VALUE) and mark/reset work for any readlimit. Reset reopens
+     *  the entry and skips forward, since a zip inflater cannot seek back. */
+    private static final class StreamingAsset extends InputStream {
+        private final ZipFile zip;
+        private final ZipEntry entry;
+        private final long size;
+        private InputStream in;
+        private long pos;
+        private long markPos;
+
+        StreamingAsset(ZipFile zip, ZipEntry entry) throws IOException {
+            this.zip = zip; this.entry = entry; this.size = entry.getSize();
+            this.in = zip.getInputStream(entry);
+        }
+
+        private InputStream in() throws IOException {
+            if (in == null) throw new IOException("Stream closed");
+            return in;
+        }
+
+        @Override public int read() throws IOException {
+            int b = in().read();
+            if (b >= 0) pos++;
+            return b;
+        }
+
+        @Override public int read(byte[] b, int off, int len) throws IOException {
+            int n = in().read(b, off, len);
+            if (n > 0) pos += n;
+            return n;
+        }
+
+        @Override public long skip(long n) throws IOException {
+            long s = in().skip(n);
+            if (s > 0) pos += s;
+            return s;
+        }
+
+        @Override public int available() throws IOException {
+            in();
+            return (int) Math.min(Integer.MAX_VALUE, Math.max(0L, size - pos));
+        }
+
+        @Override public boolean markSupported() { return true; }
+
+        @Override public synchronized void mark(int readlimit) { markPos = pos; }
+
+        @Override public synchronized void reset() throws IOException {
+            in().close();
+            in = zip.getInputStream(entry);
+            pos = 0;
+            long left = markPos;
+            while (left > 0) {
+                long s = in.skip(left);
+                if (s <= 0) throw new IOException("reset: asset shorter than mark " + markPos);
+                left -= s;
+                pos += s;
+            }
+        }
+
+        @Override public void close() throws IOException {
+            if (in != null) { in.close(); in = null; }
+        }
     }
 
     /** AOSP AssetManager.list(): the immediate children of an assets/ dir,

@@ -78,6 +78,7 @@
 #include <ifaddrs.h>       // getifaddrs -- backs the AF_NETLINK RTM_GETADDR emulation
 #include <net/if.h>        // if_nametoindex for the emulated netlink ifa_index
 #include <net/if_dl.h>     // sockaddr_dl / LLADDR for the Linux-shaped getifaddrs
+#include <sys/sockio.h>    // SIOCGIFFLAGS, translated from Linux's in macapk_ifreq_ioctl
 #include <arpa/inet.h>     // inet_ntop for the net-trace diagnostic
 #include <mach/mach.h>     // mach_vm_read_overwrite for tracer safe-read
 #include <mach/mach.h>     // mach_vm_read_overwrite for tracer safe-read
@@ -51906,6 +51907,8 @@ uint32_t __macapk_shim_poll(uint32_t fds, uint32_t nfds, uint32_t timeout,
 //                            Linux 0x5413 <-> macOS 0x40087468
 //   TIOCSWINSZ  struct winsize
 //                            Linux 0x5414 <-> macOS 0x80087467
+// SIOCGIFFLAGS (Linux 0x8913) is translated too, but its struct ifreq and
+// flag bits differ, so it has its own handler: macapk_ifreq_ioctl below.
 // Linux values from bionic's vendored uapi asm-generic/ioctls.h; macOS
 // values are the host macros, not literals, so they cannot be mistyped.
 //
@@ -51919,10 +51922,67 @@ constexpr uint32_t kLinuxTIOCGWINSZ = 0x5413;
 constexpr uint32_t kLinuxTIOCSWINSZ = 0x5414;
 constexpr uint32_t kLinuxFIONBIO    = 0x5421;
 constexpr uint32_t kLinuxFIOASYNC   = 0x5452;
+constexpr uint32_t kLinuxSIOCGIFFLAGS = 0x8913;   // uapi linux/sockios.h
+constexpr short    kLinuxIFF_MULTICAST = 0x1000;  // uapi linux/if.h
+constexpr int      kLinuxENODEV = 19;             // uapi asm-generic/errno-base.h
 }  // namespace
+
+// SIOCGIFFLAGS: an interface's flags, by name. Unlike the requests above, its
+// payload (struct ifreq) and its flag bits differ between the two systems, so
+// it is rebuilt rather than passed through.
+//
+// THE CALLER THAT NEEDS IT is WebRTC's own interface enumerator
+// (rtc_base/ifaddrs_android.cc): for every address the netlink dump returns
+// (see the AF_NETLINK emulation), set_flags() opens an AF_INET datagram socket
+// and asks ioctl(SIOCGIFFLAGS) -- and ONE failure discards the whole list.
+// Refused with ENOTTY, WebRTC logged "getifaddrs failed to gather interface
+// data" and saw no networks at all, so it gathered no ICE candidates of its
+// own: measured 2026-11-13 on Signal 8.35.2 (RingRTC), whose outgoing call
+// reached the other phone but never connected: it never rang there, and
+// hanging up left a missed call. 16 refusals of 0x8913 in the log.
+//
+//   Linux struct ifreq (uapi linux/if.h): char ifr_name[16]; union { ...;
+//       short ifru_flags; ...; struct ifmap } -- 40 bytes on arm64 (32 on arm32)
+//   macOS struct ifreq (net/if.h):        char ifr_name[16]; union { ...;
+//       short ifru_flags; ... }           -- 32 bytes
+// The name and the flags sit at the same offsets (0 and 16) in both, so only
+// those two fields are copied. IFF_* bits 0x1..0x200 (UP, BROADCAST, DEBUG,
+// LOOPBACK, POINTOPOINT, NOTRAILERS, RUNNING, NOARP, PROMISC, ALLMULTI) mean
+// the same on both; above that they do not (macOS IFF_MULTICAST is 0x8000,
+// Linux's is 0x1000, and macOS 0x400..0x4000 are OACTIVE, SIMPLEX and LINK0-2
+// where Linux has MASTER, SLAVE, MULTICAST, PORTSEL and AUTOMEDIA), so the
+// shared bits are kept and MULTICAST is moved; the macOS-only bits have no
+// Linux meaning and are dropped.
+static bool macapk_ifreq_ioctl(int fd, uint32_t op, void* argp, int* rc) {
+    if (op != kLinuxSIOCGIFFLAGS) return false;
+    if (!argp) { errno = EFAULT; *rc = -1; return true; }
+    struct ifreq host;
+    std::memset(&host, 0, sizeof host);
+    std::memcpy(host.ifr_name, argp, IFNAMSIZ - 1);   // NUL-terminated by the memset
+    if (::ioctl(fd, SIOCGIFFLAGS, &host) != 0) {
+        // An unknown name is ENXIO on macOS but ENODEV (19) from a Linux
+        // kernel, which is what an Android caller is written against.
+        errno = (errno == ENXIO) ? kLinuxENODEV : errno_mac2lin(errno);
+        *rc = -1;
+        return true;
+    }
+    const unsigned short mac = static_cast<unsigned short>(host.ifr_flags);
+    short linux_flags = static_cast<short>(mac & 0x03ff);   // the shared bits
+    if (mac & IFF_MULTICAST) linux_flags |= kLinuxIFF_MULTICAST;
+    std::memcpy(static_cast<char*>(argp) + IFNAMSIZ, &linux_flags, sizeof linux_flags);
+    *rc = 0;
+    return true;
+}
 
 uint32_t __macapk_shim_ioctl(uint32_t fd, uint32_t op, uint32_t argp,
                                uint32_t) {
+    {
+        // A null argp reaches the handler too, so a null SIOCGIFFLAGS gets
+        // EFAULT here as it does on the arm64 path.
+        int irc = 0;
+        if (macapk_ifreq_ioctl(static_cast<int>(fd), op, argp ? gptr(argp) : nullptr, &irc))
+            return static_cast<uint32_t>(irc);
+    }
     unsigned long host_op = 0;
     switch (op) {
         case kLinuxFIONREAD:   host_op = FIONREAD;   break;
@@ -51988,6 +52048,7 @@ static bool macapk_ashmem_ioctl(int fd, uint32_t op, void* argp, int* rc) {
 }
 extern "C" int __macapk_arm64_ioctl(int fd, int op, void* argp) {
     { int arc = 0; if (macapk_ashmem_ioctl(fd, static_cast<uint32_t>(op), argp, &arc)) return arc; }
+    { int irc = 0; if (macapk_ifreq_ioctl(fd, static_cast<uint32_t>(op), argp, &irc)) return irc; }
     unsigned long host_op = 0;
     switch (static_cast<uint32_t>(op)) {
         case kLinuxFIONREAD:   host_op = FIONREAD;   break;

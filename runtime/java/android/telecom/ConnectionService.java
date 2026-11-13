@@ -13,11 +13,19 @@
 // also what android.app.Service returns by default for a service that offers
 // no binding, so callers already handle it.
 //
-// Consequently NONE of the onCreate*Connection / onCreate*Failed callbacks ever
-// fire. They exist to be OVERRIDDEN -- that is the entire reason the class had
-// to link -- and an app finds out that system-integrated calling is
-// unavailable from TelecomManager, which refuses the registration outright
-// rather than leaving the app waiting on this service.
+// SELF-MANAGED CALLS ARE THE EXCEPTION. When the app registers a
+// self-managed PhoneAccount naming this service and calls
+// TelecomManager.placeCall() or addNewIncomingCall() with it,
+// SelfManagedTelecom does Telecom's part in-process: it creates this service
+// through ServiceRegistry (the same single instance a bind reaches) and calls
+// onCreateOutgoingConnection() / onCreateIncomingConnection() on the main
+// thread, as Telecom does. No binder is involved, so onBind() still returns
+// null. The connection the app returns is listed in getAllConnections() until
+// it is destroyed.
+//
+// Every other onCreate*Connection / onCreate*Failed callback still never
+// fires: managed (SIM/carrier) accounts are refused outright by
+// TelecomManager rather than leaving the app waiting on this service.
 //
 // Mirrors telecomm/java/android/telecom/ConnectionService.java; public member
 // list confirmed against frameworks/base/core/api/current.txt.
@@ -55,14 +63,25 @@ public abstract class ConnectionService extends Service {
         return null;
     }
 
+    /** Connections delivered to this service by SelfManagedTelecom, until destroy(). */
+    private final java.util.List<Connection> mMacapkConnections =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
+
     /**
-     * Empty: connections are tracked by Telecom, which never hands us any.
-     * Empty is the same answer AOSP gives before Telecom adds a call, so a
-     * caller iterating it behaves correctly rather than seeing a fabricated
-     * connection.
+     * The self-managed connections this service created and has not yet
+     * destroyed -- what AOSP returns once Telecom has added them. Empty
+     * before any call, which is also AOSP's answer then.
      */
     public final Collection<Connection> getAllConnections() {
-        return Collections.emptyList();
+        return Collections.unmodifiableList(new java.util.ArrayList<>(mMacapkConnections));
+    }
+
+    void macapkAddConnection(Connection connection) {
+        mMacapkConnections.add(connection);
+    }
+
+    void macapkRemoveConnection(Connection connection) {
+        mMacapkConnections.remove(connection);
     }
 
     /**
@@ -134,8 +153,9 @@ public abstract class ConnectionService extends Service {
     public final void connectionServiceFocusReleased() {
     }
 
-    // Inbound from Telecom. Never invoked here -- see the header. Present so an
-    // app's overrides compile and link.
+    // Inbound from Telecom. onCreateOutgoingConnection, onCreateIncomingConnection
+    // and onCreateConnectionComplete are invoked for self-managed calls (see the
+    // header); the rest never are. Present so an app's overrides compile and link.
 
     public Connection onCreateOutgoingConnection(PhoneAccountHandle connectionManagerPhoneAccount,
             ConnectionRequest request) {

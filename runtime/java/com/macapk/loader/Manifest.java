@@ -411,6 +411,12 @@ public final class Manifest {
          *  receivers have carried their filters all along (ActivityEntry
          *  .filters); services now do too, from the same parseIntentFilter. */
         public final java.util.List<IntentFilterEntry> filters;
+        /** android:permission a caller must hold to start or bind this
+         *  service, else the application's android:permission, else null
+         *  (AOSP ParsedServiceUtils). Telecom, for one, refuses a PhoneAccount
+         *  whose ConnectionService is not guarded by
+         *  BIND_TELECOM_CONNECTION_SERVICE. */
+        public final String permission;
         public ServiceEntry(String n, boolean en, boolean exp,
                              java.util.Map<String, String> md) {
             this(n, en, exp, md, null, null);
@@ -424,6 +430,14 @@ public final class Manifest {
                              java.util.Map<String, String> md,
                              java.util.Map<String, String> mdTypes,
                              java.util.List<IntentFilterEntry> filters) {
+            this(n, en, exp, md, mdTypes, filters, null);
+        }
+        public ServiceEntry(String n, boolean en, boolean exp,
+                             java.util.Map<String, String> md,
+                             java.util.Map<String, String> mdTypes,
+                             java.util.List<IntentFilterEntry> filters,
+                             String permission) {
+            this.permission = permission;
             this.name = n;
             this.enabled = en;
             this.exported = exp;
@@ -1497,9 +1511,13 @@ public final class Manifest {
                         }
                     }
                     if (!svcSetExported && EXPORTED_DEFAULT) exportedSvc = !svcFilters.isEmpty();
+                    // android:permission, else the application's (AOSP
+                    // ParsedServiceUtils.parseService; raw, as for providers below).
+                    String svcPermission = attrRawOrNull(child, "permission");
+                    if (svcPermission == null) svcPermission = attrRawOrNull(app, "permission");
                     services.put(name, new ServiceEntry(
                         name, enabled, exportedSvc, svcMeta, svcMetaTypes,
-                        svcFilters));
+                        svcFilters, svcPermission));
                 } else if ("provider".equals(childTag)) {
                     // ContentProvider declaration. Used by SDKs that
                     // auto-initialize at app start (FirebaseInitProvider

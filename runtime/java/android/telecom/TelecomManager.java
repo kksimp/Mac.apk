@@ -11,18 +11,21 @@ import java.util.concurrent.Executor;
 /**
  * Telephony call management.
  *
- * No Mac has a cellular radio, a dialer, or a Telecom service. AOSP annotates
- * this whole class {@code @RequiresFeature(PackageManager.FEATURE_TELECOM)}
- * (frameworks/base telecomm/java/android/telecom/TelecomManager.java:82), and
- * we do not report that feature -- so every answer below is the answer for a
- * device without it.
+ * No Mac has a cellular radio, a dialer, or a Telecom system service. AOSP
+ * annotates this whole class
+ * {@code @RequiresFeature(PackageManager.FEATURE_TELECOM)}
+ * (frameworks/base telecomm/java/android/telecom/TelecomManager.java:82). We
+ * report that feature because SELF-MANAGED calls work end to end (see
+ * "Self-managed calls are delivered for real" below). Everything else here --
+ * managed (SIM/carrier) accounts, the dialer, addCall -- gets the answer for a
+ * device without Telecom, as described next.
  *
  * <h3>The rule this class is built around: NEVER SUCCEED INERTLY.</h3>
  *
  * The read-only queries degrade quietly, because their empty/false/null
- * answers are complete and unambiguous: there are no phone accounts, we are
- * never in a call, there is no default dialer. Apps check these before acting
- * and the answers are true.
+ * answers are complete and unambiguous: there are no SIM or carrier
+ * accounts, no default dialer, and no calls but the app's own self-managed
+ * ones. Apps check these before acting and the answers are true.
  *
  * The operations that would hand a call over to Telecom do NOT degrade
  * quietly. They throw. That is a deliberate, measured choice:
@@ -48,6 +51,19 @@ import java.util.concurrent.Executor;
  * {@code IllegalStateException("Telecom service is not present")} on AOSP when
  * the Telecom binder is absent (TelecomManager.java:2948), which is literally
  * our situation.
+ *
+ * <h3>Self-managed calls are delivered for real.</h3>
+ *
+ * A SELF-MANAGED account (PhoneAccount.CAPABILITY_SELF_MANAGED) is the app's
+ * own: its component is the app's own ConnectionService, and the app does its
+ * own audio and video. Telecom's part for such a call -- create that service
+ * and call onCreateOutgoingConnection / onCreateIncomingConnection on it --
+ * involves nothing outside the app's process, so {@link SelfManagedTelecom}
+ * does it in-process and every callback the app waits for arrives. That is
+ * real success, not inert success, so the rule above still holds: for a
+ * self-managed account, registerPhoneAccount, placeCall and
+ * addNewIncomingCall succeed and the account queries report it; for any other
+ * account they refuse exactly as described above.
  *
  * Source: frameworks/base/telecomm/java/android/telecom/TelecomManager.java
  */
@@ -156,17 +172,28 @@ public class TelecomManager {
     public static final int PRESENTATION_UNKNOWN = 3;
     public static final int PRESENTATION_PAYPHONE = 4;
 
-    /** The message every throw below carries, so a log makes the cause obvious. */
+    /** The message every throw below carries, so a log makes the cause
+     *  obvious. It names what IS supported, since FEATURE_TELECOM is reported
+     *  for self-managed calls. */
     private static final String NO_TELECOM =
-            "This device does not have the Telecom feature "
-                    + "(PackageManager.FEATURE_TELECOM); there is no Telecom service to "
-                    + "manage calls.";
+            "Mac.apk supports only self-managed calls (PhoneAccount.CAPABILITY_SELF_MANAGED); "
+                    + "there is no Telecom system service, SIM or dialer behind";
 
     public TelecomManager() { }
 
     // ---- Read-only queries. Empty/false/null are complete answers here. ----
 
-    public boolean isInCall() { return false; }
+    /** True while a self-managed call this app placed or received is not
+     *  disconnected. TelecomServiceImpl.isInCall answers false to a caller
+     *  without READ_PHONE_STATE (it also admits the default dialer and carrier
+     *  privilege, neither of which exists here). */
+    public boolean isInCall() {
+        android.app.Application app = android.app.ActivityThread.currentApplication();
+        return app != null
+                && app.checkSelfPermission(android.Manifest.permission.READ_PHONE_STATE)
+                        == android.content.pm.PackageManager.PERMISSION_GRANTED
+                && SelfManagedTelecom.hasLiveCall();
+    }
 
     public boolean isInManagedCall() { return false; }
 
@@ -181,15 +208,23 @@ public class TelecomManager {
         return Collections.emptyList();
     }
 
+    /**
+     * Every self-managed account on the device: here, the ones this app
+     * registered. Requires READ_PHONE_STATE (SecurityException otherwise), as
+     * TelecomServiceImpl does.
+     */
     public List<PhoneAccountHandle> getSelfManagedPhoneAccounts() {
-        return Collections.emptyList();
+        return SelfManagedTelecom.allHandles();
     }
 
     /**
-     * Null rather than a fabricated account: an app that got a non-null handle
-     * here would go on to place a call through it.
+     * The app's own registered self-managed account, else null. Null rather
+     * than a fabricated account: an app that got a non-null handle here would
+     * go on to place a call through it.
      */
-    public PhoneAccount getPhoneAccount(PhoneAccountHandle account) { return null; }
+    public PhoneAccount getPhoneAccount(PhoneAccountHandle account) {
+        return SelfManagedTelecom.get(account);
+    }
 
     public PhoneAccountHandle getDefaultOutgoingPhoneAccount(String uriScheme) { return null; }
 
@@ -204,27 +239,28 @@ public class TelecomManager {
     /** No MMI dialer to consume the string, so it was not handled. */
     public boolean handleMmi(String dialString) { return false; }
 
+    /** Permitted for this app's registered self-managed accounts only. */
     public boolean isOutgoingCallPermitted(PhoneAccountHandle phoneAccountHandle) {
-        return false;
+        return SelfManagedTelecom.isRegistered(phoneAccountHandle);
     }
 
     /**
-     * The self-managed accounts registered by THIS app. AOSP throws
-     * {@code IllegalStateException("Telecom is not available")} from its own
-     * null-binder branch here rather than returning an empty list -- the
-     * method is @NonNull and AOSP chose to distinguish "no accounts" from "no
-     * Telecom". Copied verbatim, so an app sees the same failure it would on a
-     * device whose Telecom service is down.
-     *
-     * @throws IllegalStateException always: there is no Telecom service.
+     * The self-managed accounts registered by THIS app. This used to throw
+     * AOSP's null-binder {@code IllegalStateException("Telecom is not
+     * available")}, which no app meets on a phone; apps call it unguarded on
+     * the way into their call screens (OurFamilyWizard 2026.11.1, from its
+     * OFWTelecomHandler constructor), so the throw left those screens empty.
+     * Self-managed accounts are now held in-process (SelfManagedTelecom), so
+     * this answers what AOSP answers with Telecom present: the list, possibly
+     * empty.
      */
     public List<PhoneAccountHandle> getOwnSelfManagedPhoneAccounts() {
-        throw new IllegalStateException("Telecom is not available");
+        return SelfManagedTelecom.ownHandles();
     }
 
-    /** @see #getOwnSelfManagedPhoneAccounts -- AOSP's own null-binder branch. */
+    /** The PhoneAccounts registered by this app: its self-managed ones. */
     public List<PhoneAccount> getRegisteredPhoneAccounts() {
-        throw new IllegalStateException("Telecom is not available");
+        return SelfManagedTelecom.accounts();
     }
 
     /**
@@ -303,8 +339,9 @@ public class TelecomManager {
         return Uri.parse("content://icc/adn");
     }
 
+    /** Permitted for this app's registered self-managed accounts only. */
     public boolean isIncomingCallPermitted(PhoneAccountHandle phoneAccountHandle) {
-        return false;
+        return SelfManagedTelecom.isRegistered(phoneAccountHandle);
     }
 
     // ---- No-ops that cannot mislead: nothing is waiting on a result. ----
@@ -330,39 +367,62 @@ public class TelecomManager {
      * binder is absent. Throwing here would instead propagate out of an app's
      * teardown path, which is a regression, not honesty.
      */
-    public void unregisterPhoneAccount(PhoneAccountHandle accountHandle) { }
+    public void unregisterPhoneAccount(PhoneAccountHandle accountHandle) {
+        SelfManagedTelecom.unregister(accountHandle);
+    }
 
-    public void clearPhoneAccounts() { }
+    public void clearPhoneAccounts() {
+        SelfManagedTelecom.clear();
+    }
 
     // ---- Hand-off operations. These THROW. See the class javadoc. ----
 
     /**
-     * @throws UnsupportedOperationException always, per AOSP's documented
-     * behaviour for a device without the Telecom feature. Accepting the
-     * registration would tell the app the platform is now responsible for its
+     * Registers a self-managed account (see the class javadoc), with AOSP's
+     * checks, each a SecurityException: the account must belong to this app,
+     * the app must hold MANAGE_OWN_CALLS, the account may not also be a call
+     * provider, connection manager or SIM account, and its component must be a
+     * service the manifest guards with BIND_TELECOM_CONNECTION_SERVICE. One
+     * check of Mac.apk's own: that service must be a ConnectionService.
+     * SelfManagedTelecom.register has the sources.
+     *
+     * @throws UnsupportedOperationException for any other account, including
+     * a transactional one (CAPABILITY_SUPPORTS_TRANSACTIONAL_OPERATIONS), per AOSP's
+     * documented behaviour for a device without the Telecom feature.
+     * Accepting it would tell the app the platform is now responsible for its
      * calls, after which it waits for callbacks that cannot arrive.
      */
     public void registerPhoneAccount(PhoneAccount account) {
+        if (SelfManagedTelecom.register(account)) return;
         throw new UnsupportedOperationException(NO_TELECOM + " registerPhoneAccount");
     }
 
     /**
-     * @throws UnsupportedOperationException always. Silently dropping a call
-     * the user asked to place is worse than refusing it: the app shows a call
-     * in progress that never connects.
+     * With EXTRA_PHONE_ACCOUNT_HANDLE naming one of this app's self-managed
+     * accounts, delivers the call to the app's ConnectionService
+     * (onCreateOutgoingConnection, on the main thread, after this returns).
+     *
+     * @throws UnsupportedOperationException for any other call. Silently
+     * dropping a call the user asked to place is worse than refusing it: the
+     * app shows a call in progress that never connects.
      */
     public void placeCall(Uri address, Bundle extras) {
+        if (SelfManagedTelecom.placeCall(address, extras)) return;
         throw new UnsupportedOperationException(NO_TELECOM + " placeCall");
     }
 
     /**
-     * @throws UnsupportedOperationException always. On Android this asks
-     * Telecom to bind the app's ConnectionService and call
-     * onCreateIncomingConnection. With no Telecom service that bind never
-     * happens, so accepting the call here is exactly the "accepted, then
-     * silent" shape that hangs an incoming-call flow.
+     * For one of this app's self-managed accounts, delivers the call to the
+     * app's ConnectionService (onCreateIncomingConnection, then
+     * onShowIncomingCallUi once it rings), as Telecom does.
+     *
+     * @throws UnsupportedOperationException for any other account. On Android
+     * this asks Telecom to bind the app's ConnectionService; for a managed
+     * account nothing here can, so accepting the call would be exactly the
+     * "accepted, then silent" shape that hangs an incoming-call flow.
      */
     public void addNewIncomingCall(PhoneAccountHandle phoneAccount, Bundle extras) {
+        if (SelfManagedTelecom.addNewIncomingCall(phoneAccount, extras)) return;
         throw new UnsupportedOperationException(NO_TELECOM + " addNewIncomingCall");
     }
 

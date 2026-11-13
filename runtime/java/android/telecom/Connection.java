@@ -20,7 +20,15 @@
 //     method is @Deprecated on AOSP for exactly this unreliability.
 //   * onAnswer/onDisconnect/onHold and the other on* callbacks are inbound
 //     from Telecom, so they are never invoked. They exist to be OVERRIDDEN --
-//     which is the whole reason the class must link.
+//     which is the whole reason the class must link. The one exception is
+//     onShowIncomingCallUi(): for a SELF-MANAGED incoming call delivered
+//     through SelfManagedTelecom, it fires once, right after
+//     onCreateIncomingConnection returns, as ConnectionService.createConnection
+//     does on a device -- that request involves only the app.
+//
+// A connection SelfManagedTelecom delivered is "attached" to its
+// ConnectionService: it is listed in getAllConnections() until destroy(), as
+// AOSP keeps it until the onDestroyed listener removes it.
 //
 // Constants and public member list taken from
 // frameworks/base/core/api/current.txt (the authoritative public-API list),
@@ -488,7 +496,23 @@ public abstract class Connection extends Conferenceable {
         if (mState != state) {
             mState = state;
             onStateChanged(state);
+            // A delivered call that ends gives up Telecom's binding to its
+            // ConnectionService (see SelfManagedTelecom.onDisconnected).
+            if (state == STATE_DISCONNECTED && mMacapkService != null) {
+                SelfManagedTelecom.onDisconnected(this);
+            }
         }
+    }
+
+    // ---- Self-managed delivery (SelfManagedTelecom) ----
+
+    /** The ConnectionService this connection was delivered for, or null. */
+    // Volatile: set on the main thread by SelfManagedTelecom, read by
+    // setState() on whatever thread the app disconnects from.
+    private volatile ConnectionService mMacapkService;
+
+    void macapkAttach(ConnectionService service) {
+        mMacapkService = service;
     }
 
     public final void setPostDialWait(String remaining) {
@@ -521,12 +545,18 @@ public abstract class Connection extends Conferenceable {
 
     /**
      * AOSP moves the connection to STATE_DISCONNECTED (if it is not already)
-     * and notifies listeners so Telecom can drop it. With no listeners the
-     * observable part is the state move, which we keep.
+     * and notifies listeners so Telecom and the ConnectionService drop it. An
+     * attached (self-managed) connection is dropped the same way; otherwise
+     * the observable part is the state move, which we keep.
      */
     public final void destroy() {
         if (mState != STATE_DISCONNECTED) {
             setState(STATE_DISCONNECTED);
+        }
+        ConnectionService service = mMacapkService;
+        if (service != null) {
+            mMacapkService = null;
+            SelfManagedTelecom.onDestroyed(this, service);
         }
     }
 

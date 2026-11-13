@@ -136,6 +136,9 @@ set(MACAPK_RUNTIME_SOURCES
     # already linked below for the existing playback and video-decode paths.
     src/audio_input.mm
     src/camera_capture.mm
+    # Optional screen + camera picture for apps without screen sharing
+    # (MACAPK_SCREEN_CAMERA, off by default). See include/macapk/screen_camera.h.
+    src/screen_camera.mm
     # Host game controllers -> Android gamepads (GameController.framework, rung 1:
     # macOS already abstracts Xbox / PlayStation / Switch / MFi controllers; IOKit
     # only to read each controller's USB/Bluetooth vendor and product ids).
@@ -213,6 +216,10 @@ set_source_files_properties(src/proxy_settings.mm
 set_source_files_properties(src/photos_bridge.mm PROPERTIES
     COMPILE_OPTIONS "-fobjc-arc")
 set_source_files_properties(src/user_verification_bridge.mm
+    PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+# screen_camera.mm: ScreenCaptureKit completion handlers and stream outputs
+# outlive the calls that create them.
+set_source_files_properties(src/screen_camera.mm
     PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 # video_caps_probe.mm: the host-probed MediaCodecInfo profile/level table;
 # ARC because the offline gate debug/vtcaps_gate.sh builds it standalone the
@@ -410,6 +417,10 @@ target_link_libraries(macapk-runtime PRIVATE
     "-framework AVFAudio"
     "-framework AudioToolbox"
     "-framework LocalAuthentication"
+    # screen_camera.mm: the screen capture and the overlay drawing. Both are in
+    # the dyld shared cache, so nothing is bundled.
+    "-framework ScreenCaptureKit"
+    "-framework CoreImage"
     "-framework Security"
     # AudioConvertHostTimeToNanos (AudioTrack.getTimestamp()'s clock source,
     # audio_backend.mm) is exported by CoreAudio.framework specifically --

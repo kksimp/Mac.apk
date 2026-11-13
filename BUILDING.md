@@ -174,3 +174,19 @@ java -Djava.awt.headless=true -cp runtime/build/lib/android-framework.jar debug/
 MACAPK_FRAMESPEED_LAYER=0 java -Djava.awt.headless=true -cp runtime/build/lib/android-framework.jar debug/LayerColorFilterTest.java
 ```
 
+## Screen camera
+
+`MACAPK_SCREEN_CAMERA=1` in an app's environment overrides lets that app's built-in
+camera send the Mac's screen with the camera floating in a corner, switched from the
+app's View menu (Shift-Command-S). See `runtime/include/macapk/screen_camera.h` for the
+switches. Run the standalone pixel check after changing `runtime/src/screen_camera.mm`:
+
+```bash
+clang++ -std=c++17 -fobjc-arc -Iruntime/include debug/ScreenCameraSmoke.mm \
+    -o /tmp/screen-camera-smoke -framework Foundation -framework CoreImage \
+    -framework CoreVideo -framework CoreMedia -framework ScreenCaptureKit \
+    -framework CoreGraphics
+/tmp/screen-camera-smoke
+```
+
+It composes synthetic frames, so it needs no camera and no Screen Recording permission.

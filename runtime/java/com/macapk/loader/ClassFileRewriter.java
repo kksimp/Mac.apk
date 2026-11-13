@@ -415,6 +415,26 @@ public final class ClassFileRewriter {
                 }
             }
 
+            // ---- Pattern K -- hasArray() on a just-allocated direct buffer ----
+            // See patternKFreshDirectBufferHasArray for the full write-up.
+            // Gate MACAPK_DIRECT_BUFFER_HAS_ARRAY.
+            if (DIRECT_BUFFER_HAS_ARRAY) {
+                int patchedK = 0;
+                for (MethodEntry m : cf.methods) {
+                    CodeAttr code = m.code;
+                    if (code == null) continue;
+                    patchedK += patternKFreshDirectBufferHasArray(
+                        cf, code, (m.accessFlags & ACC_STATIC) != 0, className);
+                }
+                if (patchedK > 0) {
+                    NativeLog.i("Mac.apk.ClassFileRewriter", className
+                        + ": " + patchedK + " hasArray() check(s) on a buffer just made by"
+                        + " ByteBuffer.allocateDirect answer true, as on ART"
+                        + " (Pattern K)");
+                    hits += patchedK;
+                }
+            }
+
             // ---- Pattern L -- libcore private-field names on HotSpot ----
             // Apps reflect libcore's private fields by NAME; the host JDK names
             // some of them differently (java.io.FileDescriptor: libcore
@@ -578,6 +598,15 @@ public final class ClassFileRewriter {
     // carries this exact UTF8 constant. The method-name test is done in the parse.
     private static final byte[] NEEDLE_JATO_PKG =
         "com/bytedance/common/jato/".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    // Pattern K: a class that both allocates a direct buffer and asks hasArray().
+    /** Gate for Pattern K (default ON); MACAPK_DIRECT_BUFFER_HAS_ARRAY=0 leaves
+     *  every hasArray() call site alone. */
+    static final boolean DIRECT_BUFFER_HAS_ARRAY =
+        !"0".equals(System.getenv("MACAPK_DIRECT_BUFFER_HAS_ARRAY"));
+    private static final byte[] NEEDLE_ALLOCATE_DIRECT =
+        "allocateDirect".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    private static final byte[] NEEDLE_HAS_ARRAY =
+        "hasArray".getBytes(java.nio.charset.StandardCharsets.UTF_8);
     // Patterns A/B only ever inspect <clinit> (see the `!"<clinit>".
     // equals(name)` guard in the loop above that calls
     // scanAndRewriteClinit). A class without a <clinit> method
@@ -626,6 +655,11 @@ public final class ClassFileRewriter {
             }
             // Pattern J (Jato nativeInit): a class that names the Jato package.
             if (containsNeedle(raw, NEEDLE_JATO_PKG)) {
+                return true;
+            }
+            // Pattern K: allocateDirect and hasArray in the same class.
+            if (DIRECT_BUFFER_HAS_ARRAY && containsNeedle(raw, NEEDLE_ALLOCATE_DIRECT)
+                    && containsNeedle(raw, NEEDLE_HAS_ARRAY)) {
                 return true;
             }
             // Pattern L: a getDeclaredField call AND a libcore field name
@@ -1406,6 +1440,226 @@ public final class ClassFileRewriter {
     private static boolean isKnownBrokenBase(String className) {
         return "java/lang/Object".equals(className)
             || "java/lang/Enum".equals(className);
+    }
+
+    // -----------------------------------------------------------------
+    // Pattern K -- hasArray() on a buffer just made by allocateDirect
+    // -----------------------------------------------------------------
+    //
+    // THE DIFFERENCE. On ART, ByteBuffer.allocateDirect() returns a buffer
+    // whose native memory IS a non-movable Java byte[]: hasArray() is true
+    // and array() aliases the same bytes (libcore DirectByteBuffer). On
+    // HotSpot a direct buffer has no array (hasArray() false, array()
+    // throws), and no HotSpot buffer can be both, because a Java array
+    // cannot share memory with native code.
+    //
+    // WHO DEPENDS ON IT. WebRTC's microphone (org.webrtc.audio.
+    // WebRtcAudioRecord.initRecording, and the same class in vendored
+    // copies such as Twilio's tvi.webrtc) does
+    //     byteBuffer = ByteBuffer.allocateDirect(bytesPerFrame * framesPerBuffer);
+    //     if (!byteBuffer.hasArray()) { error "ByteBuffer does not have backing array."; return -1; }
+    // and then hands the buffer to AudioRecord.read and to native code by
+    // address. Measured 2026-11-13 on Signal 8.35.2: recording never
+    // started, so a connected call carried no audio from the Mac and macOS
+    // never asked for the microphone.
+    //
+    // ONE PATH THAT STILL FAILS, by design: when the app has registered a
+    // SamplesReadyCallback (JavaAudioDeviceModule.Builder
+    // .setSamplesReadyCallback), WebRtcAudioRecord's record thread copies each
+    // read out with Arrays.copyOfRange(byteBuffer.array(), ...), and array()
+    // throws UnsupportedOperationException on a HotSpot direct buffer. Such
+    // an app used to get a clean init error; now its record thread throws on
+    // the first read and dies (Boot's uncaught handler logs it as FATAL
+    // EXCEPTION; the process survives unless MACAPK_KILL_ON_UNCAUGHT=1, as
+    // on Android it would not). Either way it has no microphone; this way the
+    // log names the exact call. Making array() work would need a Java array
+    // sharing the buffer's memory, which HotSpot cannot give.
+    //
+    // THE FIX, AND ITS LIMIT. Only where the receiver of hasArray() is
+    // provably the buffer allocateDirect returned in the same method --
+    // traced forward through local variables and fields of `this`, in one
+    // straight run of code with no jump target, branch or other call in
+    // between -- the call is replaced IN PLACE, 3 bytes for 3 bytes, by
+    //     pop; iconst_1; nop
+    // (consume the receiver, push true), which is ART's answer for exactly
+    // that buffer. Nothing else changes: array() and arrayOffset() still
+    // throw UnsupportedOperationException on a direct buffer, so code that
+    // goes on to use the array fails loudly rather than reading or writing
+    // a copy. A blanket "true" for every direct buffer was rejected because
+    // libraries such as protobuf take an array-writing path when hasArray()
+    // is true, and their output would be silently lost.
+    //
+    // Same length and same stack effect (one reference in, one int out), so
+    // no PC, branch target or StackMapTable entry moves.
+    private static final int OP_ICONST_1  = 0x04;
+    private static final int OP_ALOAD     = 0x19;
+    private static final int OP_ASTORE    = 0x3A;
+    private static final int OP_ILOAD     = 0x15;
+    private static final int OP_ISTORE    = 0x36;
+    private static final int OP_GETFIELD  = 0xB4;
+    private static final int OP_PUTFIELD  = 0xB5;
+    private static final int OP_CHECKCAST = 0xC0;
+    /** Longest straight run traced after one allocateDirect. */
+    private static final int PATTERN_K_MAX_STEPS = 32;
+
+    /** Abstract values for the Pattern K trace. */
+    private enum KValue { THIS, FRESH, OTHER }
+
+    private static int patternKFreshDirectBufferHasArray(
+            ClassFile cf, CodeAttr code, boolean isStatic, String className) {
+        byte[] bc = code.code;
+        int codeStart = code.codeOffset;
+        int codeEnd = codeStart + code.codeLen;
+        java.util.BitSet jumpTargets = null;   // computed only if allocateDirect is found
+        int repairs = 0;
+        int pc = codeStart;
+        while (pc < codeEnd) {
+            int op = bc[pc] & 0xFF;
+            int len = patternKLength(op, bc, pc, codeStart);
+            if (len <= 0) break;
+            if (op == OP_INVOKESTATIC && isMethodref(cf, u2(bc, pc + 1),
+                    "java/nio/ByteBuffer", "allocateDirect", "(I)Ljava/nio/ByteBuffer;")) {
+                if (jumpTargets == null) jumpTargets = patternKJumpTargets(bc, codeStart, codeEnd);
+                repairs += patternKTraceFrom(cf, bc, pc + len, codeStart, codeEnd,
+                                             jumpTargets, isStatic, className);
+            }
+            pc += len;
+        }
+        return repairs;
+    }
+
+    /** Trace forward from the instruction after an allocateDirect call (whose
+     *  result is on the stack) and rewrite each hasArray() whose receiver is
+     *  that buffer. Stops at the first jump target, unmodelled instruction or
+     *  PATTERN_K_MAX_STEPS. Returns the number of call sites rewritten. */
+    private static int patternKTraceFrom(ClassFile cf, byte[] bc, int pc, int codeStart,
+            int codeEnd, java.util.BitSet jumpTargets, boolean isStatic, String className) {
+        java.util.ArrayDeque<KValue> stack = new java.util.ArrayDeque<>();
+        java.util.Map<Integer, KValue> locals = new java.util.HashMap<>();
+        java.util.Set<String> freshFields = new java.util.HashSet<>();
+        if (!isStatic) locals.put(0, KValue.THIS);
+        stack.push(KValue.FRESH);
+        int repairs = 0;
+        for (int step = 0; step < PATTERN_K_MAX_STEPS && pc < codeEnd; step++) {
+            if (jumpTargets.get(pc - codeStart)) break;   // another path joins here
+            int op = bc[pc] & 0xFF;
+            int len = patternKLength(op, bc, pc, codeStart);
+            if (len <= 0) break;
+            if (op >= 0x2A && op <= 0x2D) {                       // aload_0..3
+                stack.push(locals.getOrDefault(op - 0x2A, KValue.OTHER));
+            } else if (op == OP_ALOAD) {
+                stack.push(locals.getOrDefault(bc[pc + 1] & 0xFF, KValue.OTHER));
+            } else if (op >= 0x4B && op <= 0x4E) {                // astore_0..3
+                if (stack.isEmpty()) break;
+                locals.put(op - 0x4B, stack.pop());
+            } else if (op == OP_ASTORE) {
+                if (stack.isEmpty()) break;
+                locals.put(bc[pc + 1] & 0xFF, stack.pop());
+            } else if ((op >= 0x1A && op <= 0x1D) || op == OP_ILOAD) {   // iload
+                stack.push(KValue.OTHER);
+            } else if ((op >= 0x3B && op <= 0x3E) || op == OP_ISTORE) {  // istore
+                if (stack.isEmpty()) break;
+                stack.pop();
+                locals.remove(op == OP_ISTORE ? bc[pc + 1] & 0xFF : op - 0x3B);
+            } else if (op == OP_DUP) {
+                if (stack.isEmpty()) break;
+                stack.push(stack.peek());
+            } else if (op == OP_CHECKCAST || op == OP_NOP) {
+                // the value on the stack is unchanged
+            } else if (op == OP_PUTFIELD) {
+                if (stack.size() < 2) break;
+                KValue value = stack.pop();
+                KValue owner = stack.pop();
+                String field = patternKFieldKey(cf, u2(bc, pc + 1));
+                if (owner == KValue.THIS && value == KValue.FRESH) freshFields.add(field);
+                else freshFields.remove(field);
+            } else if (op == OP_GETFIELD) {
+                if (stack.isEmpty()) break;
+                KValue owner = stack.pop();
+                String field = patternKFieldKey(cf, u2(bc, pc + 1));
+                stack.push(owner == KValue.THIS && freshFields.contains(field)
+                           ? KValue.FRESH : KValue.OTHER);
+            } else if (op == OP_INVOKEVIRTUAL && (
+                       isMethodref(cf, u2(bc, pc + 1), "java/nio/ByteBuffer", "hasArray", "()Z")
+                    || isMethodref(cf, u2(bc, pc + 1), "java/nio/Buffer", "hasArray", "()Z"))) {
+                if (stack.isEmpty()) break;
+                if (stack.pop() == KValue.FRESH) {
+                    bc[pc]     = (byte) OP_POP;
+                    bc[pc + 1] = (byte) OP_ICONST_1;
+                    bc[pc + 2] = (byte) OP_NOP;
+                    repairs++;
+                    if (DEBUG) {
+                        System.err.println("[rewriter] " + className + ": Pattern-K pc="
+                            + (pc - codeStart) + " hasArray() on a fresh direct buffer -> true");
+                    }
+                }
+                stack.push(KValue.OTHER);
+            } else {
+                break;   // anything else (calls, branches, arithmetic...) ends the trace
+            }
+            pc += len;
+        }
+        return repairs;
+    }
+
+    /** Exact instruction length for Pattern K, which walks whole method
+     *  bodies: unlike instructionLength (built for <clinit> sequences), it
+     *  sizes the padded switches and the wide prefix instead of approximating
+     *  them, so the walk never drifts out of step. */
+    private static int patternKLength(int op, byte[] bc, int pc, int codeStart) {
+        if (op == 0xAA || op == 0xAB) {                          // tableswitch, lookupswitch
+            int base = pc + 1 + ((4 - ((pc - codeStart + 1) % 4)) % 4);
+            if (op == 0xAA) {
+                int low = u4(bc, base + 4), high = u4(bc, base + 8);
+                return base + 12 + 4 * (high - low + 1) - pc;
+            }
+            return base + 8 + 8 * u4(bc, base + 4) - pc;
+        }
+        if (op == 0xC4) return (bc[pc + 1] & 0xFF) == 0x84 ? 6 : 4;   // wide
+        return instructionLength(op, bc, pc);
+    }
+
+    /** "owner.name:descriptor" for a Fieldref, so two refs to one field match. */
+    private static String patternKFieldKey(ClassFile cf, int fieldrefIdx) {
+        int classIdx = cf.fieldrefClass(fieldrefIdx);
+        int ntIdx = cf.fieldrefNameAndType(fieldrefIdx);
+        if (classIdx < 0 || ntIdx < 0) return "?" + fieldrefIdx;
+        return cf.classNameOf(classIdx) + "." + cf.utf8(cf.nameAndTypeName(ntIdx))
+            + ":" + cf.utf8(cf.nameAndTypeDescriptor(ntIdx));
+    }
+
+    /** Offsets (from the start of the code) that some branch, switch or
+     *  exception handler can jump to: where another path may join, so a
+     *  straight-line trace must stop there. */
+    private static java.util.BitSet patternKJumpTargets(byte[] bc, int codeStart, int codeEnd) {
+        java.util.BitSet targets = new java.util.BitSet();
+        int pc = codeStart;
+        while (pc < codeEnd) {
+            int op = bc[pc] & 0xFF;
+            int len = patternKLength(op, bc, pc, codeStart);
+            if (len <= 0) break;
+            int rel = pc - codeStart;
+            if ((op >= 0x99 && op <= 0xA8) || op == 0xC6 || op == 0xC7) {   // if*, goto, jsr, ifnull/ifnonnull
+                targets.set(rel + (short) u2(bc, pc + 1));
+            } else if (op == 0xC8 || op == 0xC9) {                           // goto_w, jsr_w
+                targets.set(rel + u4(bc, pc + 1));
+            } else if (op == 0xAA || op == 0xAB) {                           // tableswitch, lookupswitch
+                int base = pc + 1 + ((4 - ((rel + 1) % 4)) % 4);
+                targets.set(rel + u4(bc, base));                             // default
+                if (op == 0xAA) {
+                    int low = u4(bc, base + 4), high = u4(bc, base + 8);
+                    for (int i = 0; i <= high - low; i++) targets.set(rel + u4(bc, base + 12 + 4 * i));
+                } else {
+                    int pairs = u4(bc, base + 4);
+                    for (int i = 0; i < pairs; i++) targets.set(rel + u4(bc, base + 12 + 8 * i));
+                }
+            }
+            pc += len;
+        }
+        // Exception handlers: the table follows the code (JVMS 4.7.3).
+        int count = u2(bc, codeEnd);
+        for (int i = 0; i < count; i++) targets.set(u2(bc, codeEnd + 2 + 8 * i + 4));
+        return targets;
     }
 
     /** Compute the byte length of the instruction at `pc`. Covers

@@ -202,8 +202,10 @@ public final class MacApkGlWindow {
             if (savedSkipPixels != 0) GLES20.glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
         }
 
+        final long readStart = System.nanoTime();
         mRgba.clear();
         GLES20.glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, mRgba);
+        final long readNs = System.nanoTime() - readStart;
 
         if (es3) {
             if (savedSkipPixels != 0) GLES20.glPixelStorei(GL_PACK_SKIP_PIXELS, savedSkipPixels);
@@ -214,6 +216,7 @@ public final class MacApkGlWindow {
         if (savedAlign != 4) GLES20.glPixelStorei(GL_PACK_ALIGNMENT, savedAlign);
         if (savedFb != 0) GLES20.glBindFramebuffer(fbTarget, savedFb);
 
+        final long convertStart = System.nanoTime();
         mRgba.position(0);
         mRgba.get(mBytes, 0, n * 4);
         final byte[] b = mBytes;
@@ -245,6 +248,31 @@ public final class MacApkGlWindow {
         // premultiplied bytes a device buffer holds, not our straight copy.
         mSt.macapkQueueProducerFrame(argb, w, h, w, FLIP_V, mRecycler, true); /*GLPREMUL*/
         mFrames++;
+        reportSlowSwap(w, h, readNs, System.nanoTime() - convertStart);
+    }
+
+    /** Slow swaps, measured (2026-11-13): apps draw video through eglSwapBuffers
+     *  while holding their own locks (WebRTC holds its global EglBase.lock), so a
+     *  swap that takes longer than a 30 fps frame starves every other thread that
+     *  needs that lock -- in a Signal call, the outgoing video's frame
+     *  conversion, which fell to 0 fps behind a 2940x1780 preview. The split
+     *  between the GPU readback and the CPU conversion says which half to fix.
+     *  Logged at most SLOW_SWAP_REPORTS times per process. */
+    private static final long SLOW_SWAP_NS = 33_000_000L;
+    private static final int SLOW_SWAP_REPORTS = 20;
+    private static final java.util.concurrent.atomic.AtomicInteger sSlowSwapReports =
+        new java.util.concurrent.atomic.AtomicInteger();
+
+    private static void reportSlowSwap(int w, int h, long readNs, long convertNs) {
+        if (readNs + convertNs < SLOW_SWAP_NS) return;
+        if (sSlowSwapReports.getAndIncrement() >= SLOW_SWAP_REPORTS) return;
+        try {
+            com.macapk.loader.NativeLog.w(TAG14, "slow eglSwapBuffers to a SurfaceTexture: "
+                + w + "x" + h + ", GPU readback " + readNs / 1_000_000 + " ms, conversion "
+                + convertNs / 1_000_000 + " ms, on thread " + Thread.currentThread().getName());
+        } catch (Throwable ignored) {
+            // NativeLog is native; a harness JVM without it logs nothing.
+        }
     }
 
     /** Premultiplied channel back to straight alpha, rounded to nearest. */

@@ -905,6 +905,7 @@ public final class Boot {
         }
         prewarmInvokeDynamic();
         installShutdownDump();
+        AnrWatchdog.start();   // all-thread dump when the main thread stalls 5 s
         // MACAPK_TRACE_JNI: patch the process-wide JNIEnv vtable to log JNI
         // resolves (FindClass/GetMethodID/GetFieldID/...) that return NULL --
         // names the missing android.* member behind the pairip +0x440c4 branch.

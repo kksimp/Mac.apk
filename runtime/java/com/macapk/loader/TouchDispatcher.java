@@ -2602,6 +2602,23 @@ public final class TouchDispatcher {
      *  midway (AppKit thread). */
     private static boolean s_hostAsFinger;
 
+    // RELATIVE MOUSE (MACAPK_MOUSE_RELATIVE, default OFF): the mcpelauncher
+    // recipe (mcpelauncher-client src/window_callbacks.cpp:221-239) -- once the
+    // Cocoa side holds the cursor (CGAssociateMouseAndMouseCursorPosition
+    // false), every motion is a DELTA instead of a pointer position and is
+    // delivered as what AOSP's CursorInputMapper sends for a captured pointer:
+    // SOURCE_MOUSE_RELATIVE + ACTION_HOVER_MOVE with x/y = dx/dy. Our own NDK
+    // shim already carries that pair to the engine unchanged (the source is
+    // copied verbatim and every axis is copied for a non-touch screen:
+    // bionic_shim_nativeactivity.cpp:632, :658-660), so nothing below this
+    // layer needed a change.
+    static final boolean MOUSE_RELATIVE = "1".equals(System.getenv("MACAPK_MOUSE_RELATIVE"));
+    /** True while the Cocoa side holds the cursor. Written on the AppKit
+     *  thread, read on the delivery thread: while it is set a click must take
+     *  the mouse path below, not the touchscreen-finger path a taken input
+     *  queue otherwise selects. */
+    private static volatile boolean s_hostMouseRelative;
+
     /** What CursorInputMapper builds for one main/hover event: one pointer,
      *  TOOL_TYPE_MOUSE, SOURCE_MOUSE, pressure 1 while a button is down. Device
      *  id 0, like the wheel step: no mouse InputDevice is registered. */
@@ -2622,14 +2639,92 @@ public final class TouchDispatcher {
                 android.view.InputDevice.SOURCE_MOUSE, 0 /* flags */);
     }
 
+    /** Capture state mirror, called from cocoa_bridge.mm when the cursor is
+     *  taken or given back (macapkSetRelativeMouse:). */
+    public void setHostMouseRelative(boolean on) {
+        s_hostMouseRelative = on && MOUSE_RELATIVE;
+    }
+
+    /** Pointer capture the APP asked for through View.requestPointerCapture
+     *  (API 26). AOSP grants it per view and releases it through
+     *  releasePointerCapture; a game menu keeps an ordinary pointer, so the
+     *  host cursor may only be taken while this is set. Written from the app's
+     *  threads, read by cocoa_bridge.mm (hostPointerCaptureWanted) and by the
+     *  relative delivery below. */
+    private static volatile boolean s_pointerCaptureWanted;
+    /** The view AOSP would deliver the captured stream to (never cleared by
+     *  the framework itself; releasePointerCapture and a new request are the
+     *  only writers). */
+    private static volatile android.view.View s_pointerCaptureView;
+
+    public static void requestHostPointerCapture(android.view.View view) {
+        s_pointerCaptureView = view;
+        s_pointerCaptureWanted = true;
+    }
+
+    public static void releaseHostPointerCapture() {
+        s_pointerCaptureWanted = false;
+        s_pointerCaptureView = null;
+    }
+
+    /** View.hasPointerCapture: AOSP answers for the view that holds it. */
+    public static boolean hasHostPointerCapture(android.view.View view) {
+        return s_pointerCaptureWanted && s_pointerCaptureView == view;
+    }
+
+    /** Polled by cocoa_bridge.mm before it takes the cursor. */
+    public boolean hostPointerCaptureWanted() {
+        return MOUSE_RELATIVE && s_pointerCaptureWanted;
+    }
+
+    /** One host motion while the cursor is held. Built like mcpelauncher's
+     *  relative branch (window_callbacks.cpp:221-239): one pointer,
+     *  TOOL_TYPE_MOUSE, SOURCE_MOUSE_RELATIVE, ACTION_HOVER_MOVE, and the
+     *  deltas in x/y (not only in AXIS_RELATIVE_X/Y, which the same event also
+     *  carries). deviceId 0 for the same reason as mouseEvent: no mouse
+     *  InputDevice is registered. */
+    public void dispatchHostMouseRelative(float dx, float dy) {
+        if (!MOUSE_RELATIVE || !s_hostMouseRelative) return;
+        final Activity a = ActivityHost.peek();
+        if (a == null) return;
+        noteRealInput();
+        final long t = android.os.SystemClock.uptimeMillis();
+        MotionEvent.PointerProperties p = new MotionEvent.PointerProperties();
+        p.id = 0;
+        p.toolType = MotionEvent.TOOL_TYPE_MOUSE;
+        MotionEvent.PointerCoords c = new MotionEvent.PointerCoords();
+        c.x = dx; c.y = dy;
+        c.relativeX = dx; c.relativeY = dy;
+        c.pressure = (s_hostMouseButtons & POINTER_DOWN_BUTTONS) != 0 ? 1f : 0f;
+        c.size = 0f;
+        MotionEvent ev = MotionEvent.obtain(t, t, MotionEvent.ACTION_HOVER_MOVE, 1,
+                new MotionEvent.PointerProperties[]{ p },
+                new MotionEvent.PointerCoords[]{ c },
+                0 /* metaState */, s_hostMouseButtons, 1f, 1f,
+                0 /* deviceId */, 0 /* edgeFlags */,
+                android.view.InputDevice.SOURCE_MOUSE_RELATIVE, 0 /* flags */);
+        if (ev == null) return;
+        // AOSP hands a captured stream to the captured VIEW, not to the generic
+        // dispatch path; an app that registered OnCapturedPointerListener (which
+        // is how it learns the deltas) is served here first. Only when that view
+        // does not take the event does it go to the taken input queue.
+        final android.view.View captured = s_pointerCaptureView;
+        if (captured != null && captured.dispatchCapturedPointerEvent(ev)) return;
+        if (!deliverToTakenInputQueue(a, ev)) a.dispatchGenericMotionEvent(ev);
+    }
+
     /** Called from cocoa_bridge.mm for every host mouse button event: the
      *  pressed set AFTER this event (AOSP BUTTON_* bits, which AppKit's button
      *  numbers map onto 1:1), the meta state, and the pointer in view points. */
     public void dispatchHostMouse(int buttonState, int metaState, float x, float y,
                                   float viewW, float viewH) {
         if ((s_hostMouseButtons & POINTER_DOWN_BUTTONS) == 0) {
+            // A held cursor makes this a mouse for the whole press: the game
+            // reads relative motion and expects the click as SOURCE_MOUSE with
+            // a button, so the taken-queue finger rule must not apply.
             s_hostAsFinger = !MOUSE_POINTER
-                    || (!NATIVE_QUEUE_MOUSE && hasTakenInputQueue(ActivityHost.peek()));
+                    || (!s_hostMouseRelative && !NATIVE_QUEUE_MOUSE
+                        && hasTakenInputQueue(ActivityHost.peek()));
         }
         if (s_hostAsFinger) {
             // The pre-change path, for a taken native input queue (above) and

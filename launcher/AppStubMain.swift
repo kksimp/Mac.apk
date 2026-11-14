@@ -707,7 +707,8 @@ struct AppStubMain {
         // run yesterday's runtime after a rebuild. It is a no-op once the
         // staged build-id matches, and -- the part that matters -- it REFUSES
         // to run at all once the user has pressed Uninstall.
-        let runtimeURL = RuntimeInstall.ensureStaged(extraSources: appCandidates) {
+        let runtimeURL = RuntimeInstall.ensureStaged(extraSources: appCandidates,
+                                                     willStage: EarlyCheckIn.now) {
             stubLog($0)
         }
         guard let runtime = runtimeURL else {
@@ -1324,6 +1325,41 @@ enum PlayBootstrap {
 }
 
 // MARK: - The system broker's background item
+
+/// Connect to the window server before a slow first launch, so the launch's
+/// activation lands while the user is still looking at it.
+///
+/// LaunchServices makes a launched app frontmost when the app checks in, which
+/// AppKit does in NSApplication.shared. The runtime does that in CocoaInit,
+/// after this stub has exec'd it, which on an ordinary launch is a fraction of
+/// a second in. On the first launch after Mac.apk is installed or updated the
+/// stub first re-stages the runtime and macOS then checks the new program,
+/// and the system log showed the runtime checking in four seconds after the
+/// launch (OurFamilyWizard, 2026-11-14). A user who switched to another app
+/// inside those seconds kept it, as macOS intends, but the launched app had
+/// never been active, so it opened behind and sorted last in Command-Tab,
+/// where a native app, checked in at once, would be second.
+///
+/// Called only on that path (RuntimeInstall.ensureStaged's willStage), and it
+/// only creates the shared NSApplication: no finishLaunching, no run loop, so
+/// the launch's Apple Events are not read here. The runtime checks in again
+/// after the exec. Never for a secondary process (MACAPK_SECONDARY_PROCESS=1):
+/// a headless worker must not register as the app. Nor when the app is already
+/// running: this launch is then a relay (LaunchUrlHandoff, which keeps its own
+/// NSApplication off the Dock) and must not take the Dock tile or activation.
+enum EarlyCheckIn {
+    static func now() {
+        let env = ProcessInfo.processInfo.environment
+        guard env["MACAPK_EARLY_CHECKIN"] != "0", env["MACAPK_SECONDARY_PROCESS"] != "1" else { return }
+        if let id = Bundle.main.bundleIdentifier {
+            let me = ProcessInfo.processInfo.processIdentifier
+            if NSRunningApplication.runningApplications(withBundleIdentifier: id)
+                .contains(where: { $0.processIdentifier != me }) { return }
+        }
+        _ = NSApplication.shared
+        stubLog("[runtime] connected to the window server before staging, so the launch activation is not lost")
+    }
+}
 
 /// Is the "Use Google GMS" switch on, and does launchd hold the broker? When the
 /// switch is on and launchd does not, Mac.apk.app registers it (SMAppService can

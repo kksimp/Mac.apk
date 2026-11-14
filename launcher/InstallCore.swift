@@ -6285,6 +6285,7 @@ public enum RuntimeInstall {
     /// makes the button mean anything.
     @discardableResult
     public static func ensureStaged(extraSources: [URL] = [],
+                                    willStage: (() -> Void)? = nil,
                                     log: ((String) -> Void)? = nil) -> URL? {
         // An explicit A/B target is the caller's business: do not self-heal it,
         // do not consult the marker, do not stage over it. Short-circuiting
@@ -6322,6 +6323,10 @@ public enum RuntimeInstall {
             why = "staged build \(st.stagedBuildId ?? "?") != shipped \(st.sourceBuildId ?? "?")"
         }
         log?("[runtime] staging: \(why)")
+        // The slow path (a full copy of the payload): the caller's chance to
+        // do what must not wait for it. The app stub connects to the window
+        // server here (AppStubMain, EarlyCheckIn).
+        willStage?()
         let r = install(extraSources: extraSources, log: log)
         if case .failed(let m) = r { log?("[runtime] staging FAILED: \(m)") }
         // Again after staging: install() just re-copied the payload, xattrs

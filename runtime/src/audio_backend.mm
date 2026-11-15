@@ -755,6 +755,8 @@ static void attach_source_node(Stream* s) {
     }
 }
 
+static void observe_output_engine_changes();
+
 // ---------------------------------------------------------------------------
 // Lazy engine bring-up. Caller holds g_mtx.
 // ---------------------------------------------------------------------------
@@ -832,6 +834,7 @@ static void ensure_engine_locked() {
             g_engine.mainMixerNode.outputVolume = 0.0f;
             std::fprintf(stderr, "[audio] output muted (MACAPK_AUDIO_TEST_MUTE=1, test hook)\n");
         }
+        if (g_engine_started) observe_output_engine_changes();
         if (!g_engine_started) {
             std::fprintf(stderr, "[audio] AVAudioEngine start FAILED: %s\n",
                          forced_fail ? "forced by MACAPK_AUDIO_TEST_NO_OUTPUT=1 (test hook)"
@@ -843,6 +846,123 @@ static void ensure_engine_locked() {
                 of.sampleRate, (unsigned)of.channelCount);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Keeping the output engine running.
+//
+// macOS STOPS an AVAudioEngine by itself whenever the audio configuration
+// changes (the default output device changes, its format or sample rate
+// changes) and posts AVAudioEngineConfigurationChangeNotification; the engine
+// stays stopped until it is started again (AVAudioEngine.h). This engine is
+// created once per process, so before this every stream went silent for the
+// rest of the process: measured 2026-11-13 on Signal 8.35.2, where connecting
+// headphones during a call left every AudioTrack.write returning 0 ("AudioTrack
+// .write played invalid number of bytes: 0") while the other side's audio kept
+// arriving.
+//
+// So when the notification arrives, or a stream is created and finds the
+// engine stopped, the mixer is reconnected to the output node at the new
+// device's format (the old connection carries the old device's) and the engine
+// is started again. Source nodes stay attached; the mixer converts each
+// stream's rate to the device's. A device switch can post several
+// notifications while it settles, so a restart that fails is retried a few
+// times, a second apart. Every failure grants a fresh set of retries; at most
+// one retry is scheduled at a time.
+// ---------------------------------------------------------------------------
+static int  g_restart_retries_left = 0;     // guarded by g_mtx
+static bool g_restart_retry_pending = false; // guarded by g_mtx: a retry is scheduled
+static const int kOutputRetries = 5;
+
+// Reconnect and start the stopped engine. Caller holds g_mtx. Returns true when
+// it is running afterwards; logs why not otherwise.
+static bool restart_output_engine_locked(const char* why) {
+    @autoreleasepool {
+        AVAudioOutputNode* out = g_engine.outputNode;
+        AVAudioFormat* hw = [out outputFormatForBus:0];
+        if (!hw || hw.channelCount == 0 || hw.sampleRate <= 0.0) {
+            std::fprintf(stderr, "[audio] output stopped (%s) and no usable output device "
+                         "to restart on\n", why);
+            return false;
+        }
+        AVAudioMixerNode* mixer = g_engine.mainMixerNode;
+        AVAudioFormat* now = [mixer outputFormatForBus:0];
+        if (now.sampleRate != hw.sampleRate || now.channelCount != hw.channelCount) {
+            AVAudioFormat* fmt = [[AVAudioFormat alloc]
+                initStandardFormatWithSampleRate:hw.sampleRate channels:hw.channelCount];
+            @try {
+                EngineConnect(g_engine, mixer, out, fmt);
+            } @catch (NSException* ex) {
+                std::fprintf(stderr, "[audio] output reconnect failed (%s): %s\n", why,
+                             ex.reason ? ex.reason.UTF8String : "(no reason)");
+            }
+            [fmt release];
+        }
+        [g_engine prepare];
+        NSError* err = nil;
+        if (![g_engine startAndReturnError:&err]) {
+            std::fprintf(stderr, "[audio] output restart FAILED (%s), %.0f Hz %u ch: %s\n",
+                         why, hw.sampleRate, (unsigned)hw.channelCount,
+                         err ? err.localizedDescription.UTF8String : "(unknown)");
+            return false;
+        }
+        std::fprintf(stderr, "[audio] output restarted (%s): %.0f Hz %u ch\n",
+                     why, hw.sampleRate, (unsigned)hw.channelCount);
+        return true;
+    }
+}
+
+static void retry_output_engine_later();
+
+// Caller holds g_mtx.
+static void restart_output_engine_if_stopped_locked(const char* why) {
+    if (!g_engine || !g_engine_started || g_engine.isRunning) return;
+    if (restart_output_engine_locked(why)) {
+        g_restart_retries_left = 0;
+    } else {
+        g_restart_retries_left = kOutputRetries;
+        retry_output_engine_later();
+    }
+}
+
+// Caller holds g_mtx. Schedules one retry unless one is already pending.
+static void retry_output_engine_later() {
+    if (g_restart_retry_pending) return;
+    g_restart_retry_pending = true;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_restart_retry_pending = false;
+        // The engine runs again: end the run so a later failure starts a fresh one.
+        if (g_restart_retries_left <= 0 || g_engine.isRunning) {
+            g_restart_retries_left = 0;
+            return;
+        }
+        g_restart_retries_left--;
+        if (restart_output_engine_locked("retry after a failed restart")) {
+            g_restart_retries_left = 0;
+        } else if (g_restart_retries_left > 0) {
+            retry_output_engine_later();
+        } else {
+            std::fprintf(stderr, "[audio] output still not running after %d retries; "
+                         "the next stream created tries again\n", kOutputRetries);
+        }
+    });
+}
+
+static void observe_output_engine_changes() {
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:AVAudioEngineConfigurationChangeNotification
+                    object:g_engine
+                     queue:nil
+                usingBlock:^(NSNotification*) {
+        // Off the posting thread: the restart takes g_mtx and talks to
+        // CoreAudio, neither of which belongs on a notification callback.
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            std::lock_guard<std::mutex> lk(g_mtx);
+            restart_output_engine_if_stopped_locked("audio configuration changed");
+        });
+    }];
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,6 +1168,7 @@ extern "C" int64_t macapk_audio_stream_create(int sample_rate, int channels,
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         ensure_engine_locked();
+        restart_output_engine_if_stopped_locked("an audio stream was created");
     }
 
     attach_source_node(s);

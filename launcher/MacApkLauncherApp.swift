@@ -4620,6 +4620,25 @@ struct LauncherView: View {
         }
     }
 
+    /// The same hand-off for an app opened as its bundle. Observed (owner,
+    /// 2026-11-13): an app opened from this window opened behind it, last in
+    /// Command-Tab, though openApplication is asked to activate it. The likely
+    /// reason: the bundle's stub execv's the runtime, and the runtime's own
+    /// activate when its window appears is refused while this launcher stays
+    /// the active app, since the launcher never yielded to it. Opened from Finder or Spotlight it came forward,
+    /// as LaunchServices grants that itself. Yielding until the app is active
+    /// covers the exec; it stops once the app is active or has quit, once the
+    /// launcher is no longer the active app (the user moved on: the chain
+    /// ends at the first tick that finds it inactive and is not restarted),
+    /// or after about 15 seconds.
+    private func yieldActivation(toLaunched app: NSRunningApplication, attempt: Int = 0) {
+        guard !app.isTerminated, !app.isActive, NSApp.isActive, attempt < 30 else { return }
+        NSApp.yieldActivation(to: app)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) {
+            self.yieldActivation(toLaunched: app, attempt: attempt + 1)
+        }
+    }
+
     private func stopRunning() {
         if let p = model.process, p.isRunning {
             p.terminate()
@@ -4723,6 +4742,7 @@ struct LauncherView: View {
                     return
                 }
                 self.model.runningApps[running.processIdentifier] = (running, label)
+                self.yieldActivation(toLaunched: running)
                 if let dirName = app?.dirName ?? (NSDictionary(contentsOf:
                         bundle.appendingPathComponent("Contents/Info.plist"))?["MacapkDirName"] as? String) {
                     self.tailRunLog(dirName: dirName, since: started,

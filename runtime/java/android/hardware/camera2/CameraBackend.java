@@ -254,6 +254,21 @@ final class CameraBackend {
                 new int[] { CameraMetadata.CONTROL_AF_MODE_OFF });
         p.put(CameraCharacteristics.CONTROL_MAX_REGIONS_AF, Integer.valueOf(0));
 
+        // Video stabilization: we do not stabilize, so the one available mode
+        // is OFF. AOSP documents CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES as
+        // "available on all devices", and a LEGACY device reports exactly
+        // { CONTROL_VIDEO_STABILIZATION_MODE_OFF } when Camera1 cannot stabilize
+        // (LegacyMetadataMapper.mapControlOther, android11-release). Absent,
+        // WebRTC's Camera2Session.chooseStabilizationMode, which loops over this
+        // array without a null check, threw a NullPointerException from
+        // onConfigured, so capture never started and a later stopCapture waited
+        // forever for the session (seen 2026-11-15 with Twilio Video 7.10.5's
+        // tvi.webrtc copy of Camera2Session).
+        // LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION stays absent: LEGACY does
+        // not report it, and WebRTC checks that one for null.
+        p.put(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES,
+                new int[] { CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF });
+
         // AE: auto-exposure is always on and is not under app control, so the
         // single available mode is ON (not ON_AUTO_FLASH -- there is no flash).
         p.put(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES,

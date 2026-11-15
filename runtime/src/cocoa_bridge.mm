@@ -497,8 +497,9 @@ static std::atomic<bool> g_unity_app{false};
 // filled only the bottom-left of it (Rocket League Sideswipe, 2026-10-02).
 // Here the layer's bounds become the buffer size in points (so its natural
 // drawable, which ANGLE / MoltenVK size the swapchain from, is exactly w x h)
-// and a scale transform stretches it over the window rect, as the compositor
-// does. Main thread only (both are written there).
+// and a scale transform stretches it over the layer's rect (the window, or its
+// view's rect under MACAPK_SV_NATIVE_LAYER_RECT), as the compositor does. Main
+// thread only (both are written there).
 static int g_nw_buffer_w = 0, g_nw_buffer_h = 0;
 // The window's DEFAULT buffer size (the layer's own rect in pixels) while a
 // requested buffer size is applied. ANativeWindow_getWidth/Height answer THIS,
@@ -508,6 +509,56 @@ static int g_nw_buffer_w = 0, g_nw_buffer_h = 0;
 // Unreal maps a touch as getX / ANativeWindow_getWidth * renderWidth, so
 // answering the requested size put every tap at the far edge.
 static std::atomic<int> g_nw_default_w{0}, g_nw_default_h{0};
+// MACAPK_SV_NATIVE_LAYER_RECT (default ON, 2026-11-15): where the layer goes.
+// AOSP shows a SurfaceView's buffer at the VIEW's rect; this layer was always
+// the host's bounds (the whole window), which is right for the engines it was
+// made for (Unity, AGDK, SDL: their views fill the window) and wrong for a view
+// that does not. A producer that sizes its drawing from the EGL surface then
+// drew a window-sized picture behind the window, and the owner's hole showed
+// whichever part of it lay underneath (OurFamilyWizard's draggable self-view
+// tile, Twilio Video's VideoView: a wall at the window's edge, the caller's
+// face only in the middle). SurfaceView.macapkNativeWindowLayerRectPacked
+// answers the owning view's rect in display-surface pixels, or 0 for the whole
+// window; MacapkSyncGuestLayerRect pulls it every tick and stores it here. The
+// sites that resize a published layer (the buffer-geometry request, the resize
+// and live-resize paths, the reassert diagnostic) ask macapk_native_egl_layer_rect,
+// so a resize cannot put the layer back on the window box for a frame; one that
+// re-hosts it (macapk_sv_layer_show_on_main, a host that left its window) places
+// it on the new view's bounds, and the next tick's sync, which compares the
+// layer's geometry and not only the rect, puts it back on the view's rect. Main
+// thread only (written and read there). =0 here and on the Java side keeps the
+// host's bounds byte-for-byte.
+static long long g_nw_view_rect_packed = 0;
+static bool macapk_native_layer_rect_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_SV_NATIVE_LAYER_RECT");
+        return !(e && std::strcmp(e, "0") == 0);
+    }();
+    return on;
+}
+// The rect, in `host` points, the native-EGL window layer covers right now:
+// the owning SurfaceView's rect while it is published and does not fill the
+// window, else host.bounds (the legacy placement).
+static CGRect macapk_native_egl_layer_rect(NSView* host, CGFloat scale) {
+    if (!host) return CGRectZero;
+    const long long packed = g_nw_view_rect_packed;
+    if (packed == 0) return host.bounds;
+    const int16_t xs  = (int16_t) ((packed >> 48) & 0xffff);
+    const int16_t ys  = (int16_t) ((packed >> 32) & 0xffff);
+    const int     wpx = (int)     ((packed >> 16) & 0xffff);
+    const int     hpx = (int)     ( packed        & 0xffff);
+    if (wpx <= 0 || hpx <= 0) return host.bounds;
+    if (scale <= 0) scale = 2.0;
+    // Display-surface px (top-left origin) -> host points; ask the view for its
+    // flip, as MacapkApplySurfaceLayerGeometry does.
+    CGRect r;
+    r.origin.x    = xs / scale;
+    r.origin.y    = host.isFlipped ? ys / scale
+                                   : host.bounds.size.height - (ys + hpx) / scale;
+    r.size.width  = wpx / scale;
+    r.size.height = hpx / scale;
+    return r;
+}
 // Lays `ul` over `rect` (host points) at the requested buffer size and returns
 // true; returns false, touching nothing, when no buffer size was requested, so
 // each caller keeps its own unscaled placement byte-for-byte.
@@ -544,16 +595,18 @@ extern "C" void CocoaSetNativeEglBufferGeometry(int w, int h) {
         CAMetalLayer* ul = g_unity_layer;
         MTKView* host = g_unity_host_view;
         std::fprintf(stderr, "[I] cocoa_v2: native-EGL window buffer %dx%d (%s)\n", w, h,
-                     (w > 0 && h > 0) ? "scaled to the window, as SurfaceFlinger does"
-                                      : "the window's own size");
+                     (w > 0 && h > 0) ? "scaled to the layer's rect, the window or its "
+                                        "view's (MACAPK_SV_NATIVE_LAYER_RECT), as SurfaceFlinger does"
+                                      : "the layer's own size");
         if (!ul || !host) return;
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         CGFloat scale = host.window ? host.window.backingScaleFactor : ul.contentsScale;
-        if (!macapk_place_scaled_native_egl_layer(ul, host.bounds, scale)) {
-            ul.frame = host.bounds;
-            ul.drawableSize = CGSizeMake(std::round(host.bounds.size.width  * scale),
-                                         std::round(host.bounds.size.height * scale));
+        const CGRect r = macapk_native_egl_layer_rect(host, scale);   // MACAPK_SV_NATIVE_LAYER_RECT
+        if (!macapk_place_scaled_native_egl_layer(ul, r, scale)) {
+            ul.frame = r;
+            ul.drawableSize = CGSizeMake(std::round(r.size.width  * scale),
+                                         std::round(r.size.height * scale));
         }
         [CATransaction commit];
     });
@@ -2043,14 +2096,14 @@ static void macapk_reassert_native_egl_layer(void) {
         [av.layer addSublayer:ul];
         g_unity_host_view = av;
     }
-    if (macapk_place_scaled_native_egl_layer(
-            ul, av.bounds, av.window ? av.window.backingScaleFactor : ul.contentsScale)) {
+    const CGFloat avScale = av.window ? av.window.backingScaleFactor : ul.contentsScale;
+    const CGRect  avRect  = macapk_native_egl_layer_rect(av, avScale);   // MACAPK_SV_NATIVE_LAYER_RECT
+    if (macapk_place_scaled_native_egl_layer(ul, avRect, avScale)) {
         // placed at the guest's requested buffer size
-    } else if (!CGRectEqualToRect(ul.frame, av.bounds)) {
-        ul.frame = av.bounds;
-        CGFloat scale = av.window ? av.window.backingScaleFactor : ul.contentsScale;
-        ul.drawableSize = CGSizeMake(std::round(av.bounds.size.width  * scale),
-                                     std::round(av.bounds.size.height * scale));
+    } else if (!CGRectEqualToRect(ul.frame, avRect)) {
+        ul.frame = avRect;
+        ul.drawableSize = CGSizeMake(std::round(avRect.size.width  * avScale),
+                                     std::round(avRect.size.height * avScale));
     }
     [CATransaction commit];
 }
@@ -8291,6 +8344,82 @@ static void MacapkSyncGuestLayerZ(JNIEnv* env) {
     std::fflush(stderr);
 }
 
+/** Per drawInMTKView tick, beside MacapkSyncGuestLayerZ: put the native-EGL
+ *  window layer on its owning SurfaceView's rect when that view does not fill
+ *  its window (MACAPK_SV_NATIVE_LAYER_RECT; the why is at g_nw_view_rect_packed).
+ *  One static JNI call per tick, only while a PUBLISHED layer exists. While a
+ *  rect is applied it compares the layer's geometry with the rect every tick,
+ *  so a site that re-hosts the layer on a window box is corrected the next
+ *  tick. A steady tile costs a few compares, or an idempotent re-place while
+ *  ANativeWindow_setBuffersGeometry asks for a buffer size. Back on the window
+ *  it writes once, then leaves the layer to the legacy sites. Main thread only. */
+static void MacapkSyncGuestLayerRect(JNIEnv* env) {
+    if (!macapk_sv_guest_below_on() || !macapk_native_layer_rect_on()) return;
+    CAMetalLayer* ul = g_unity_layer;
+    MTKView* host = g_unity_host_view;
+    if (!ul || !host || !env) return;
+    static jclass    s_cls = nullptr;
+    static jmethodID s_mid = nullptr;
+    static bool      s_tried = false;
+    if (!s_tried) {
+        s_tried = true;
+        jclass c = env->FindClass("android/view/SurfaceView");
+        if (!c) {
+            env->ExceptionClear();
+        } else {
+            s_mid = env->GetStaticMethodID(c, "macapkNativeWindowLayerRectPacked", "()J");
+            if (!s_mid) env->ExceptionClear();
+            else s_cls = (jclass) env->NewGlobalRef(c);
+            env->DeleteLocalRef(c);
+        }
+    }
+    if (!s_cls || !s_mid) return;   // an older framework jar: the window box stays
+    jlong packed = env->CallStaticLongMethod(s_cls, s_mid);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); packed = 0; }
+    // -1: the owner is attached but hidden (a tile switched off). Keep the layer
+    // where it is, as the holder keeps the view's size, so hiding and showing
+    // the tile does not reallocate the drawable twice.
+    if (packed == -1) return;
+    const long long was = g_nw_view_rect_packed;
+    if (packed == 0 && was == 0) return;   // the window box: the legacy sites own it
+    g_nw_view_rect_packed = (long long) packed;
+    const CGFloat scale = host.window ? host.window.backingScaleFactor : 2.0;
+    const CGRect  r     = macapk_native_egl_layer_rect(host, scale);
+    const CGSize  ds    = CGSizeMake(std::round(r.size.width  * scale),
+                                     std::round(r.size.height * scale));
+    const bool scaled = g_nw_buffer_w > 0 && g_nw_buffer_h > 0;
+    if (!scaled && (long long) packed == was && ul.contentsScale == scale
+        && CGRectEqualToRect(ul.frame, r) && CGSizeEqualToSize(ul.drawableSize, ds))
+        return;                            // placed: the steady state
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];   // no implicit move/resize animation
+    if (!macapk_place_scaled_native_egl_layer(ul, r, scale)) {
+        // contentsScale with the drawable, as macapk_sv_layer_place_locked sets
+        // them: a window moved to a display of another scale must not leave
+        // bounds x contentsScale disagreeing with the drawable every tick.
+        if (ul.contentsScale != scale) ul.contentsScale = scale;
+        if (!CGRectEqualToRect(ul.frame, r)) ul.frame = r;
+        if (!CGSizeEqualToSize(ul.drawableSize, ds)) ul.drawableSize = ds;
+    }
+    [CATransaction commit];
+    // A drag moves the rect every tick: log only a change of SIZE, or the switch
+    // between "the view's rect" and "the window".
+    const bool sizeChanged = ((was ^ (long long) packed) & 0xffffffffLL) != 0;
+    if (sizeChanged || (was == 0) != (packed == 0)) {
+        if (packed == 0)
+            std::fprintf(stderr, "[I] cocoa_v2: native-EGL window layer back on the window "
+                         "%.0fx%.0f pt (MACAPK_SV_NATIVE_LAYER_RECT)\n",
+                         r.size.width, r.size.height);
+        else
+            std::fprintf(stderr, "[I] cocoa_v2: native-EGL window layer follows its "
+                         "SurfaceView: %d,%d %dx%d px (MACAPK_SV_NATIVE_LAYER_RECT)\n",
+                         (int) (int16_t) ((packed >> 48) & 0xffff),
+                         (int) (int16_t) ((packed >> 32) & 0xffff),
+                         (int) ((packed >> 16) & 0xffff), (int) (packed & 0xffff));
+        std::fflush(stderr);
+    }
+}
+
 /** Per drawInMTKView tick: keep every surface layer glued to its view (a
  *  paused game must still move with its layout) and drop the gone ones. */
 static void MacapkApplySurfaceLayersGeometry(JNIEnv* env) {
@@ -13287,11 +13416,12 @@ static bool MacapkNoteDisplaySize(JNIEnv* env, MTKView* view, int w, int h) {
         self.angleLayer.frame = wsBox.framePt;
         MacapkSyncGlClipMask(view, self.angleLayer);
     }
-    if (macapk::g_unity_layer && macapk::g_unity_host_view
-        && !macapk::macapk_place_scaled_native_egl_layer(
-               macapk::g_unity_layer, macapk::g_unity_host_view.bounds,
-               view.window ? view.window.backingScaleFactor : 2.0))
-        macapk::g_unity_layer.frame = macapk::g_unity_host_view.bounds;
+    if (macapk::g_unity_layer && macapk::g_unity_host_view) {
+        const CGFloat sc = view.window ? view.window.backingScaleFactor : 2.0;
+        const CGRect  r  = macapk::macapk_native_egl_layer_rect(macapk::g_unity_host_view, sc);
+        if (!macapk::macapk_place_scaled_native_egl_layer(macapk::g_unity_layer, r, sc))
+            macapk::g_unity_layer.frame = r;   // the view's rect or the window (MACAPK_SV_NATIVE_LAYER_RECT)
+    }
 }
 
 - (void)drawInMTKView:(MTKView*)view {
@@ -13855,6 +13985,8 @@ static bool MacapkNoteDisplaySize(JNIEnv* env, MTKView* view, int w, int h) {
     macapk::MacapkApplySurfaceLayersGeometry(env);
     // The native-EGL window layer's side of the window (AOSP SurfaceView z-order).
     macapk::MacapkSyncGuestLayerZ(env);
+    // ...and on its owning view's rect when that view does not fill the window.
+    macapk::MacapkSyncGuestLayerRect(env);
 
     // ANGLE-driven path: ANGLE owns its own drawables on a SUBLAYER
     // sitting on top of MTKView's own layer. This is critical -- if we
@@ -14369,14 +14501,22 @@ static bool MacapkNoteDisplaySize(JNIEnv* env, MTKView* view, int w, int h) {
                     macapk::AngleResize(rzBox.wPx, rzBox.hPx);
             }
 #endif
+            const CGFloat ulScale = view.window ? view.window.backingScaleFactor : 2.0;
+            const CGRect  ulRect  = macapk::macapk_native_egl_layer_rect(
+                                        macapk::g_unity_host_view, ulScale);
             if (macapk::g_unity_layer
                 && !(macapk::g_unity_host_view
                      && macapk::macapk_place_scaled_native_egl_layer(
-                            macapk::g_unity_layer, macapk::g_unity_host_view.bounds,
-                            view.window ? view.window.backingScaleFactor : 2.0))) {
-                macapk::g_unity_layer.drawableSize = CGSizeMake(curW, curH);
+                            macapk::g_unity_layer, ulRect, ulScale))) {
+                // MACAPK_SV_NATIVE_LAYER_RECT: a layer on its view's rect keeps
+                // that rect's size; otherwise the window's, as before.
+                macapk::g_unity_layer.drawableSize =
+                    (macapk::g_nw_view_rect_packed != 0 && macapk::g_unity_host_view)
+                        ? CGSizeMake(std::round(ulRect.size.width  * ulScale),
+                                     std::round(ulRect.size.height * ulScale))
+                        : CGSizeMake(curW, curH);
                 if (macapk::g_unity_host_view)
-                    macapk::g_unity_layer.frame = macapk::g_unity_host_view.bounds;
+                    macapk::g_unity_layer.frame = ulRect;
             }
             env->CallVoidMethod(globalGlSurfaceViewRef, surfaceChangedMid,
                                 static_cast<jint>(curW),

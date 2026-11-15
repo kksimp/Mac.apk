@@ -4338,7 +4338,28 @@ public final class InstallPipeline {
             try? store.remove(dirName: prev.dirName)
             log("[install] \(prev.dirName) replaced in place by \(rec.dirName)")
         }
-        if let b = inPlaceBackup { try? fm.removeItem(at: b.backup.deletingLastPathComponent()) }
+        // Done with the backup clone and its manifest. They were made under the
+        // bundle as it was named at the start, and finalizeBundle may have
+        // renamed it since (a collision name such as "Example-App-exampleapp.app"
+        // becomes "Example-App.app" when bundleIdentityMode is "package"). So
+        // find the folder under the bundle's current name. At the old path the
+        // removal would fail, the manifest would survive, and the stub's
+        // InPlaceRecovery would undo the finished update at the next launch,
+        // moving the data back to the old version's name (GitHub #152).
+        if let b = inPlaceBackup {
+            var bkRoot = b.backup.deletingLastPathComponent()
+            if let from = bundleURL?.path, let to = rec.bundlePath, from != to,
+               bkRoot.path.hasPrefix(from + "/") {
+                bkRoot = URL(fileURLWithPath: to + bkRoot.path.dropFirst(from.count))
+            }
+            do { try fm.removeItem(at: bkRoot) }
+            catch {
+                // Not fatal here, but the next launch would roll this update
+                // back, so the log must say why.
+                log("[install] could not remove the update backup \(bkRoot.path): "
+                  + "\(error.localizedDescription); the next launch may undo this update")
+            }
+        }
 
         if let fresh = try? store.load() {
             ApkRetention.pruneUnreferenced(package: pkg, registry: fresh, log: hooks.log)

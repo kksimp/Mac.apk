@@ -2883,6 +2883,26 @@ struct LauncherView: View {
                         }
                     }
                 }
+                // Android's fingerprint and screen-lock checks, answered by
+                // macOS (runtime/src/user_verification_bridge.mm). The runtime
+                // reads this from a file, like "Use Google GMS", because a
+                // Dock-launched app gets no environment from here. Default OFF,
+                // keeping the bridge opt-in; an app's own
+                // MACAPK_USER_VERIFICATION_HOST override wins either way.
+                Section("Touch ID") {
+                    Toggle("Let Android apps use Touch ID and your Mac password",
+                           isOn: touchIdBinding)
+                    Text("Apps that offer fingerprint or screen-lock sign-in can ask macOS to "
+                       + "check it's you, with Touch ID or your Mac password. Apps never see "
+                       + "your fingerprint or password, only whether the check passed. "
+                       + "Takes effect the next time each app opens. To choose for one app, "
+                       + "add a line to its \"Environment overrides\" in the app's info: "
+                       + "MACAPK_USER_VERIFICATION_HOST=0 turns it off for that app, and "
+                       + "MACAPK_USER_VERIFICATION_HOST=1 turns it on for that app even with "
+                       + "this switch off.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
                 if model.devMenuRevealed {
                     Section("App files") {
                         // The path itself is deliberately NOT rendered here
@@ -3880,16 +3900,24 @@ struct LauncherView: View {
         !FileManager.default.fileExists(atPath: macFoldersOffFile.path)
     private var macFoldersBinding: Binding<Bool> {
         Binding(get: { macFoldersOn }, set: { on in
-            let f = Self.macFoldersOffFile
-            if on {
-                try? FileManager.default.removeItem(at: f)
-            } else {
-                try? FileManager.default.createDirectory(
-                    at: f.deletingLastPathComponent(), withIntermediateDirectories: true)
-                FileManager.default.createFile(atPath: f.path, contents: Data())
-            }
-            macFoldersOn = !FileManager.default.fileExists(atPath: f.path)
+            macFoldersOn = !Self.setMarkerFile(Self.macFoldersOffFile, present: !on)
         })
+    }
+
+    /// Creates or removes one of the empty marker files the runtime reads for a
+    /// Settings switch, and returns whether it exists afterwards (so the switch
+    /// shows the real state if the write failed).
+    @discardableResult
+    private static func setMarkerFile(_ file: URL, present: Bool) -> Bool {
+        let fm = FileManager.default
+        if present {
+            try? fm.createDirectory(at: file.deletingLastPathComponent(),
+                                    withIntermediateDirectories: true)
+            fm.createFile(atPath: file.path, contents: Data())
+        } else {
+            try? fm.removeItem(at: file)
+        }
+        return fm.fileExists(atPath: file.path)
     }
 
     /// The "Use Google GMS" switch: ON when the file exists (default OFF). The
@@ -3901,16 +3929,21 @@ struct LauncherView: View {
         FileManager.default.fileExists(atPath: googleGmsFile.path)
     private var googleGmsBinding: Binding<Bool> {
         Binding(get: { googleGmsOn }, set: { on in
-            let f = Self.googleGmsFile
-            if on {
-                try? FileManager.default.createDirectory(
-                    at: f.deletingLastPathComponent(), withIntermediateDirectories: true)
-                FileManager.default.createFile(atPath: f.path, contents: Data())
-            } else {
-                try? FileManager.default.removeItem(at: f)
-            }
-            googleGmsOn = FileManager.default.fileExists(atPath: f.path)
+            googleGmsOn = Self.setMarkerFile(Self.googleGmsFile, present: on)
             setSystemBroker(enabled: googleGmsOn)
+        })
+    }
+
+    /// The "Touch ID" switch: ON when the file exists (default OFF). The runtime
+    /// reads the same file (user_verification_bridge.mm, On()).
+    private static var touchIdFile: URL {
+        Paths.supportDir.appendingPathComponent("use-touch-id")
+    }
+    @State private var touchIdOn: Bool =
+        FileManager.default.fileExists(atPath: touchIdFile.path)
+    private var touchIdBinding: Binding<Bool> {
+        Binding(get: { touchIdOn }, set: { on in
+            touchIdOn = Self.setMarkerFile(Self.touchIdFile, present: on)
         })
     }
 

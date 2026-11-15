@@ -1468,6 +1468,15 @@ struct EnvEditor: View {
     @State private var text: String = ""
     @State private var problems: [String] = []
     @State private var loaded: Bool = false
+    /// The "Saved" label, shown from Apply until the text is edited again or
+    /// a few seconds pass.
+    @State private var showSaved: Bool = false
+    /// The editor's border in the icon's colour, for a moment after Apply.
+    @State private var flashBorder: Bool = false
+    /// Bumped by each Apply, so a timer from an earlier one leaves a newer
+    /// confirmation alone.
+    @State private var confirmSavedCount: Int = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1475,7 +1484,12 @@ struct EnvEditor: View {
                 .font(.system(.caption, design: .monospaced))
                 .frame(minHeight: 72)
                 .overlay(RoundedRectangle(cornerRadius: 5)
-                    .stroke(Color.secondary.opacity(0.3)))
+                    .stroke(flashBorder ? savedColor : Color.secondary.opacity(0.3),
+                            lineWidth: flashBorder ? 2 : 1))
+                .onChange(of: text) { _, _ in
+                    // An edit after Apply is not saved yet: drop the label.
+                    if showSaved { setSaved(false) }
+                }
             if !problems.isEmpty {
                 // Warn, do not block: an unknown-looking key may simply be
                 // one this build of the launcher has not heard of.
@@ -1491,6 +1505,19 @@ struct EnvEditor: View {
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer()
+                // Always in the layout, shown by opacity, so the caption beside
+                // it does not reflow on each Apply. Only the icon is coloured;
+                // the words stay in the primary colour for contrast.
+                Label {
+                    Text(savedText)
+                } icon: {
+                    Image(systemName: problems.isEmpty
+                          ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(savedColor)
+                }
+                .font(.caption)
+                .opacity(showSaved ? 1 : 0)
+                .accessibilityHidden(!showSaved)
                 Button("Apply") { apply() }
                     .controlSize(.small)
             }
@@ -1506,6 +1533,48 @@ struct EnvEditor: View {
         let parsed = Self.parse(text)
         problems = parsed.problems
         env = parsed.env
+        confirmSaved()
+    }
+
+    /// The checkmark's green, or orange beside the warning icon. The border
+    /// flash uses it too (owner, 2026-11-14: the outline should match the
+    /// check).
+    private var savedColor: Color { problems.isEmpty ? .green : .orange }
+
+    /// "Saved", or "Saved, 2 warnings" when lines were ignored or questioned
+    /// (the warnings themselves are listed above the button).
+    private var savedText: String {
+        problems.isEmpty ? "Saved"
+            : "Saved, \(problems.count) " + (problems.count == 1 ? "warning" : "warnings")
+    }
+
+    /// Shows the "Saved" label and flashes the border, then clears both, and
+    /// asks VoiceOver to say so. The label stays about four seconds, long
+    /// enough to read; the border starts to fade back at 0.8 seconds.
+    private func confirmSaved() {
+        confirmSavedCount += 1
+        let count = confirmSavedCount
+        setSaved(true)
+        animate(.easeOut(duration: 0.15)) { flashBorder = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            guard count == confirmSavedCount else { return }
+            animate(.easeInOut(duration: 0.4)) { flashBorder = false }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            guard count == confirmSavedCount else { return }
+            setSaved(false)
+        }
+        AccessibilityNotification.Announcement("Environment overrides " + savedText.lowercased())
+            .post()
+    }
+
+    private func setSaved(_ on: Bool) {
+        animate(.easeInOut(duration: 0.25)) { showSaved = on }
+    }
+
+    /// withAnimation, or the plain change when Reduce Motion is on.
+    private func animate(_ animation: Animation, _ change: () -> Void) {
+        if reduceMotion { change() } else { withAnimation(animation, change) }
     }
 
     static func text(from env: [String: String]) -> String {

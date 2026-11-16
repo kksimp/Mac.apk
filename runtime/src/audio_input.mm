@@ -66,7 +66,10 @@
 //
 // ENV:
 //   MACAPK_MIC=0                     hard-disable capture (open always fails).
-//   MACAPK_MIC_TRACE=1               per-stream lifecycle + a ~2 s level meter.
+//   MACAPK_MIC_TRACE=1               per-stream lifecycle + a ~2 s level meter,
+//                                    and a ~2 s meter of what macOS hands the
+//                                    input tap plus the system default input
+//                                    device (see trace_tap_level).
 //   MACAPK_MIC_DUMP=/path.wav        write captured PCM (post-conversion, i.e.
 //                                    exactly what the app reads) as 16-bit WAV.
 //   MACAPK_MIC_PERMISSION_TIMEOUT_MS bound on the first-use prompt wait
@@ -74,6 +77,7 @@
 
 #import <AVFoundation/AVFoundation.h>
 #import <Foundation/Foundation.h>
+#import <CoreAudio/CoreAudio.h>
 
 #include <jni.h>
 
@@ -536,8 +540,116 @@ static void cap_consume(Cap* c, AVAudioPCMBuffer* in) {
     }
 }
 
+// Input tap meter (MACAPK_MIC_TRACE). The level meter in cap_consume reports
+// what an AudioRecord reads, after conversion; this one reports what macOS
+// hands the input tap, before any conversion, and which input device the
+// system is using. When an app's caller hears nothing, the lines say where
+// the sound was lost: a tap peak of 0.0000 means macOS delivered silence (for
+// example the default input is a muted or silent device, or macOS withholds
+// the microphone although the authorization check passed); a live tap peak
+// beside "level peak=0.0000" means it was lost in conversion or later; and no
+// tap lines at all mean the tap stopped (AVAudioEngine stops itself on an
+// input configuration change).
+//
+// Observed, not documented by Apple: the engine's own input device is an
+// aggregate macOS builds around the system default input
+// ("CADefaultDeviceAggregate-<pid>-<n>"), so the default input is the device
+// named here. It is logged on the first report and again whenever it changes
+// while the tap is still running. Device names can carry the owner's name
+// (headphones often do), which is one reason this stays behind the opt-in
+// trace flag. Float input is not clipped, so a peak above 1.0 is possible.
+//
+// Its own lock keeps the statics below to one thread at a time:
+// AVAudioEngine does not promise that every tap delivery comes on the same
+// thread.
+static void trace_tap_level(AVAudioPCMBuffer* buf) {
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lk(mtx);
+    static uint64_t win0_ms = 0;
+    static uint64_t frames = 0;
+    static float peak = 0.0f;
+    static AudioDeviceID last_dev = kAudioObjectUnknown;
+    static bool query_failed_logged = false;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    const uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ull
+                          + (uint64_t)ts.tv_nsec / 1000000ull;
+    if (win0_ms == 0) win0_ms = now_ms;
+
+    const AVAudioFrameCount n = buf.frameLength;
+    const AVAudioChannelCount chans = buf.format.channelCount;
+    float* const* ch = buf.floatChannelData;
+    if (ch) {
+        // Planar: one pointer per channel, n samples each. Interleaved: one
+        // pointer, n * channels samples.
+        const bool inter = buf.format.isInterleaved;
+        const AVAudioChannelCount ptrs = inter ? 1 : chans;
+        const uint64_t len = inter ? (uint64_t)n * chans : (uint64_t)n;
+        for (AVAudioChannelCount c = 0; c < ptrs; ++c) {
+            for (uint64_t i = 0; i < len; ++i) {
+                const float a = std::fabs(ch[c][i]);
+                if (a > peak) peak = a;
+            }
+        }
+    }
+    frames += n;
+
+    if (now_ms - win0_ms < 2000) return;
+
+    AudioDeviceID dev = kAudioObjectUnknown;
+    UInt32 dev_size = sizeof dev;
+    const AudioObjectPropertyAddress default_input = {
+        kAudioHardwarePropertyDefaultInputDevice,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    const OSStatus dev_status = AudioObjectGetPropertyData(
+        kAudioObjectSystemObject, &default_input, 0, nullptr, &dev_size, &dev);
+    if (dev_status != noErr && !query_failed_logged) {
+        query_failed_logged = true;
+        std::fprintf(stderr, "[audio-in] default input device query failed "
+                     "(OSStatus %d)\n", (int)dev_status);
+    }
+    if (dev_status == noErr && dev != last_dev) {
+        last_dev = dev;
+        char name[256] = "?";
+        CFStringRef cf_name = nullptr;
+        UInt32 name_size = sizeof cf_name;
+        const AudioObjectPropertyAddress name_addr = {
+            kAudioObjectPropertyName,
+            kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        if (AudioObjectGetPropertyData(dev, &name_addr, 0, nullptr,
+                                       &name_size, &cf_name) == noErr && cf_name) {
+            if (!CFStringGetCString(cf_name, name, sizeof name, kCFStringEncodingUTF8))
+                std::strcpy(name, "?");   // did not fit the buffer
+            CFRelease(cf_name);
+        }
+        std::fprintf(stderr, "[audio-in] input device %u \"%s\" (system default input)\n",
+                     (unsigned)dev, name);
+    }
+
+    const double secs = (double)(now_ms - win0_ms) / 1000.0;
+    if (ch) {
+        std::fprintf(stderr,
+            "[audio-in] tap peak=%.4f frames=%llu in %.2f s (%.0f Hz x%u, "
+            "before conversion)\n",
+            peak, (unsigned long long)frames, secs,
+            buf.format.sampleRate, (unsigned)chans);
+    } else {
+        std::fprintf(stderr,
+            "[audio-in] tap frames=%llu in %.2f s (%.0f Hz x%u, not float: "
+            "peak not measured)\n",
+            (unsigned long long)frames, secs,
+            buf.format.sampleRate, (unsigned)chans);
+    }
+    std::fflush(stderr);
+    win0_ms = now_ms;
+    frames = 0;
+    peak = 0.0f;
+}
+
 static void tap_dispatch(AVAudioPCMBuffer* buf) {
     if (!buf) return;
+    if (trace_on()) trace_tap_level(buf);
     // The tap block runs on an engine-owned thread, NOT the CoreAudio realtime
     // render thread (the existing MACAPK_AUDIO_DUMP tap in audio_backend.mm
     // takes a mutex on the same kind of thread), so a short lock here is fine

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- The manifest of winapk-runtime.exe and macapk-translator.exe (runtime.rc).
+     activeCodePage makes the process's ANSI code page UTF-8 on Windows 10 1903 and
+     later, whatever "Language for non-Unicode programs" is set to. The JVM reads paths
+     in that code page, so a folder or user name in any script reaches it whole.
+     Older Windows ignores the setting; runtime_main.cpp then passes paths the ANSI
+     code page can hold. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="WinApk.Runtime" version="0.1.0.0" processorArchitecture="arm64"/>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

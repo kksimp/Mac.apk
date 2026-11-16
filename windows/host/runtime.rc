@@ -1,0 +1,4 @@
+// runtime.rc -- the manifest of winapk-runtime.exe and macapk-translator.exe
+// (runtime.manifest: the UTF-8 ANSI code page).
+
+1 24 "runtime.manifest"

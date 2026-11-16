@@ -1,0 +1,638 @@
+# Win.apk's build and tests, on Windows on Arm (windows-11-arm):
+#
+#   What changed ──┬─ Guest libraries (Ubuntu) ─┬─ Unit tests
+#                  └─ Build (ARM64, ccache) ────┼─ Runtime tests
+#                                               ├─ App smoke test
+#                                               ├─ Package (preview + installer)
+#                                               └─ Sweep 1/4 .. 4/4 ─ Sweep report  (only when asked)
+#
+# The build runs once; the other jobs take its exes and staged runtime as
+# artifacts. Every pull request boots the smoke set (windows/test/compat/smoke.txt)
+# and fails when an app no longer draws. The whole corpus (apps.txt, four
+# machines) runs only by hand: Run workflow with "Full compatibility sweep".
+# A launcher-only change builds and packages but runs no app. A push to main
+# only builds, to leave its compile cache for the next pull request. Releases
+# come from win-release.yml.
+name: CI
+
+on:
+  pull_request:
+    paths:
+      - 'windows/**'
+      - 'runtime/**'
+      - 'scripts/build_framework_res.sh'
+      - '.github/workflows/win-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'windows/**'
+      - 'runtime/**'
+      - 'scripts/build_framework_res.sh'
+      - '.github/workflows/win-ci.yml'
+  workflow_dispatch:
+    inputs:
+      full_sweep:
+        description: 'Full compatibility sweep (every app of apps.txt, on four machines)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: What changed
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.diff.outputs.build }}
+      tests: ${{ steps.diff.outputs.tests }}
+      package: ${{ steps.diff.outputs.package }}
+      full_sweep: ${{ steps.diff.outputs.full_sweep }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: diff
+        run: |
+          case "${{ github.event_name }}" in
+            workflow_dispatch) build=true tests=true ;;
+            push) build=true tests=false ;;
+            *)
+              # The checkout is the merge commit: its first parent is the base branch.
+              build=false tests=false
+              while read -r f; do
+                case "$f" in
+                  *.md) ;;
+                  windows/launcher/*|windows/package/*) build=true ;;
+                  *) build=true tests=true ;;
+                esac
+              done < <(git diff --name-only HEAD^1 HEAD)
+              ;;
+          esac
+          package=$build
+          [[ "${{ github.event_name }}" == push ]] && package=false
+          full_sweep=false
+          [[ "${{ github.event_name }}" == workflow_dispatch && "${{ inputs.full_sweep }}" == true ]] && full_sweep=true
+          printf 'build=%s\ntests=%s\npackage=%s\nfull_sweep=%s\n' \
+            "$build" "$tests" "$package" "$full_sweep" | tee -a "$GITHUB_OUTPUT"
+
+  guest:
+    name: Guest libraries (arm64)
+    needs: changes
+    if: needs.changes.outputs.tests == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install clang + lld
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang lld
+      - name: Build guest .so files
+        run: windows/test/build_guest.sh "$RUNNER_TEMP/guest"
+      - name: Build end-to-end guest library and Java class
+        run: windows/test/build_e2e.sh "$JAVA_HOME/include" "$JAVA_HOME/bin/javac" "$RUNNER_TEMP/guest/e2e"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest-libs
+          retention-days: 3
+          path: |
+            ${{ runner.temp }}/guest/arm64/*.so
+            ${{ runner.temp }}/guest/aarch64/*.so
+            ${{ runner.temp }}/guest/aarch64/link/*.so
+            ${{ runner.temp }}/guest/e2e/arm64/libwinapk_jni_guest.so
+            ${{ runner.temp }}/guest/e2e/classes/**
+
+  build:
+    # Temurin, because other aarch64 JDKs' jni_md.h make jint a long.
+    name: Build (ARM64)
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      # ccache keys on the compiler's contents: MSYS2 installs a fresh clang on every run.
+      CCACHE_DIR: ${{ github.workspace }}\.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 2G
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          architecture: aarch64
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          install: unzip zip git
+          pacboy: >-
+            clang:p
+            cmake:p
+            ninja:p
+            ccache:p
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-arm64-${{ github.sha }}
+          restore-keys: ccache-arm64-
+      - uses: actions/cache@v4
+        with:
+          path: thirdparty/framework-res
+          key: framework-res-v2-${{ hashFiles('scripts/build_framework_res.sh', 'windows/scripts/build_framework_res.sh') }}
+      - uses: actions/cache@v4
+        with:
+          path: thirdparty/angle-win
+          key: angle-arm64-${{ hashFiles('windows/scripts/fetch_angle.sh') }}
+      - name: Build (loader, runtime, launcher, tests)
+        run: |
+          ccache -z
+          # The newest release plus what came after it (v0.8.0-dev.<run>), so the update check never offers an older one.
+          tag=$(git ls-remote --tags --refs origin 'v*' | sed 's#.*refs/tags/##' | sort -V | tail -1)
+          tag=${tag:-v0.1.0}
+          cmake -S windows -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DWINAPK_JNI_INCLUDE="$(cygpath -u "$JAVA_HOME")/include" \
+            -DWINAPK_VERSION="${tag%%[-+]*}-dev.${{ github.run_number }}" \
+            -DWINAPK_REPO="${{ github.repository }}"
+          cmake --build build
+          ccache -s
+      - name: Stage the runtime
+        # Into stage/, not runtime/: that is upstream's source tree.
+        run: |
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          windows/scripts/stage_runtime.sh build stage
+          windows/scripts/bake_jre.sh "$JAVA_HOME" stage/lib stage/jre
+          source windows/scripts/arch.sh
+          for exe in stage/Win.apk.exe stage/bin/*.exe stage/jre/bin/server/jvm.dll; do
+            [[ "$(winapk_pe_arch "$exe")" == arm64 ]] || { echo "not arm64: $exe"; exit 1; }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-stage
+          path: stage/
+          retention-days: 3
+          compression-level: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winapk-binaries
+          path: build/*.exe
+          compression-level: 1
+
+  unit-tests:
+    name: Unit tests
+    needs: [changes, guest, build]
+    if: needs.changes.outputs.tests == 'true'
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          architecture: aarch64
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          release: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: guest-libs
+          path: guest
+      - uses: actions/download-artifact@v4
+        with:
+          name: winapk-binaries
+          path: build
+      - name: Run the ABI thunk test
+        run: ./build/winapk-thunk-test.exe
+      - name: Run the JNI wrapper test
+        run: ./build/winapk-jni-test.exe
+      - name: Run the variadic JNI bridge test
+        run: ./build/winapk-jni-variadic-test.exe
+      - name: Run the x18 scan test
+        run: ./build/winapk-x18-scan-test.exe
+      - name: Run the arm64 test
+        run: ./build/winapk-arm64-test.exe guest/arm64
+      - name: Run the guest linker test
+        run: ./build/winapk-linker-test.exe guest/aarch64/link
+      - name: Run the Bionic shim test
+        run: |
+          mkdir -p bionic-scratch
+          ./build/winapk-bionic-test.exe guest/aarch64/libwinapk_bionic_guest.so "$(cygpath -w "$PWD/bionic-scratch")"
+      - name: Run the crash report test
+        run: |
+          mkdir -p crash-scratch
+          ./build/winapk-crash-test.exe "$(cygpath -w "$PWD/crash-scratch")"
+      - name: Run the host-only tests
+        run: |
+          ./build/winapk-applink-test.exe
+          mkdir -p cds-scratch && ./build/winapk-cds-test.exe "$(cygpath -w "$PWD/cds-scratch")"
+          ./build/winapk-paths-test.exe
+          ./build/winapk-audio-test.exe "$(cygpath -w "$PWD/windows/test/audio")"
+          ./build/winapk-video-test.exe "$(cygpath -w "$PWD/windows/test/video")"
+          ./build/winapk-user-folders-test.exe "$(cygpath -w "$PWD")"
+          ./build/winapk-window-test.exe
+          ./build/winapk-launcher-state-test.exe
+          ./build/winapk-bluetooth-test.exe
+      - name: Run the real-JVM end-to-end test
+        run: |
+          export PATH="$(cygpath -u "$JAVA_HOME")/bin/server:$(cygpath -u "$JAVA_HOME")/bin:$PATH"
+          ./build/winapk-jvm-run.exe guest/e2e/arm64/libwinapk_jni_guest.so guest/e2e/classes
+
+  runtime-tests:
+    name: Runtime tests (Java, GL, boot an APK)
+    needs: [changes, guest, build]
+    if: needs.changes.outputs.tests == 'true'
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          architecture: aarch64
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          release: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: guest-libs
+          path: guest
+      - uses: actions/download-artifact@v4
+        with:
+          name: winapk-binaries
+          path: build
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-stage
+          path: stage
+      - name: Run the real-JVM test on the runtime's Bitmap
+        run: |
+          export PATH="$(cygpath -u "$JAVA_HOME")/bin/server:$(cygpath -u "$JAVA_HOME")/bin:$PATH"
+          cp="guest/e2e/classes;$(cygpath -w stage/lib/android-framework.jar);$(cygpath -w stage/lib/macapk-loader.jar)"
+          ./build/winapk-jvm-run.exe guest/e2e/arm64/libwinapk_jni_guest.so "$cp" | tee jvm-bitmap.log
+          grep -q "\[PASS\] AndroidBitmap" jvm-bitmap.log
+      - name: Run the File.separator rewrite test
+        run: |
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          "$JAVA_HOME/bin/javac" -cp stage/lib/macapk-loader.jar -d build/sep-test \
+            windows/test/java/FileSeparatorRewriteTest.java
+          cp="$(cygpath -w stage/lib/macapk-loader.jar);$(cygpath -w build/sep-test)"
+          "$JAVA_HOME/bin/java" -cp "$cp" FileSeparatorRewriteTest
+          MACAPK_ANDROID_FILE_SEPARATOR=0 "$JAVA_HOME/bin/java" -cp "$cp" FileSeparatorRewriteTest off
+      - name: Run the File.renameTo test
+        run: |
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          "$JAVA_HOME/bin/javac" -d build/rename-test windows/test/java/FileRenameTest.java
+          "$JAVA_HOME/bin/java" --patch-module "java.base=$(cygpath -w stage/lib/java_base_patch)" \
+            -cp "$(cygpath -w build/rename-test)" FileRenameTest
+      - name: Run the Android paths overlay test
+        run: |
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          "$JAVA_HOME/bin/javac" -d build/android-paths-test windows/test/java/AndroidPathsTest.java
+          "$JAVA_HOME/bin/java" --patch-module "java.base=$(cygpath -w stage/lib/java_base_patch)" \
+            -Dwinapk.android.root="$(cygpath -w "$RUNNER_TEMP")" \
+            -cp "$(cygpath -w build/android-paths-test)" AndroidPathsTest
+      - name: Run the camera2 still test
+        run: |
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          cp="$(cygpath -w stage/lib/android-framework.jar);$(cygpath -w stage/lib/macapk-loader.jar)"
+          "$JAVA_HOME/bin/javac" -cp "$cp" -d build/camera2-test windows/test/java/Camera2StillTest.java
+          "$JAVA_HOME/bin/java" -Djava.awt.headless=true -cp "$cp;$(cygpath -w build/camera2-test)" Camera2StillTest
+      - name: Run the host network test
+        run: |
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          cp="$(cygpath -w stage/lib/android-framework.jar);$(cygpath -w stage/lib/macapk-loader.jar)"
+          "$JAVA_HOME/bin/javac" -cp "$cp" -d build/hostnet-test windows/test/java/android/net/HostNetworkTest.java
+          MACAPK_LOG_LEVEL=7 "$JAVA_HOME/bin/java" -cp "$cp;$(cygpath -w build/hostnet-test)" android.net.HostNetworkTest
+      - name: Run the host touch test
+        run: |
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          cp="$(cygpath -w stage/lib/android-framework.jar);$(cygpath -w stage/lib/macapk-loader.jar)"
+          "$JAVA_HOME/bin/javac" -cp "$cp" -d build/hosttouch-test windows/test/java/com/macapk/loader/HostTouchTest.java
+          MACAPK_LOG_LEVEL=7 "$JAVA_HOME/bin/java" -cp "$cp;$(cygpath -w build/hosttouch-test)" com.macapk.loader.HostTouchTest
+      - name: Run the permission model test
+        run: |
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          cp="$(cygpath -w stage/lib/macapk-loader.jar);$(cygpath -w stage/lib/android-framework.jar)"
+          "$JAVA_HOME/bin/javac" -cp "$cp" -d build/perm-test windows/test/java/PermissionModelTest.java
+          "$JAVA_HOME/bin/java" -cp "$cp;$(cygpath -w build/perm-test)" PermissionModelTest
+      - name: Run the APK signature verification test
+        run: |
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          cp="$(cygpath -w stage/lib/android-framework.jar);$(cygpath -w stage/lib/macapk-loader.jar)"
+          "$JAVA_HOME/bin/javac" -cp "$cp" -d build/apkverify-test windows/test/java/com/macapk/loader/ApkVerificationTest.java
+          MACAPK_LOG_LEVEL=7 "$JAVA_HOME/bin/java" -cp "$cp;$(cygpath -w build/apkverify-test)" \
+            com.macapk.loader.ApkVerificationTest "$(cygpath -w stage/bin/tools/framework-res.apk)" \
+            "$(cygpath -w "$RUNNER_TEMP/apkverify")" | tee apkverify-test.log
+          grep -q "ALL PASSED" apkverify-test.log
+      - name: Run the App Link verification test
+        run: |
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          cp="$(cygpath -w stage/lib/android-framework.jar);$(cygpath -w stage/lib/macapk-loader.jar)"
+          "$JAVA_HOME/bin/javac" -cp "$cp" -d build/applinks-test windows/test/java/com/macapk/loader/AppLinksTest.java
+          MACAPK_LOG_LEVEL=7 "$JAVA_HOME/bin/java" -cp "$cp;$(cygpath -w build/applinks-test)" \
+            com.macapk.loader.AppLinksTest "$(cygpath -w "$RUNNER_TEMP/applinks")" | tee applinks-test.log
+          grep -q "ALL PASSED" applinks-test.log
+      - name: Run the cross-process Binder test
+        # It starts copies of itself; if the parent dies they keep the pipe open.
+        timeout-minutes: 5
+        run: |
+          export PATH="$(cygpath -u "$JAVA_HOME")/bin/server:$(cygpath -u "$JAVA_HOME")/bin:$PATH"
+          jh="$(cygpath -u "$JAVA_HOME")"
+          cp="$(cygpath -w stage/lib/android-framework.jar);$(cygpath -w stage/lib/macapk-loader.jar)"
+          "$jh/bin/javac" -cp "$cp" -d build/binder-test windows/test/java/com/macapk/loader/BinderTransportTest.java
+          ./build/winapk-binder-test.exe "$cp;$(cygpath -w build/binder-test)" com.macapk.loader.BinderTransportTest \
+            | tee binder-test.log
+          grep -q "ALL PASSED" binder-test.log
+      - name: Run the java.io share-delete test
+        run: |
+          export PATH="$(cygpath -u "$JAVA_HOME")/bin/server:$(cygpath -u "$JAVA_HOME")/bin:$PATH"
+          cp="$(cygpath -w stage/lib/android-framework.jar);$(cygpath -w stage/lib/macapk-loader.jar)"
+          "$(cygpath -u "$JAVA_HOME")/bin/javac" -d build/share-delete-test windows/test/java/FileShareDeleteTest.java
+          WINAPK_TEST_JAVA_BASE_PATCH="$(cygpath -w stage/lib/java_base_patch)" \
+            ./build/winapk-binder-test.exe "$cp;$(cygpath -w build/share-delete-test)" FileShareDeleteTest \
+            | tee share-delete-test.log
+          grep -q "ALL PASSED" share-delete-test.log
+      - name: Run the GL test
+        run: |
+          # ANGLE is next to it in stage/bin; with no GPU it falls back to WARP or SwiftShader.
+          cp build/winapk-gl-test.exe stage/bin/
+          ./stage/bin/winapk-gl-test.exe
+          rm stage/bin/winapk-gl-test.exe
+      - name: Boot an APK headless
+        run: |
+          # F-Droid moves old versions to its archive, so try both.
+          apk=org.secuso.privacyfriendlysudoku_101.apk
+          curl -sSfL -o sudoku.apk "https://f-droid.org/repo/$apk" \
+            || curl -sSfL -o sudoku.apk "https://f-droid.org/archive/$apk"
+          export WINAPK_HEADLESS=1 WINAPK_HEADLESS_EXIT_AFTER_FRAMES=30
+          export WINAPK_HEADLESS_FRAME="$(cygpath -w "$PWD/frame.bmp")"
+          timeout 600 ./stage/bin/winapk-runtime.exe --apk sudoku.apk --jdk "$JAVA_HOME" --data "$(cygpath -w "$PWD/appdata")" \
+            > boot.log 2>&1 || { tail -n 200 boot.log; exit 1; }
+          grep -E "first frame presented|frames presented" boot.log
+      - name: Class-data sharing on the shipped Java runtime
+        run: |
+          # The first start has no framework archive: it records its classes and starts the dump at its
+          # exit; the next start maps the archive.
+          export WINAPK_HEADLESS=1 WINAPK_HEADLESS_EXIT_AFTER_FRAMES=30
+          data="$(cygpath -w "$PWD/cdsdata")"
+          timeout 600 ./stage/bin/winapk-runtime.exe --apk sudoku.apk --data "$data" > cds1.log 2>&1 \
+            || { tail -n 200 cds1.log; exit 1; }
+          grep -F "cds: no framework archive" cds1.log
+          grep -F "class-data sharing ON" cds1.log
+          for i in $(seq 1 90); do ls cdsdata/cds/framework-*.jsa > /dev/null 2>&1 && break; sleep 2; done
+          cat cdsdata/cds/dump.log | tail -n 5
+          timeout 600 ./stage/bin/winapk-runtime.exe --apk sudoku.apk --data "$data" > cds2.log 2>&1 \
+            || { tail -n 200 cds2.log; exit 1; }
+          grep -F "cds: framework archive" cds2.log
+          grep -F "class-data sharing ON" cds2.log
+          grep -E "frames presented" cds2.log
+          if grep -F "did not map" cds2.log; then exit 1; fi
+      - name: Start an app the broker runs as a service host
+        run: |
+          # The user's start of an app the broker runs headless (MACAPK_SERVICE_HOST=1) replaces the host.
+          data="$(cygpath -w "$PWD/appdata")"
+          MACAPK_SERVICE_HOST=1 WINAPK_HEADLESS=1 ./stage/bin/winapk-runtime.exe --apk sudoku.apk \
+            --jdk "$JAVA_HOME" --data "$data" > host.log 2>&1 &
+          for i in $(seq 1 120); do grep -q "service host: entering main loop" host.log && break; sleep 2; done
+          grep "service host: entering main loop" host.log || { tail -n 100 host.log; exit 1; }
+          export WINAPK_HEADLESS=1 WINAPK_HEADLESS_EXIT_AFTER_FRAMES=30
+          timeout 600 ./stage/bin/winapk-runtime.exe --apk sudoku.apk --jdk "$JAVA_HOME" --data "$data" \
+            > replace.log 2>&1 || { tail -n 200 replace.log; exit 1; }
+          grep -F "runs this app as a service host" replace.log
+          grep -E "frames presented" replace.log
+          wait || true
+      - name: Run the GMS layer's CLI
+        run: |
+          data="$(cygpath -w "$PWD/appdata")"
+          timeout 300 ./stage/bin/winapk-runtime.exe --jdk "$JAVA_HOME" --data "$data" --gms selftest \
+            > gms.log 2> gms-err.log || { cat gms.log; tail -n 100 gms-err.log; exit 1; }
+          cat gms.log
+          grep -q "protobuf codec      : OK" gms.log
+          timeout 300 ./stage/bin/winapk-runtime.exe --jdk "$JAVA_HOME" --data "$data" --gms status \
+            > gms-status.log 2>> gms-err.log || { cat gms-status.log; tail -n 100 gms-err.log; exit 1; }
+          cat gms-status.log
+          grep -F "gms dir        : $data\\gms" gms-status.log
+      - name: Run the APK check verb
+        run: |
+          # --verify-apk on the APKs the signature test made: test key verifies but is not Google's (4),
+          # unsigned does not verify (3), not an app has no package (1).
+          data="$(cygpath -w "$PWD/appdata")"
+          dir="$RUNNER_TEMP/apkverify"
+          check() {
+            set +e
+            timeout 300 ./stage/bin/winapk-runtime.exe --jdk "$JAVA_HOME" --data "$data" --verify-apk "$(cygpath -w "$1")" \
+              > verify.out 2>> verify-err.log
+            rc=$?
+            set -e
+            echo "--- $1: exit $rc"; cat verify.out
+            [ "$rc" = "$2" ] || { tail -n 50 verify-err.log; exit 1; }
+          }
+          check "$dir/signed.apk" 4
+          grep -q "^PACKAGE.android" verify.out && grep -q "^VERIFIED.1" verify.out && grep -q "^GOOGLE.0" verify.out
+          grep -q "^ABIS" verify.out && grep -q "^MINSDK.[0-9]" verify.out && grep -q "^SDK.3[0-9]" verify.out
+          check "$dir/unsigned.apk" 3
+          grep -q "^VERIFIED.0" verify.out && grep -q "^REASON." verify.out
+          echo "not an app" > "$dir/not-an-app.apk"
+          check "$dir/not-an-app.apk" 1
+      - name: Boot an APK in a window
+        run: |
+          # A real window that resizes itself to 400x600 px a second after the first frame
+          # (WINAPK_TEST_RESIZE); the app must draw at that size within the run.
+          export WINAPK_HEADLESS_EXIT_AFTER_FRAMES=240 WINAPK_TEST_RESIZE=400x600
+          timeout 600 ./stage/bin/winapk-runtime.exe --apk sudoku.apk --jdk "$JAVA_HOME" --data "$(cygpath -w "$PWD/appdata")" \
+            > window.log 2>&1 || { tail -n 200 window.log; exit 1; }
+          if grep -E "running headless|running without a window" window.log; then exit 1; fi
+          grep -E "frames presented" window.log
+          grep -E "\[win.apk\] (window|window resized|resize):" window.log
+          grep -E "resize: the app drew at 400x600 px" window.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: headless-boot
+          path: |
+            boot.log
+            window.log
+            host.log
+            replace.log
+            frame.bmp
+
+  smoke:
+    # Klooni's libgdx.so uses x18 and is refused: it is left out of the smoke set and must end saying why.
+    name: App smoke test
+    needs: [changes, build]
+    if: needs.changes.outputs.tests == 'true'
+    runs-on: windows-11-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-stage
+          path: stage
+      - uses: actions/cache@v4
+        with:
+          path: apk-cache
+          key: compat-apks-smoke-${{ hashFiles('windows/test/compat/apps.txt', 'windows/test/compat/smoke.txt') }}
+      - name: Boot the smoke set
+        shell: pwsh
+        run: |
+          # One framework archive shared by the apps (WINAPK_CDS_DIR); each app's classes are recorded
+          # for the shipped class list (framework-classlist artifact).
+          $env:WINAPK_CDS_DIR = "$PWD\cds"
+          $env:WINAPK_CDS_RECORD_DIR = "$PWD\classlists"
+          ./stage/bin/winapk-runtime.exe --cds-prepare --data "$PWD\cds-prepare"
+          if ($LASTEXITCODE -ne 0) { Get-Content cds/dump.log -Tail 50; exit 1 }
+          python windows/test/compat/sweep.py --runtime stage `
+            --apks apk-cache --out smoke --frames 150 --timeout 180 `
+            --only-from windows/test/compat/smoke.txt --skip dev.lonami.klooni --require-drew
+          python windows/scripts/merge_classlists.py framework.classlist (Get-ChildItem classlists/*.classlist)
+      - name: An app whose library uses x18 ends and says why
+        shell: pwsh
+        run: |
+          python windows/test/compat/sweep.py --runtime stage --apks apk-cache --out refused --frames 150 `
+            --timeout 120 --only dev.lonami.klooni
+          $log = "refused/logs/dev.lonami.klooni.log"
+          if (-not (Select-String -Path $log -Pattern "this app cannot run on this PC: it needs libgdx.so" -Quiet)) {
+            Get-Content $log -Tail 40; exit 1
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke
+          path: |
+            smoke/report.md
+            smoke/logs/
+            smoke/frames/
+            refused/logs/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          # windows/java/winapk-framework.classlist, made again.
+          name: framework-classlist
+          path: framework.classlist
+
+  sweep:
+    name: Sweep ${{ matrix.shard }}/4
+    needs: [changes, build]
+    if: needs.changes.outputs.full_sweep == 'true'
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-stage
+          path: stage
+      - uses: actions/cache@v4
+        with:
+          path: apk-cache
+          key: compat-apks-${{ matrix.shard }}-of-4-${{ hashFiles('windows/test/compat/apps.txt') }}
+      - name: Run the sweep
+        shell: pwsh
+        run: |
+          $env:WINAPK_CDS_DIR = "$PWD\cds"
+          ./stage/bin/winapk-runtime.exe --cds-prepare --data "$PWD\cds-prepare"
+          if ($LASTEXITCODE -ne 0) { Get-Content cds/dump.log -Tail 50; exit 1 }
+          python windows/test/compat/sweep.py --runtime stage `
+            --apks apk-cache --out sweep --frames 300 --timeout 180 --shard ${{ matrix.shard }}/4
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sweep-shard-${{ matrix.shard }}
+          retention-days: 3
+          path: |
+            sweep/report.json
+            sweep/logs/
+            sweep/frames/
+
+  sweep-report:
+    name: Sweep report
+    needs: sweep
+    if: ${{ !cancelled() && needs.sweep.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sweep-shard-*
+          path: parts
+      - name: Merge the shards
+        run: |
+          python3 windows/test/compat/sweep.py --merge parts/* --out sweep
+          cat sweep/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compat-sweep
+          path: |
+            sweep/report.md
+            sweep/report.json
+            sweep/logs/
+            sweep/frames/
+
+  package:
+    # Inno Setup only packs files, so an x64 runner does it.
+    name: Package (preview + installer)
+    needs: [changes, build]
+    if: needs.changes.outputs.package == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-stage
+          path: stage
+      - name: Add the README and the licences
+        run: |
+          Copy-Item windows/package/README.txt, windows/package/THIRD_PARTY_NOTICES.txt stage/
+          Copy-Item LICENSE stage/LICENSE.txt
+          if (-not (Test-Path stage/jre/bin/server/jvm.dll)) { exit 1 }
+      - name: Build the installer
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc "/DSourceDir=$PWD\stage" "/O$PWD" windows\package\winapk.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winapk-preview
+          path: stage/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winapk-setup
+          path: Win.apk-Setup-arm64.exe

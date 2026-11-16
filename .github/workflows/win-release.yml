@@ -1,0 +1,112 @@
+# Publishes a Win.apk pre-release for a tag: builds and stages the runtime on
+# windows-11-arm, smoke-tests it, then packs Win.apk-Setup-arm64.exe
+# (windows/package/winapk.iss) and Win.apk-windows-arm64.zip and attaches
+# both to a GitHub release.
+name: Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, for example v0.1.0-preview'
+        required: true
+        default: 'v0.1.0-preview'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ARM64
+    runs-on: windows-11-arm
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          architecture: aarch64
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          update: true
+          install: unzip zip git
+          pacboy: >-
+            clang:p
+            cmake:p
+            ninja:p
+      - name: Build
+        run: |
+          cmake -S windows -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++ \
+            -DWINAPK_JNI_INCLUDE="$(cygpath -u "$JAVA_HOME")/include" \
+            -DWINAPK_VERSION="${{ inputs.tag }}" \
+            -DWINAPK_REPO="${{ github.repository }}"
+          cmake --build build
+      - uses: actions/cache@v4
+        with:
+          path: thirdparty/framework-res
+          key: framework-res-v2-${{ hashFiles('scripts/build_framework_res.sh', 'windows/scripts/build_framework_res.sh') }}
+      - uses: actions/cache@v4
+        with:
+          path: thirdparty/angle-win
+          key: angle-arm64-${{ hashFiles('windows/scripts/fetch_angle.sh') }}
+      - name: Stage
+        run: |
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          windows/scripts/stage_runtime.sh build Win.apk
+          windows/scripts/bake_jre.sh "$JAVA_HOME" Win.apk/lib Win.apk/jre
+          test -f Win.apk/jre/bin/server/jvm.dll
+          cp windows/package/README.txt windows/package/THIRD_PARTY_NOTICES.txt Win.apk/
+          cp LICENSE Win.apk/LICENSE.txt
+      - name: Smoke test the package
+        run: |
+          apk=org.secuso.privacyfriendlysudoku_101.apk
+          curl -sSfL -o sudoku.apk "https://f-droid.org/repo/$apk" \
+            || curl -sSfL -o sudoku.apk "https://f-droid.org/archive/$apk"
+          export WINAPK_HEADLESS=1 WINAPK_HEADLESS_EXIT_AFTER_FRAMES=30
+          timeout 600 ./Win.apk/bin/winapk-runtime.exe --apk sudoku.apk --data "$(cygpath -w "$PWD/appdata")" \
+            > boot.log 2>&1 || { tail -n 200 boot.log; exit 1; }
+          grep -E "frames presented" boot.log
+          grep -F "class-data sharing ON" boot.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-arm64
+          path: Win.apk/
+          retention-days: 1
+
+  publish:
+    # Inno Setup only packs files, so an x64 runner does it.
+    name: Package and publish
+    needs: build
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-arm64
+          path: Win.apk
+      - name: Zip the folder
+        run: Compress-Archive -Path Win.apk -DestinationPath Win.apk-windows-arm64.zip
+      - name: Build the installer
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          $version = "${{ inputs.tag }}".TrimStart("v")
+          $number = ($version -split '[-+]')[0]
+          & $iscc "/DSourceDir=$PWD\Win.apk" "/DAppVersion=$version" "/DAppNumber=$number" "/O$PWD" `
+            windows\package\winapk.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" Win.apk-Setup-arm64.exe Win.apk-windows-arm64.zip `
+            --prerelease --target "${{ github.sha }}" `
+            --title "Win.apk ${{ inputs.tag }}" `
+            --notes-file windows/package/RELEASE_NOTES.md

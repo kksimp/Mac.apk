@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security problem
+    url: https://github.com/airisu-dev/WinARM.apk/security/policy
+    about: Please do not open a public issue for a security problem; SECURITY.md says where to send it.

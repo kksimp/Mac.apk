@@ -1,0 +1,15 @@
+# The smoke set: the apps every pull request boots (win-ci.yml, "App smoke test"),
+# one of each kind the corpus covers, all of which draw today. The run fails
+# when one of them no longer draws its first screen, so keep only apps that
+# reliably do; the whole corpus (apps.txt) runs only when asked for.
+# One package per line; each must be in apps.txt, which pins its version.
+org.billthefarmer.editor            # Java, no native code
+org.fossify.notes                   # Kotlin, views
+com.jerboa                          # Compose
+name.boyle.chris.sgtpuzzles         # JNI C, Canvas
+dev.lonami.klooni                   # libGDX, OpenGL ES from Java
+se.voxelmanip.tensy                 # SDL, OpenGL ES from native code
+org.ppsspp.ppsspp                   # NativeActivity
+org.jitsi.meet                      # React Native (Hermes)
+org.jellyfin.mobile                 # WebView shell
+org.moire.opensudoku                # arm64-v8a only: the ARM translation

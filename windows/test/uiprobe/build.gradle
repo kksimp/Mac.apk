@@ -1,0 +1,57 @@
+// The UI probe as one Android application: the APK Win.apk runs, and a unit
+// test that runs the same probes on the real framework under Robolectric.
+plugins {
+    id 'com.android.application' version '8.5.2'
+}
+
+android {
+    namespace 'dev.winapk.probe'
+    compileSdk 34
+    defaultConfig {
+        applicationId 'dev.winapk.probe'
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName '1'
+    }
+    sourceSets {
+        main {
+            manifest.srcFile 'AndroidManifest.xml'
+            java.srcDirs = ['src']
+            res.srcDirs = ['res']
+        }
+        test {
+            java.srcDirs = ['oracle']
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    testOptions {
+        unitTests {
+            // The app's compiled resources, for Robolectric.
+            includeAndroidResources = true
+            all {
+                systemProperty 'probe.out', System.getProperty('probe.out', "${buildDir}/oracle.txt")
+                systemProperty 'probe.pictures', System.getProperty('probe.pictures', "${buildDir}/oracle-pictures")
+                // Robolectric keeps the framework it fetches in ~/.m2 and cannot load its
+                // native library from a home folder with a space in its name.
+                systemProperty 'user.home', "${buildDir}/home"
+                doFirst { file("${buildDir}/home").mkdirs() }
+                outputs.upToDateWhen { false }
+            }
+        }
+    }
+}
+
+dependencies {
+    // What most apps are built from: the probe lays these out too.
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.12.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'androidx.recyclerview:recyclerview:1.3.2'
+    implementation 'androidx.cardview:cardview:1.0.0'
+    testImplementation 'org.robolectric:robolectric:4.16'
+    testImplementation 'junit:junit:4.13.2'
+}

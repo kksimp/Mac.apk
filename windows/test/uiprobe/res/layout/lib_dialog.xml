@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- AppCompat's alert dialog, as its window lays it out; Probes fills in the title, the message
+     and the buttons, and inflates it with the theme's alertDialogTheme. -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="wrap_content"
+    android:background="?android:attr/colorBackground" android:padding="24dp">
+    <include layout="@layout/abc_alert_dialog_material" />
+</FrameLayout>

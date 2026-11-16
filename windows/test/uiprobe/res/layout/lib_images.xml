@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A picture that is not the shape of its view: every scale type, and a view that follows its picture. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical"
+    android:background="?android:attr/colorBackground" android:padding="8dp">
+    <ImageView android:id="@+id/a" android:layout_width="120dp" android:layout_height="40dp"
+        android:src="@drawable/pic_wide" android:scaleType="fitCenter" android:background="#FFE0E0E0" />
+    <ImageView android:id="@+id/b" android:layout_width="120dp" android:layout_height="40dp"
+        android:src="@drawable/pic_wide" android:scaleType="centerCrop" android:background="#FFE0E0E0" />
+    <ImageView android:id="@+id/c" android:layout_width="120dp" android:layout_height="40dp"
+        android:src="@drawable/pic_wide" android:scaleType="centerInside" android:background="#FFE0E0E0" />
+    <ImageView android:id="@+id/d" android:layout_width="120dp" android:layout_height="40dp"
+        android:src="@drawable/pic_wide" android:scaleType="center" android:background="#FFE0E0E0" />
+    <ImageView android:id="@+id/e" android:layout_width="120dp" android:layout_height="40dp"
+        android:src="@drawable/pic_wide" android:scaleType="fitXY" android:background="#FFE0E0E0" />
+    <ImageView android:id="@+id/f" android:layout_width="120dp" android:layout_height="40dp"
+        android:src="@drawable/pic_wide" android:scaleType="fitStart" android:background="#FFE0E0E0" />
+    <ImageView android:id="@+id/g" android:layout_width="120dp" android:layout_height="40dp"
+        android:src="@drawable/pic_wide" android:scaleType="fitEnd" android:background="#FFE0E0E0" />
+    <ImageView android:id="@+id/h" android:layout_width="120dp" android:layout_height="40dp"
+        android:src="@drawable/pic_wide" android:scaleType="matrix" android:background="#FFE0E0E0" />
+    <ImageView android:id="@+id/i" android:layout_width="30dp" android:layout_height="60dp"
+        android:src="@drawable/pic_wide" android:scaleType="centerCrop" android:background="#FFE0E0E0" />
+    <ImageView android:id="@+id/j" android:layout_width="30dp" android:layout_height="60dp"
+        android:src="@drawable/pic_wide" android:scaleType="centerInside" android:background="#FFE0E0E0"
+        android:padding="4dp" />
+    <ImageView android:id="@+id/k" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:src="@drawable/pic_wide" android:adjustViewBounds="true" android:background="#FFE0E0E0" />
+    <ImageView android:id="@+id/l" android:layout_width="wrap_content" android:layout_height="50dp"
+        android:src="@drawable/pic_wide" android:adjustViewBounds="true" android:background="#FFE0E0E0" />
+    <ImageView android:id="@+id/m" android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:src="@drawable/pic_wide" android:maxWidth="60dp" android:adjustViewBounds="true"
+        android:background="#FFE0E0E0" />
+    <ImageView android:id="@+id/n" android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:src="@drawable/pic_wide" android:minWidth="100dp" android:minHeight="40dp"
+        android:background="#FFE0E0E0" />
+    <androidx.appcompat.widget.AppCompatImageView android:id="@+id/o" android:layout_width="48dp"
+        android:layout_height="48dp" app:srcCompat="@drawable/pic_wide" android:scaleType="centerCrop"
+        android:background="@drawable/bg_oval" android:padding="8dp" />
+    <ImageButton android:id="@+id/p" android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:src="@drawable/pic_wide" />
+</LinearLayout>

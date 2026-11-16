@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical">
+    <EditText android:id="@+id/a" android:layout_width="match_parent" android:layout_height="wrap_content" android:hint="@string/he_hint" />
+    <EditText android:id="@+id/b" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="@string/number" android:inputType="number" />
+    <TextView android:id="@+id/c" android:layout_width="match_parent" android:layout_height="56dp" android:text="@string/he_short" android:gravity="center_vertical" android:drawableStart="@android:drawable/ic_menu_search" android:drawablePadding="12dp" android:paddingStart="16dp" android:paddingEnd="24dp" />
+    <Button android:id="@+id/d" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/he_short" />
+    <Button android:id="@+id/e" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="@string/en_short" />
+    <CheckBox android:id="@+id/f" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/he_short" />
+    <ImageView android:id="@+id/g" android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@android:drawable/ic_menu_search" android:padding="12dp" />
+    <ImageView android:id="@+id/h" android:layout_width="96dp" android:layout_height="wrap_content" android:src="@android:drawable/ic_menu_search" android:adjustViewBounds="true" />
+</LinearLayout>

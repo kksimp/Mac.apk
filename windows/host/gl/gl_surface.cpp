@@ -129,25 +129,45 @@ void to_argb(const uint32_t* src, std::vector<uint32_t>* argb, int W, int H, boo
 }
 
 // Reads FBO 0 into client memory and restores the app's bindings. (A pixel pack buffer read a frame late was
-// slower: ANGLE's D3D11 backend converts the pixels on the CPU at map time.)
+// slower: ANGLE's D3D11 backend converts the pixels on the CPU at map time.) The destination holds exactly W*H
+// pixels, so every pack parameter the app may have set (row length, skips) goes back to its default for the read.
+// On ES2 those parameters exist only with GL_NV_pack_subimage, which ANGLE exposes; querying them without it is an
+// error the app would see.
 struct PackState {
-    GLint fbo = 0, align = 4, pbo = 0;
-    bool es3 = false;
+    GLint read_fbo = 0, align = 4, pbo = 0, row_length = 0, skip_rows = 0, skip_pixels = 0;
+    bool es3 = false, subimage = false;
     void save() {
         EGLint version = 2;
         eglQueryContext(eglGetCurrentDisplay(), eglGetCurrentContext(), EGL_CONTEXT_CLIENT_VERSION, &version);
         es3 = version >= 3;
-        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
+        subimage = es3;
+        if (!es3) {
+            const char* ext = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+            subimage = ext && std::strstr(ext, "GL_NV_pack_subimage") != nullptr;
+        }
+        // glReadPixels reads the read framebuffer; on ES2 that is the single framebuffer binding.
+        glGetIntegerv(es3 ? GL_READ_FRAMEBUFFER_BINDING : GL_FRAMEBUFFER_BINDING, &read_fbo);
         glGetIntegerv(GL_PACK_ALIGNMENT, &align);
         if (es3) glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pbo);
-        if (fbo) glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        if (subimage) {
+            glGetIntegerv(GL_PACK_ROW_LENGTH, &row_length);
+            glGetIntegerv(GL_PACK_SKIP_ROWS, &skip_rows);
+            glGetIntegerv(GL_PACK_SKIP_PIXELS, &skip_pixels);
+        }
+        if (read_fbo) glBindFramebuffer(es3 ? GL_READ_FRAMEBUFFER : GL_FRAMEBUFFER, 0);
         if (pbo) glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
         if (align != 4) glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        if (row_length) glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+        if (skip_rows) glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+        if (skip_pixels) glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
     }
     void restore() const {
+        if (skip_pixels) glPixelStorei(GL_PACK_SKIP_PIXELS, skip_pixels);
+        if (skip_rows) glPixelStorei(GL_PACK_SKIP_ROWS, skip_rows);
+        if (row_length) glPixelStorei(GL_PACK_ROW_LENGTH, row_length);
         if (align != 4) glPixelStorei(GL_PACK_ALIGNMENT, align);
-        if (es3) glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(pbo));
-        if (fbo) glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(fbo));
+        if (pbo) glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(pbo));
+        if (read_fbo) glBindFramebuffer(es3 ? GL_READ_FRAMEBUFFER : GL_FRAMEBUFFER, static_cast<GLuint>(read_fbo));
     }
 };
 

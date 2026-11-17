@@ -240,16 +240,28 @@ git switch -c sync/macapk-v1.0.NNNN
 git merge upstream/main
 ```
 
-Conflicts can only fall on upstream files this fork changes, which are listed
-below. Every native a merged class gains needs an answer in `windows/host/`
-(for the classes `host_natives.cpp` binds, an unimplemented one returns 0 or
-null). Merge the pull request with a merge commit, never a squash or rebase, so
-the next `git merge upstream/main` finds its base.
+`runtime/` is never edited, so the merge itself does not conflict. Our changes
+to upstream's Java live in `windows/runtime/`, which mirrors `runtime/`: a file
+there replaces upstream's at the same path (`windows/scripts/build_java.sh`
+compiles ours instead), or adds a new one. `windows/runtime/UPSTREAM.tsv`
+records, for each replaced file, the upstream blob our copy is based on.
+
+After the merge, `windows/scripts/check_overlay.sh` (also a CI step) names each
+file upstream changed under one of our copies. For each: merge upstream's change
+into our copy (`git diff <old blob> <new blob>` shows it), then
+`check_overlay.sh --update <path>` records the new blob. A copy that has become
+identical to upstream's is deleted with its line. With `UPSTREAM_REF=upstream/main`
+the script also fails if `runtime/` itself was edited.
+
+Every native a merged class gains needs an answer in `windows/host/` (for the
+classes `host_natives.cpp` binds, an unimplemented one returns 0 or null). Merge
+the pull request with a merge commit, never a squash or rebase, so the next
+`git merge upstream/main` finds its base.
 
 ### Changes to the upstream tree
 
-Files in `runtime/` are changed only where a Windows hook is unavoidable, and
-every such change is listed here:
+What the copies in `windows/runtime/` change, by file (paths are upstream's,
+under `runtime/`):
 
 - `runtime/java/android/os/MacApkBinderTransport.java`: tries `nativeInit()`
   before looking for upstream's `libmacapk-binder.dylib`, since the Windows

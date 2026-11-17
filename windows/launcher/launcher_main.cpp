@@ -9101,7 +9101,7 @@ bool stop_library_app(const std::wstring& name) {
     return stopped;
 }
 
-// The app asking: our parent must be a winapk-runtime.exe that started before
+// The app asking: our parent must be our bin\winapk-runtime.exe that started before
 // us (not a reused process id), and its --apk a library app whose package has
 // one registry row. Nothing the app passes in its arguments is believed.
 bool resolve(Caller* c, std::string* why) {
@@ -9118,10 +9118,13 @@ bool resolve(Caller* c, std::string* why) {
         *why = "the parent process cannot be opened";
         return false;
     }
+    // The parent must be our own runtime by full path: any same-user program can be named
+    // winapk-runtime.exe and pass the library's Play Store APK as its --apk.
     wchar_t image[MAX_PATH * 2];
     DWORD len = MAX_PATH * 2;
+    std::error_code image_ec;
     const bool named = QueryFullProcessImageNameW(p, 0, image, &len) &&
-                       _wcsicmp(fs::path(image).filename().c_str(), L"winapk-runtime.exe") == 0;
+                       fs::equivalent(fs::path(image, image + len), runtime_exe(), image_ec) && !image_ec;
     FILETIME pc{}, sc{}, x1, x2, x3;
     const bool older = GetProcessTimes(p, &pc, &x1, &x2, &x3) &&
                        GetProcessTimes(GetCurrentProcess(), &sc, &x1, &x2, &x3) && CompareFileTime(&pc, &sc) <= 0;

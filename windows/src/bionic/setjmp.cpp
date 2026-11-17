@@ -29,7 +29,7 @@ namespace {
 // caller's own registers are not saved yet (setjmp) or not restored yet (longjmp) when it happens.
 extern "C" uint64_t winapk_sig_mask_get() { return signal_mask_of_current_thread(); }
 extern "C" void winapk_sig_mask_set(uint64_t mask) { signal_set_mask_of_current_thread(mask); }
-extern "C" void winapk_sig_stack_fixup(uint64_t rsp);  // signal.cpp
+extern "C" void winapk_sig_stack_fixup(uint64_t sp);  // signal.cpp
 extern "C" void winapk_longjmp_bad(int64_t* buf) {
     std::fprintf(stderr, "[win.apk] guest called longjmp on a jmp_buf (%p) that setjmp did not fill\n",
                  static_cast<void*>(buf));

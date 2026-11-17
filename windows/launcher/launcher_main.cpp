@@ -4993,24 +4993,40 @@ std::vector<std::wstring> google_accounts() {
     return out;
 }
 
-// The toolbar's account: none without the marker; else the first account, asked on a thread
-// (a JVM start) and posted to the library's window.
+// The signed-in accounts, as last asked. Asking starts a JVM, so it runs on a thread and the Settings
+// page and the toolbar read this copy; they never ask themselves. Without the marker the answer is known: none.
+std::vector<std::wstring> g_accounts;
+bool g_accounts_known = false;  // g_accounts holds an answer (a refresh may still be under way)
+bool g_accounts_busy = false;   // a query is in flight
+bool g_accounts_again = false;  // the accounts changed while it ran: ask once more
+
 DWORD WINAPI account_thread(void*) {
-    const std::vector<std::wstring> accounts = google_accounts();
-    auto* out = new std::wstring(accounts.empty() ? L"" : accounts[0]);
+    auto* out = new std::vector<std::wstring>(google_accounts());
     if (!PostMessageW(g_main, kGmsAccount, 0, reinterpret_cast<LPARAM>(out))) delete out;
     return 0;
 }
 
 void refresh_account() {
     if (!google_account_present()) {
+        g_accounts.clear();
+        g_accounts_known = true;
         g_account.clear();
         g_account_photo_key.clear();
         if (g_main) InvalidateRect(g_main, nullptr, FALSE);
+        if (g_view == kSettingsView) rebuild_page();
         return;
     }
+    if (g_accounts_busy) {
+        g_accounts_again = true;
+        return;
+    }
+    g_accounts_busy = true;
     HANDLE t = CreateThread(nullptr, 0, account_thread, nullptr, 0, nullptr);
-    if (t) CloseHandle(t);
+    if (t) {
+        CloseHandle(t);
+    } else {
+        g_accounts_busy = false;
+    }
 }
 
 // The sign-in window is the runtime's (--gms signin-window: Google's own
@@ -5058,9 +5074,10 @@ Section google_account_section() {
     if (g_gms_busy) {
         sec.rows.push_back(text_row(L"Google account", L"Signing in…",
                                     L"Complete the sign-in in the Google window, or close it to cancel."));
+    } else if (!g_accounts_known) {
+        sec.rows.push_back(text_row(L"Google account", L"Checking…", L""));
     } else {
-        const std::vector<std::wstring> accounts = google_accounts();
-        g_account = accounts.empty() ? L"" : accounts[0];
+        const std::vector<std::wstring> accounts = g_accounts;
         for (const std::wstring& a : accounts) {
             sec.rows.push_back(button_row(a, L"", L"Sign out", [a] { google_signout(a); }, true));
         }
@@ -8243,10 +8260,19 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp && google_account_present() != !g_account.empty()) refresh_account();
             break;
         case kGmsAccount: {
-            std::unique_ptr<std::wstring> account(reinterpret_cast<std::wstring*>(lp));
-            g_account = *account;
+            std::unique_ptr<std::vector<std::wstring>> accounts(reinterpret_cast<std::vector<std::wstring>*>(lp));
+            g_accounts_busy = false;
+            if (g_accounts_again) {
+                g_accounts_again = false;
+                refresh_account();  // this answer predates a sign-in or sign-out
+                return 0;
+            }
+            g_accounts = *accounts;
+            g_accounts_known = true;
+            g_account = g_accounts.empty() ? L"" : g_accounts[0];
             g_account_photo_key.clear();  // a sign-in or sign-out may have changed the picture
             InvalidateRect(hwnd, nullptr, FALSE);
+            if (g_view == kSettingsView) rebuild_page();
             return 0;
         }
         case WM_ACTIVATE:  // back to the window: the keyboard goes to Google Play when it is the view

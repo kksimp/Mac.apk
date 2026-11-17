@@ -37,6 +37,7 @@
 #include "cds.h"
 #include "frame_timing.h"
 #include "gl/gl_surface.h"
+#include "host_url.h"
 #include "native_window.h"
 #include "win32_window.h"
 #include "winapk/arm64_guest.h"
@@ -644,20 +645,18 @@ void JNICALL Cocoa_closeWindow(JNIEnv*, jclass, jlong) {}
 void JNICALL Cocoa_setSecureContent(JNIEnv*, jclass, jboolean secure) { window_set_secure(secure == JNI_TRUE); }
 
 // An implicit ACTION_VIEW/SENDTO/DIAL intent nobody in the app handles: the
-// system opens the URL (browser, mail, ...). Only URLs with a scheme, and not
-// file:, so an intent cannot start a program by its path.
+// system opens the URL (browser, mail, ...), if it is one a phone opens
+// outside the app (host_url.h); any other scheme would reach whatever program
+// Windows registered for it.
 jboolean JNICALL Cocoa_openHostUrl(JNIEnv* env, jclass, jstring url) {
     if (!url) return JNI_FALSE;
     const jchar* c = env->GetStringChars(url, nullptr);
     const std::wstring u(reinterpret_cast<const wchar_t*>(c), static_cast<size_t>(env->GetStringLength(url)));
     env->ReleaseStringChars(url, c);
-    size_t colon = u.find(L':');
-    bool scheme = colon != std::wstring::npos && colon > 1 && iswalpha(u[0]);
-    for (size_t i = 1; scheme && i < colon; ++i) {
-        scheme = iswalnum(u[i]) || u[i] == L'+' || u[i] == L'-' || u[i] == L'.';
-    }
-    if (!scheme || _wcsnicmp(u.c_str(), L"file:", 5) == 0) return JNI_FALSE;
-    const auto r = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", u.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+    const std::wstring target = host_open_target(u);
+    if (target.empty()) return JNI_FALSE;
+    const auto r =
+        reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
     return r > 32 ? JNI_TRUE : JNI_FALSE;
 }
 

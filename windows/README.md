@@ -174,6 +174,7 @@ Every test is a program built by CMake; `win-ci.yml` runs each on
 | `winapk-bionic-test <bionic_guest.so> <scratch>` | `test/guest/bionic_guest.c` exercises the shim from guest code: strings, printf/scanf through the guest's `va_list`, threads, files, ELF TLS, properties, locales, futex, large reservations, pipes, eventfd, epoll, sockets (loopback, multicast), `ALooper`, clocks, `mmap`, and calls that must fail as Linux reports it |
 | `winapk-crash-test <scratch>` | `host/crash_report.cpp`: a guest SIGSEGV handler that declines, then the report line and a minidump, pruned to the last three |
 | `winapk-applink-test` | `host/applink_match.h`: which navigation is the App Link sign-in's return to the app |
+| `winapk-host-url-test` | `host/host_url.h`: which URLs an app may hand to Windows (http, https, mailto, tel, sms; geo as a web map; the location settings), escaped; `shell:`, `file:` and every other scheme refused |
 | `winapk-cds-test <scratch>` | `host/cds_util.h`: the patch digest `bake_jre.sh` records, the flags a baked JRE drops, the archive key, the class list merge |
 | `winapk-paths-test` | `src/bionic/paths.cpp`: Android paths to host files |
 | `winapk-audio-test <test/audio>` | The WASAPI mixer and the decoders |

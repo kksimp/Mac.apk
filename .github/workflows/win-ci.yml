@@ -241,6 +241,7 @@ jobs:
       - name: Run the host-only tests
         run: |
           ./build/winapk-applink-test.exe
+          ./build/winapk-host-url-test.exe
           mkdir -p cds-scratch && ./build/winapk-cds-test.exe "$(cygpath -w "$PWD/cds-scratch")"
           ./build/winapk-paths-test.exe
           ./build/winapk-audio-test.exe "$(cygpath -w "$PWD/windows/test/audio")"

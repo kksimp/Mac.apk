@@ -302,14 +302,14 @@ public final class BluetoothGatt implements BluetoothProfile {
                 if (kind != HostBluetooth.GATT_CHAR_CHANGED) end();
                 continue;
             }
+            // Only the API 33 overloads: BluetoothGattCallback's defaults forward them to the legacy ones, which
+            // read the value set on the characteristic or descriptor here.
+            final byte[] bytes = value != null ? value : new byte[0];
             switch (kind) {
             case HostBluetooth.GATT_CHAR_READ:
                 if (status == GATT_SUCCESS) c.setValue(value);
                 end();
-                deliver(() -> {
-                    mCallback.onCharacteristicRead(this, c, status);
-                    mCallback.onCharacteristicRead(this, c, value != null ? value : new byte[0], status);
-                });
+                deliver(() -> mCallback.onCharacteristicRead(this, c, bytes, status));
                 break;
             case HostBluetooth.GATT_CHAR_WRITE:
                 end();
@@ -317,10 +317,7 @@ public final class BluetoothGatt implements BluetoothProfile {
                 break;
             case HostBluetooth.GATT_CHAR_CHANGED:
                 c.setValue(value);
-                deliver(() -> {
-                    mCallback.onCharacteristicChanged(this, c);
-                    mCallback.onCharacteristicChanged(this, c, value != null ? value : new byte[0]);
-                });
+                deliver(() -> mCallback.onCharacteristicChanged(this, c, bytes));
                 break;
             case HostBluetooth.GATT_DESC_READ:
             case HostBluetooth.GATT_DESC_WRITE: {
@@ -329,7 +326,7 @@ public final class BluetoothGatt implements BluetoothProfile {
                 if (d == null) break;
                 if (kind == HostBluetooth.GATT_DESC_READ) {
                     if (status == GATT_SUCCESS) d.setValue(value);
-                    deliver(() -> mCallback.onDescriptorRead(this, d, status));
+                    deliver(() -> mCallback.onDescriptorRead(this, d, status, bytes));
                 } else {
                     deliver(() -> mCallback.onDescriptorWrite(this, d, status));
                 }

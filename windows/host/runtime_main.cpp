@@ -1198,7 +1198,13 @@ void buffer_stderr() {
     if (t) CloseHandle(t);
 }
 
+// Descriptors and strftime formats come from guest code and from other processes' parcels. The CRT's
+// default reaction to a bad one is a fast-fail that ends the whole runtime; with a handler that returns,
+// _close, _read, _fstat64, strftime and the rest fail with errno set (EBADF, EINVAL), as Linux reports it.
+static void ignore_invalid_parameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned, uintptr_t) {}
+
 int wmain(int argc, wchar_t** argv) {
+    _set_invalid_parameter_handler(ignore_invalid_parameter);
     buffer_stderr();
     winapk::host::install_crash_report();
     winapk::host::take_launcher_ready_event();

@@ -807,6 +807,8 @@ static void test_files(const char* dir) {
     if (d) closedir(d);
     check("opendir/readdir", found, 0);
     check("open a missing file sets ENOENT", open("Z:/no/such/file", 0) < 0 && *__errno() == 2, 0);
+    check("close of a bad descriptor is EBADF", close(-1) == -1 && *__errno() == 9, 0);
+    check("read of a bad descriptor is EBADF", read(-1, &st, 1) == -1 && *__errno() == 9, 0);
     unlink(path);
     rmdir(sub);
     check("unlink + rmdir", stat(sub, &st) != 0, 0);

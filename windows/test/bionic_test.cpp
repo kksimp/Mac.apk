@@ -63,6 +63,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: winapk-bionic-test <libwinapk_bionic_guest.so> <scratch dir>\n");
         return 2;
     }
+    // As in the runtime: a bad descriptor from the guest must fail with errno, not fast-fail the process.
+    _set_invalid_parameter_handler([](const wchar_t*, const wchar_t*, const wchar_t*, unsigned, uintptr_t) {});
     winapk::LinkerConfig config;
     config.host = winapk::mini_bionic_resolve;
     winapk::GuestLinker linker(config);

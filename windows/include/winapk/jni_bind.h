@@ -54,7 +54,7 @@ void set_critical_native_query(CriticalNativeQuery query);
 // thunk code stays in the pool (it never frees) but nothing refers to it.
 void guest_native_thunks_forget(const void* base, size_t size);
 
-// The guest table's RegisterNatives slot (System V, called by guest code).
+// The guest table's RegisterNatives slot (guest ABI, called by guest code).
 WINAPK_GUEST_ABI jint guest_register_natives(JNIEnv* env, jclass clazz, const JNINativeMethod* methods,
                                              jint count);
 

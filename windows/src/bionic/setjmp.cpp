@@ -4,13 +4,10 @@
 // engine) report errors with longjmp. Without these the stub returned 0 for
 // setjmp and did nothing for longjmp, so an error path ran on into freed or
 // half-built state: Pixel Wheels (libGDX, FreeType) and LocalSend (Flutter)
-// died with access violations. An arm64 guest never reaches this file: its
-// setjmp and longjmp are the bridge's intrinsics (arm64_guest.h), asked
-// before the shim.
+// died with access violations.
 //
-// Only the registers the System V ABI keeps across a call need saving (rbx,
-// rbp, r12-r15, rsp and the return address); the rest are the caller's to
-// lose. Bionic's x86_64 jmp_buf is 11 longs; the slots used are the
+// Only the registers AAPCS64 keeps across a call need saving (x19-x28, x29, x30,
+// sp and d8-d15); the rest are the caller's to lose. The slots used are the
 // runtime's own, since only these functions read them. sigsetjmp(buf, 1)
 // also saves the thread's signal mask and siglongjmp restores it, as on
 // Linux: a handler that longjmps out of a fault would otherwise leave the
@@ -28,16 +25,11 @@ namespace winapk::bionic {
 
 namespace {
 
-// jmp_buf layout: [0] rbx, [1] rbp, [2] r12, [3] r13, [4] r14, [5] r15,
-// [6] rsp after return, [7] return address, [8] a magic (0x5e7a3b1c0f2d4a69)
-// that longjmp checks, [9] the signal mask, [10] 1 if [9] was saved.
-
-// Microsoft x64 helpers the naked functions call: callee-saved rdi and rsi
-// survive the call, and the caller's own registers are not saved yet (setjmp)
-// or not restored yet (longjmp) when it happens.
+// Helpers the naked functions call. They are ordinary Windows ARM64 functions: x19-x28 survive the call, and the
+// caller's own registers are not saved yet (setjmp) or not restored yet (longjmp) when it happens.
 extern "C" uint64_t winapk_sig_mask_get() { return signal_mask_of_current_thread(); }
 extern "C" void winapk_sig_mask_set(uint64_t mask) { signal_set_mask_of_current_thread(mask); }
-extern "C" void winapk_sig_stack_fixup(uint64_t rsp);  // signal.cpp
+extern "C" void winapk_sig_stack_fixup(uint64_t sp);  // signal.cpp
 extern "C" void winapk_longjmp_bad(int64_t* buf) {
     std::fprintf(stderr, "[win.apk] guest called longjmp on a jmp_buf (%p) that setjmp did not fill\n",
                  static_cast<void*>(buf));

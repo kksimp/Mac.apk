@@ -29,6 +29,9 @@ set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 RT="$(cd -- "$HERE/../../runtime" >/dev/null 2>&1 && pwd)"
+# windows/runtime mirrors runtime/: a file there replaces upstream's at the same
+# path, or adds one, so runtime/ itself stays upstream's (windows/runtime/UPSTREAM.tsv).
+OV="$(cd -- "$HERE/../runtime" >/dev/null 2>&1 && pwd)"
 OUT="${1:-$HERE/../build/runtime}"
 mkdir -p "$OUT"
 OUT="$(cd -- "$OUT" && pwd)"  # absolute: the packaging steps cd elsewhere
@@ -52,6 +55,18 @@ native_paths() {
 # The same for a path inside an argument ("module=path"), which MSYS2 does not
 # always recognize.
 native_path() { printf '%s\n' "$1" | native_paths; }
+# The .java files of runtime/<sub> with the overlay applied, one per line.
+sources() {  # sources <sub>
+    local sub="$1" f
+    {
+        if [[ -d "$RT/$sub" ]]; then
+            find "$RT/$sub" -name '*.java' ! -path '* [2-9].java' | while IFS= read -r f; do
+                [[ -f "$OV/${f#"$RT"/}" ]] || printf '%s\n' "$f"
+            done
+        fi
+        if [[ -d "$OV/$sub" ]]; then find "$OV/$sub" -name '*.java'; fi
+    } | sort
+}
 
 # A stale class from a deleted source would otherwise ship forever; javac
 # recompiles everything anyway, so wiping costs nothing.
@@ -62,7 +77,7 @@ echo "[build_java] compiling runtime/java..."
 LIST="$WORK/java.list"
 # Paths go into an @file, which splits on spaces; upstream skips Finder
 # conflict copies ("Foo 2.java") the same way.
-find "$RT/java" -name '*.java' ! -path '* [2-9].java' | sort | native_paths > "$LIST"
+sources java | native_paths > "$LIST"
 # Upstream's sources produce a few dozen warnings (sun.misc.Unsafe use) that
 # -nowarn does not silence, so the output goes to a log shown only on failure.
 # Android's org.apache.http.legacy (thirdparty/apache-http-legacy/README.md):
@@ -92,41 +107,43 @@ fi
 
 # The resolver provider is a separate pass: it needs the running JDK's API
 # rather than --release 21.
-if [[ -d "$RT/net_spi" ]]; then
-    find "$RT/net_spi" -name '*.java' ! -path '* [2-9].java' | sort | native_paths > "$WORK/net_spi.list"
+if [[ -d "$RT/net_spi" || -d "$OV/net_spi" ]]; then
+    sources net_spi | native_paths > "$WORK/net_spi.list"
     if [[ -s "$WORK/net_spi.list" ]]; then
         "$JAVAC" -d "$TMP" -nowarn -Xlint:-options @"$WORK/net_spi.list"
     fi
-    if [[ -d "$RT/net_spi/META-INF/services" ]]; then
+    for svc in "$RT/net_spi/META-INF/services" "$OV/net_spi/META-INF/services"; do
+        compgen -G "$svc/*" > /dev/null || continue
         mkdir -p "$TMP/META-INF/services"
-        cp -f "$RT"/net_spi/META-INF/services/* "$TMP/META-INF/services/"
-    fi
+        cp -f "$svc"/* "$TMP/META-INF/services/"
+    done
 fi
 
 # Classes the JDK only accepts from inside its own modules: upstream's
 # overlay, plus Win.apk's own under windows/java (java.base only), compiled
 # together into one directory the runtime hands to --patch-module.
-patch_module() {  # patch_module <module> <out dir> <source dir>...
-    local module="$1" dst="$2" src dirs="" sep=":"
+patch_module() {  # patch_module <module> <out dir> <source dir>... (a later dir's file replaces an earlier one's)
+    local module="$1" dst="$2" src dirs="" sep=":" f
+    local -A by_rel=()
     shift 2
     command -v cygpath > /dev/null 2>&1 && sep=";"  # javac on Windows splits on ';'
-    : > "$WORK/$module.list"
     for src in "$@"; do
         [[ -d "$src" ]] || continue
         echo "[build_java] compiling ${src#"$RT"/} (--patch-module $module)..."
         # sun.nio.fs.Windows* patch the Windows JDK's own classes, which a
         # JDK for another system does not have (a Linux build checks the rest).
-        find "$src" -name '*.java' | { if command -v cygpath > /dev/null 2>&1; then cat; else
-            grep -v '/sun/nio/fs/Windows'; fi; } | sort | native_paths >> "$WORK/$module.list"
+        while IFS= read -r f; do by_rel["${f#"$src"/}"]="$f"; done < <(find "$src" -name '*.java' |
+            { if command -v cygpath > /dev/null 2>&1; then cat; else grep -v '/sun/nio/fs/Windows'; fi; })
         dirs="${dirs:+$dirs$sep}$(native_path "$src")"
     done
-    [[ -s "$WORK/$module.list" ]] || return 0
+    [[ ${#by_rel[@]} -gt 0 ]] || return 0
+    printf '%s\n' "${by_rel[@]}" | sort | native_paths > "$WORK/$module.list"
     rm -rf "$dst"
     mkdir -p "$dst"
     "$JAVAC" -nowarn --patch-module "$module=$dirs" -d "$dst" @"$WORK/$module.list"
 }
-patch_module java.base "$LIB/java_base_patch" "$RT/java_base_patch" "$HERE/../java/java_base_patch"
-patch_module jdk.unsupported "$LIB/jdk_unsupported_patch" "$RT/jdk_unsupported_patch"
+patch_module java.base "$LIB/java_base_patch" "$RT/java_base_patch" "$OV/java_base_patch" "$HERE/../java/java_base_patch"
+patch_module jdk.unsupported "$LIB/jdk_unsupported_patch" "$RT/jdk_unsupported_patch" "$OV/jdk_unsupported_patch"
 
 # Shipped key-bind profiles are classpath resources of the loader jar.
 if [[ -d "$RT/java/com/macapk/loader/keybinds" ]]; then

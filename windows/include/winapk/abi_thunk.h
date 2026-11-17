@@ -47,6 +47,7 @@ void* make_jni_native_thunk(void* target, const ArgKind* args, size_t nargs, voi
 // fixed arguments (3 for CallIntMethod(env, obj, mid, ...), 4 for the
 // Nonvirtual variants). It calls `handler` with the same fixed arguments plus
 // a pointer to a SysVVaList over the variadic part.
+// (The sysv* names here and in SysVVaList are historical: the convention is AAPCS64.)
 void* make_sysv_variadic_entry(int named, void* handler);
 
 // A callable that calls `handler(first_arg, tag)` and then returns 0 / 0.0 /

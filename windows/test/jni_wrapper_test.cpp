@@ -1,11 +1,11 @@
 // jni_wrapper_test.cpp -- drives the guest JNIEnv/JavaVM wrapper
 // (windows/src/guest_jni.cpp) against a MOCK host JVM, so the forwarding and
-// the System V <-> Microsoft x64 boundary are tested without real HotSpot.
+// the guest (AAPCS64) <-> host (Windows ARM64) boundary are tested without real HotSpot.
 //
 // The mock host JNINativeInterface_ / JNIInvokeInterface_ are ordinary
-// Microsoft x64 functions (JNICALL is a no-op on x64). The guest table's slots
-// are System V. A test calls a guest slot the way guest code would -- load the
-// pointer at the slot and call it System V -- and checks that:
+// Windows ARM64 functions (JNICALL is a no-op there). The guest table's slots
+// are AAPCS64. A test calls a guest slot the way guest code would -- load the
+// pointer at the slot and call it AAPCS64 -- and checks that:
 //   * the call reaches the right mock slot with the arguments intact
 //     (including floating-point returns, narrow returns, and a long argument
 //     list that overflows into the stack),
@@ -183,7 +183,7 @@ void build_mock() {
     g_mock_vm.functions = &g_mock_invoke;
 }
 
-// Reads a guest-table slot as the System V function pointer it really holds.
+// Reads a guest-table slot as the guest-ABI function pointer it really holds.
 template <typename Fn>
 Fn slot(JNIEnv* genv, Fn JNINativeInterface_::*field) {
     const JNINativeInterface_* t = reinterpret_cast<JNIEnv_*>(genv)->functions;
@@ -200,7 +200,7 @@ int main() {
     JavaVM* gvm = winapk::guest_jni_init(reinterpret_cast<JavaVM*>(&g_mock_vm));
     check("guest_jni_init returned a guest VM", gvm && gvm != reinterpret_cast<JavaVM*>(&g_mock_vm));
 
-    // JavaVM GetEnv, called System V like guest code, must return a guest env.
+    // JavaVM GetEnv, called like guest code, must return a guest env.
     JNIEnv* genv = nullptr;
     {
         auto getenv_fn = reinterpret_cast<jint(WINAPK_GUEST_ABI*)(JavaVM*, void**, jint)>(
@@ -218,7 +218,7 @@ int main() {
         return 1;
     }
 
-    // Each slot, called System V, must reach the mock with the host env.
+    // Each slot, called like guest code, must reach the mock with the host env.
     {
         auto f = slot(genv, &JNINativeInterface_::GetVersion);
         auto fn = reinterpret_cast<jint(WINAPK_GUEST_ABI*)(JNIEnv*)>(reinterpret_cast<void*>(f));

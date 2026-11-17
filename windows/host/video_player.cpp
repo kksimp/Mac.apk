@@ -131,7 +131,8 @@ struct Player::Impl {
                 continue;
             }
             hold.lock();
-            if (video_eos && audio_eos && !have_pending) {
+            // Without a sound stream read_audio never runs, so audio_eos never comes.
+            if (video_eos && (audio_eos || !audio) && !have_pending) {
                 if (looping) {
                     do_loop(hold);
                     continue;

@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 namespace winapk::host {
@@ -92,11 +93,21 @@ struct AStream {
     std::atomic<bool> in_cb{false};  // true while the guest callback runs
     std::thread feeder;
     std::atomic<int64_t> frames_written{0};
+    // The engine's played count restarts at 0 on stop and flush; AAudio's
+    // framesRead never goes back (apps difference it for latency), so it is
+    // this base plus the engine's count.
+    // Taken for "base + position" and for "stop/flush and move the count into
+    // the base", so a reader never sees the count twice or going back. Only
+    // engine calls run under it (no callback, no join).
+    std::atomic<int64_t> frames_read_base{0};
+    mutable std::mutex read_lock;
 
     int encoding() const { return format == kFormatFloat ? kEncodingFloat : kEncodingPcm16; }
-    int64_t buffered() const {
-        return frames_written.load(std::memory_order_relaxed) - audio::stream_position(out.get());
+    int64_t frames_read() const {
+        std::lock_guard<std::mutex> hold(read_lock);
+        return frames_read_base.load(std::memory_order_relaxed) + audio::stream_position(out.get());
     }
+    int64_t buffered() const { return frames_written.load(std::memory_order_relaxed) - frames_read(); }
 };
 
 void sleep_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
@@ -132,6 +143,13 @@ void join_feeder(AStream* s) {
     s->running.store(false, std::memory_order_relaxed);
     if (s->feeder.joinable() && s->feeder.get_id() != std::this_thread::get_id()) s->feeder.join();
     else if (s->feeder.joinable()) s->feeder.detach();  // stopped from inside its own callback
+}
+
+// What was written before the stop still plays out and the engine counts it
+// from 0 again, so the frames played so far move into the base.
+void stop_engine(AStream* s) {
+    std::lock_guard<std::mutex> hold(s->read_lock);
+    s->frames_read_base.fetch_add(audio::stream_stop(s->out.get()), std::memory_order_relaxed);
 }
 
 Builder* B(void* b) { return static_cast<Builder*>(b); }
@@ -213,7 +231,7 @@ WINAPK_GUEST_ABI int AAudioStreamBuilder_openStream(void* b, void** stream) {
     s->input_preset = bld->input_preset > 0 ? bld->input_preset : 6;
     s->raw_data_cb = bld->data_cb;
     s->user_data = bld->user_data;
-    // A guest function pointer: arm64 code gets a System V entry for the host.
+    // A guest function pointer: arm64 code gets an entry the host can call.
     s->data_cb = reinterpret_cast<DataCallback>(bld->data_cb ? arm64::host_callable(bld->data_cb) : nullptr);
     s->out = audio::stream_create(s->sample_rate, s->channels, s->encoding(), s->buffer_capacity);
     if (!s->out) {
@@ -248,7 +266,7 @@ WINAPK_GUEST_ABI int AAudioStream_release(void* st) {
     AStream* s = S(st);
     if (!s) return kOk;
     join_feeder(s);
-    audio::stream_stop(s->out.get());
+    stop_engine(s);
     return kOk;
 }
 
@@ -283,12 +301,20 @@ WINAPK_GUEST_ABI int AAudioStream_requestStop(void* st) {
     // STOPPED first so the feeder stops calling back before it is joined.
     s->state.store(kStateStopped, std::memory_order_release);
     join_feeder(s);
-    audio::stream_stop(s->out.get());
+    stop_engine(s);
     return kOk;
 }
 
 WINAPK_GUEST_ABI int AAudioStream_requestFlush(void* st) {
-    if (AStream* s = S(st)) audio::stream_flush(s->out.get());
+    AStream* s = S(st);
+    if (!s) return kOk;
+    // The engine ignores a flush while playing. Otherwise the unplayed frames
+    // are dropped and count as read, as AOSP's flush moves framesRead up to
+    // framesWritten.
+    if (s->state.load(std::memory_order_acquire) == kStateStarted) return kOk;
+    std::lock_guard<std::mutex> hold(s->read_lock);
+    audio::stream_flush(s->out.get());
+    s->frames_read_base.store(s->frames_written.load(std::memory_order_relaxed), std::memory_order_relaxed);
     return kOk;
 }
 
@@ -344,7 +370,7 @@ WINAPK_GUEST_ABI int AAudioStream_getContentType(void*) { return 2; } // AAUDIO_
 WINAPK_GUEST_ABI int AAudioStream_getInputPreset(void* st) { return st ? S(st)->input_preset : 6; }
 WINAPK_GUEST_ABI int AAudioStream_getPerformanceMode(void*) { return 10; }  // NONE
 WINAPK_GUEST_ABI int AAudioStream_getSharingMode(void*) { return 0; }
-WINAPK_GUEST_ABI int64_t AAudioStream_getFramesRead(void*) { return 0; }
+WINAPK_GUEST_ABI int64_t AAudioStream_getFramesRead(void* st) { return st ? S(st)->frames_read() : 0; }
 WINAPK_GUEST_ABI int64_t AAudioStream_getFramesWritten(void* st) {
     return st ? S(st)->frames_written.load(std::memory_order_relaxed) : 0;
 }
@@ -361,7 +387,7 @@ WINAPK_GUEST_ABI int AAudioStream_getTimestamp(void* st, int clockid, int64_t* p
     static auto clock_gettime = reinterpret_cast<ClockGettime>(mini_bionic_resolve("clock_gettime"));
     int64_t ts[2] = {0, 0};
     if (clock_gettime) clock_gettime(clockid ? clockid : 1 /* CLOCK_MONOTONIC */, ts);
-    *position = audio::stream_position(s->out.get());
+    *position = s->frames_read();
     *nanos = ts[0] * 1000000000LL + ts[1];
     return kOk;
 }

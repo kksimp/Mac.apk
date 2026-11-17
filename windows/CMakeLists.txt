@@ -91,6 +91,11 @@ target_include_directories(winapk-arm64-test PRIVATE test/guest)
 add_executable(winapk-applink-test test/applink_match_test.cpp)
 target_include_directories(winapk-applink-test PRIVATE host)
 
+# Which URLs an app hands to Windows' own handlers, and as what (host/host_url.h):
+# test/host_url_test.cpp.
+add_executable(winapk-host-url-test test/host_url_test.cpp)
+target_include_directories(winapk-host-url-test PRIVATE host)
+
 # Class-data sharing's pure parts (host/cds_util.h): the patch digest
 # bake_jre.sh records, the flags it drops, the archive's key, the class list
 # merge. test/cds_test.cpp.
@@ -114,6 +119,7 @@ if(MINGW)
   target_link_options(winapk-x18scan PRIVATE -static)
   target_link_options(winapk-x18-scan-test PRIVATE -static)
   target_link_options(winapk-applink-test PRIVATE -static)
+  target_link_options(winapk-host-url-test PRIVATE -static)
   target_link_options(winapk-paths-test PRIVATE -static)
   target_link_options(winapk-cds-test PRIVATE -static)
 endif()

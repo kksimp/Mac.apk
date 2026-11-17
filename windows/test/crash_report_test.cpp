@@ -5,7 +5,7 @@
 //
 // It runs itself again with --child and that scratch directory, stderr to a
 // file. The child installs the crash report with a dump location, installs a
-// guest-style SIGSEGV handler through the Bionic shim's sigaction (System V,
+// guest-style SIGSEGV handler through the Bionic shim's sigaction (AAPCS64,
 // as an app's crash reporter would) that only logs and returns, then writes
 // to address 0. Expected: the handler runs kMaxNoProgress (3) times and is
 // then treated as having declined, the report names the faulting module and

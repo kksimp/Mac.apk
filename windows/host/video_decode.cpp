@@ -991,10 +991,12 @@ struct Demuxer::Impl {
             UINT32 clean = 0;
             out->key = !t.video || (SUCCEEDED(sample->GetUINT32(MFSampleExtension_CleanPoint, &clean)) && clean != 0);
             if (t.mime == "video/avc" || t.mime == "video/hevc") to_annexb(&out->data);
-            if (adts[static_cast<size_t>(track)] && out->data.size() > 7 && out->data[0] == 0xff &&
+            if (adts[static_cast<size_t>(track)] && out->data.size() > 1 && out->data[0] == 0xff &&
                 (out->data[1] & 0xf0) == 0xf0) {
                 const size_t head = (out->data[1] & 1) ? 7 : 9;  // 9 with a CRC
-                out->data.erase(out->data.begin(), out->data.begin() + static_cast<ptrdiff_t>(head));
+                if (out->data.size() > head) {
+                    out->data.erase(out->data.begin(), out->data.begin() + static_cast<ptrdiff_t>(head));
+                }
             }
             return true;
         }

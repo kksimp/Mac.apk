@@ -1,9 +1,9 @@
 // printf.cpp -- the printf family, sscanf, and liblog's formatted entry points.
 //
-// A guest's variadic arguments arrive the System V way: integers and pointers
-// in rdi..r9 and then on the stack, doubles in xmm0..xmm7 and then on the
-// stack, long double always on the stack. The CRT's printf would read them the
-// Microsoft way, so formatting cannot be handed to it whole. Instead the format
+// A guest's variadic arguments arrive the AAPCS64 way: integers and pointers
+// in x0..x7 and then on the stack, doubles and long doubles in v0..v7 and then
+// on the stack. The CRT's printf would read them the Windows ARM64 way (floating
+// point in integer registers), so formatting cannot be handed to it whole. Instead the format
 // string is parsed here, each argument is fetched from the guest's va_list by
 // its real class (abi_thunk.h's SysVVaList), and each conversion is formatted
 // on its own by the CRT's snprintf. Variadic functions get their va_list from

@@ -87,7 +87,7 @@ struct Slot<Field> {
 
 // Slot stub for the variadic Call<T>Method families before a signature
 // provider is set (guest_jni_set_signature_provider). Declared with fixed
-// parameters (not `...`): a System V caller cleans up its own stack, so the
+// parameters (not `...`): an AAPCS64 caller cleans up its own stack, so the
 // ignored variadic arguments are harmless, and they are never read.
 [[noreturn]] WINAPK_GUEST_ABI void unimplemented_variadic(JNIEnv*) {
     std::fprintf(stderr,
@@ -228,9 +228,9 @@ WINAPK_GUEST_ABI jclass guest_find_class(JNIEnv* genv, const char* name) {
     return env->FindClass(name);
 }
 
-// GetJavaVM hands the guest the guest JavaVM (System V slots), never HotSpot's:
-// a guest that calls (*vm)->GetEnv on HotSpot's own table passes System V
-// arguments to a Microsoft x64 function and faults inside jni_GetEnv.
+// GetJavaVM hands the guest the guest JavaVM (guest-ABI slots), never HotSpot's:
+// a guest that calls (*vm)->GetEnv on HotSpot's own table would get HotSpot's
+// JNIEnv, not the guest one, and fault on its first call through it.
 WINAPK_GUEST_ABI jint guest_get_java_vm(JNIEnv*, JavaVM** vm) {
     if (!vm) return JNI_ERR;
     *vm = reinterpret_cast<JavaVM*>(&g_guest_vm);
@@ -253,7 +253,7 @@ void build_guest_table() {
 #undef WINAPK_JNI_CALLV
 
     // The plain slots that cannot just forward. The function pointers the
-    // guest registers are System V and need a thunk each (jni_bind.h).
+    // guest registers are AAPCS64 and need a thunk each (jni_bind.h).
     *reinterpret_cast<void**>(&t.RegisterNatives) = reinterpret_cast<void*>(&guest_register_natives);
     *reinterpret_cast<void**>(&t.GetJavaVM) = reinterpret_cast<void*>(&guest_get_java_vm);
     *reinterpret_cast<void**>(&t.GetMethodID) = reinterpret_cast<void*>(&guest_get_method_id);
@@ -273,7 +273,7 @@ JNIEnv* wrap_host_env(JNIEnv* host) {
     return reinterpret_cast<JNIEnv*>(&t_env);
 }
 
-// ---- guest JavaVM slots (System V) ---------------------------------------
+// ---- guest JavaVM slots (AAPCS64) ---------------------------------------
 
 JavaVM* host_vm_from(JavaVM* vm) {
     auto* g = reinterpret_cast<GuestVM*>(vm);

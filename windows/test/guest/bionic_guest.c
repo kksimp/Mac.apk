@@ -301,6 +301,10 @@ int pipe(int[2]);
 int eventfd(unsigned, int);
 struct pollfd { int fd; short events, revents; };
 int poll(struct pollfd*, unsigned long, int);
+typedef struct { unsigned long bits[16]; } guest_fd_set;
+struct guest_timeval { long sec, usec; };
+int select(int, guest_fd_set*, guest_fd_set*, guest_fd_set*, struct guest_timeval*);
+#define GUEST_FD_ISSET(fd, s) (((s)->bits[(fd) / 64] >> ((fd) % 64)) & 1)
 int epoll_create1(int);
 struct WINAPK_EPOLL_PACKED epoll_event { unsigned events; unsigned long data; };
 int epoll_ctl(int, int, int, struct epoll_event*);
@@ -323,6 +327,7 @@ static void* waker(void* arg) {
 
 size_t malloc_usable_size(const void*);
 int posix_memalign(void**, size_t, size_t);
+void* realloc(void*, size_t);
 static void test_malloc_usable_size(void) {
     void* p = malloc(100);
     check("malloc_usable_size of a malloc block is at least its size", p && malloc_usable_size(p) >= 100, 0);
@@ -330,6 +335,15 @@ static void test_malloc_usable_size(void) {
     void* q = 0;
     check("malloc_usable_size of a posix_memalign(64) block", posix_memalign(&q, 64, 200) == 0 && q &&
               malloc_usable_size(q) >= 200, 0);
+    // A size the over-aligned path cannot pad without wrapping, and a realloc that fails: the old block is kept.
+    const size_t huge = (size_t)-1 - 8;
+    void* r = 0;
+    check("posix_memalign of a size that would wrap is ENOMEM", posix_memalign(&r, 64, huge) == 12 && !r, 0);
+    if (q) memset(q, 0x5a, 200);
+    *__errno() = 0;
+    check("a failed realloc of an aligned block is ENOMEM", q && realloc(q, huge) == 0 && *__errno() == 12, 0);
+    check("a failed realloc keeps the aligned block",
+          q && ((unsigned char*)q)[199] == 0x5a && malloc_usable_size(q) >= 200, 0);
     free(q);
 }
 
@@ -339,8 +353,18 @@ static void test_event_fds(void) {
     check("pipe write/read", pipe(p) == 0 && write(p[1], "ping", 4) == 4 && read(p[0], b, 16) == 4 && !strcmp(b, "ping"), b);
     struct pollfd pf = {p[0], 1, 0};
     check("poll: empty pipe times out", poll(&pf, 1, 10) == 0, 0);
+    guest_fd_set rs = {{0}};
+    rs.bits[p[0] / 64] |= 1UL << (p[0] % 64);
+    struct guest_timeval tv = {0, 10000};
+    check("select: empty pipe times out, clears the set and the timeout",
+          select(p[0] + 1, &rs, 0, 0, &tv) == 0 && !GUEST_FD_ISSET(p[0], &rs) && tv.sec == 0 && tv.usec == 0, 0);
     write(p[1], "x", 1);
     check("poll: pipe readable", poll(&pf, 1, 100) == 1 && (pf.revents & 1), 0);
+    rs.bits[p[0] / 64] |= 1UL << (p[0] % 64);
+    tv = (struct guest_timeval){5, 0};
+    check("select: pipe readable, the timeout keeps the time left",
+          select(p[0] + 1, &rs, 0, 0, &tv) == 1 && GUEST_FD_ISSET(p[0], &rs) && tv.sec >= 4 &&
+              tv.sec * 1000000 + tv.usec <= 5000000, 0);
     read(p[0], b, 1);
     fcntl(p[0], 4, 04000);  // F_SETFL O_NONBLOCK
     check("non-blocking empty read is EAGAIN", read(p[0], b, 1) == -1 && *__errno() == 11, 0);
@@ -783,6 +807,8 @@ static void test_files(const char* dir) {
     if (d) closedir(d);
     check("opendir/readdir", found, 0);
     check("open a missing file sets ENOENT", open("Z:/no/such/file", 0) < 0 && *__errno() == 2, 0);
+    check("close of a bad descriptor is EBADF", close(-1) == -1 && *__errno() == 9, 0);
+    check("read of a bad descriptor is EBADF", read(-1, &st, 1) == -1 && *__errno() == 9, 0);
     unlink(path);
     rmdir(sub);
     check("unlink + rmdir", stat(sub, &st) != 0, 0);
@@ -1696,6 +1722,22 @@ static struct timespec in_ms(long ms) {
     return t;
 }
 
+// Threads reading pages of one descriptor at once, each page filled with its own number: SQLite and
+// LevelDB share a descriptor across threads this way. Returns the number of wrong pages read.
+static int g_pages_fd = -1;
+static void* page_reader(void* arg) {
+    long bad = 0;
+    unsigned char page[4096];
+    for (int i = 0; i < 2000; ++i) {
+        const int n = (int)(((long)arg + i * 7) % 16);
+        if (__pread_chk(g_pages_fd, page, sizeof page, (off_t)n * 4096, sizeof page) != 4096 || page[0] != n ||
+            page[4095] != n) {
+            ++bad;
+        }
+    }
+    return (void*)bad;
+}
+
 static void test_missing_forms(const char* dir) {
     char b[512], path[512], other[512];
     struct stat st;
@@ -1719,10 +1761,33 @@ static void test_missing_forms(const char* dir) {
           pwritev(fd, out, 3, 2) == 6 && preadv(fd, in, 1, 2) == 3 && memcmp(r1, "abc", 3) == 0 &&
               lseek(fd, 0, 1) == 16,
           0);
+    check("pread past the end is 0", __pread_chk(fd, b, 4, 1000, sizeof b) == 0, 0);
+    check("ftruncate to the same size keeps the position", lseek(fd, 7, 0) == 7 && ftruncate(fd, 16) == 0 &&
+                                                               lseek(fd, 0, 1) == 7, 0);
+    snprintf(other, sizeof other, "%s/pages.bin", dir);
+    g_pages_fd = open(other, 01102, 0600);
+    for (int n = 0; n < 16; ++n) {
+        memset(b, n, sizeof b);
+        for (int k = 0; k < 8; ++k) write(g_pages_fd, b, sizeof b);
+    }
+    lseek(g_pages_fd, 5, 0);
+    pthread_t readers[4];
+    long wrong = 0;
+    for (long i = 0; i < 4; ++i) pthread_create(&readers[i], 0, page_reader, (void*)i);
+    for (int i = 0; i < 4; ++i) {
+        void* r = 0;
+        pthread_join(readers[i], &r);
+        wrong += (long)r;
+    }
+    check("pread from four threads at once reads every page it asks for and leaves the position",
+          wrong == 0 && lseek(g_pages_fd, 0, 1) == 5, 0);
+    close(g_pages_fd);
+    unlink(other);
     int p[2] = {-1, -1};
     pipe(p);
     write(p[1], "xyz", 3);
     in[0].len = 2;
+    check("pread on a pipe fails with ESPIPE", __pread_chk(p[0], b, 1, 0, sizeof b) == -1 && *__errno() == 29, 0);
     check("readv on a pipe returns what is there", readv(p[0], in, 2) == 3 && r1[1] == 'y' && r2[0] == 'z', 0);
     check("writev to a pipe", writev(p[1], out, 3) == 6 && read(p[0], b, 16) == 6 && memcmp(b, "abcdef", 6) == 0, 0);
     off_t at = 2;  // the file holds "01abcdef89abcdef"

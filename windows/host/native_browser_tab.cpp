@@ -62,6 +62,7 @@
 
 #include "applink_match.h"
 #include "host_natives.h"
+#include "host_url.h"
 #include "webview2_host.h"
 #include "win32_window.h"
 
@@ -180,7 +181,8 @@ void java_failed(Tab* t) {
         std::fprintf(stderr, "[win.apk] applink-signin %d: no window; %s goes to the system browser\n", t->id,
                      wv2::redact(t->initial_url).c_str());
         std::fflush(stderr);
-        ShellExecuteW(nullptr, L"open", t->initial_url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        const std::wstring target = host_open_target(t->initial_url);
+        if (!target.empty()) ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         return;
     }
     JNIEnv* env = wv2::env();

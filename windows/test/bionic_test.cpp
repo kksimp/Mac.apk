@@ -4,7 +4,7 @@
 //   winapk-bionic-test <libwinapk_bionic_guest.so> <scratch dir>
 //
 // The guest library is loaded through the guest linker with the shim as its
-// libc, so every call is a real System V call into the shim with Bionic's
+// libc, so every call is a real AAPCS64 call into the shim with Bionic's
 // layouts. An import the shim does not provide fails the load and is listed.
 //
 // Exit code: the number of failed checks.
@@ -63,6 +63,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: winapk-bionic-test <libwinapk_bionic_guest.so> <scratch dir>\n");
         return 2;
     }
+    // As in the runtime: a bad descriptor from the guest must fail with errno, not fast-fail the process.
+    _set_invalid_parameter_handler([](const wchar_t*, const wchar_t*, const wchar_t*, unsigned, uintptr_t) {});
     winapk::LinkerConfig config;
     config.host = winapk::mini_bionic_resolve;
     winapk::GuestLinker linker(config);

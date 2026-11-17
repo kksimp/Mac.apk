@@ -76,20 +76,38 @@ jstring jstr(JNIEnv* env, const std::wstring& w) {
     return env->NewString(reinterpret_cast<const jchar*>(w.data()), static_cast<jsize>(w.size()));
 }
 
+// Bytes another program put on the clipboard are not modified UTF-8, which NewStringUTF expects: go through UTF-16,
+// where an invalid sequence becomes U+FFFD.
+jstring jstr_utf8(JNIEnv* env, const std::string& s) {
+    const int n = s.empty() ? 0 : MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring w(static_cast<size_t>(n > 0 ? n : 0), L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), &w[0], n);
+    return jstr(env, w);
+}
+
 bool put(UINT format, const void* data, size_t size) {
     HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, size);
     if (!g) return false;
-    std::memcpy(GlobalLock(g), data, size);
+    void* p = GlobalLock(g);
+    if (!p) {
+        GlobalFree(g);
+        return false;
+    }
+    std::memcpy(p, data, size);
     GlobalUnlock(g);
     if (SetClipboardData(format, g)) return true;
     GlobalFree(g);
     return false;
 }
+// Empty when the format is absent or its handle can't be locked.
 std::string get_bytes(UINT format) {
     HANDLE h = GetClipboardData(format);
     if (!h) return {};
+    const SIZE_T size = GlobalSize(h);
+    if (size == 0) return {};
     const void* p = GlobalLock(h);
-    std::string s(static_cast<const char*>(p), GlobalSize(h));
+    if (!p) return {};
+    std::string s(static_cast<const char*>(p), size);
     GlobalUnlock(h);
     return s;
 }
@@ -186,11 +204,11 @@ jobjectArray JNICALL Clip_read(JNIEnv* env, jclass, jlongArray out) {
     jobjectArray r = env->NewObjectArray(5, env->FindClass("java/lang/String"), nullptr);
     if (!r) return nullptr;
     if (types & kText) env->SetObjectArrayElement(r, 0, jstr(env, text));
-    if (types & kHtml) env->SetObjectArrayElement(r, 1, env->NewStringUTF(html.c_str()));
+    if (types & kHtml) env->SetObjectArrayElement(r, 1, jstr_utf8(env, html));
     if (types & kUrl) env->SetObjectArrayElement(r, 2, jstr(env, url));
     if (types & kMacApk) {
-        env->SetObjectArrayElement(r, 3, env->NewStringUTF(pkg.c_str()));
-        env->SetObjectArrayElement(r, 4, env->NewStringUTF(label.c_str()));
+        env->SetObjectArrayElement(r, 3, jstr_utf8(env, pkg));
+        env->SetObjectArrayElement(r, 4, jstr_utf8(env, label));
     }
     if (out && env->GetArrayLength(out) >= 2) {
         const jlong v[2] = {static_cast<jlong>(GetClipboardSequenceNumber()), types};

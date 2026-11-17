@@ -81,7 +81,7 @@ void JNICALL on_native_method_bind(jvmtiEnv* jvmti, JNIEnv* env, jthread, jmetho
     }
     void* thunk = sig ? guest_native_thunk(address, sig, critical) : nullptr;
     if (!thunk) {
-        // Binding the raw System V address would crash on the first call, far
+        // Binding the raw guest address would crash on the first call, far
         // from the cause. Leave it, but say why.
         std::fprintf(stderr, "[win.apk] cannot bind guest native %p (signature %s)\n", address,
                      sig ? sig : "unknown");
@@ -125,7 +125,7 @@ void* guest_native_thunk(void* fn, const char* sig, bool critical) {
     auto key = std::make_pair(fn, std::string(sig) + (critical ? "!critical" : ""));
     auto it = g_thunks.find(key);
     if (it != g_thunks.end()) return it->second;
-    // An arm64 native gets its System V entry here, so
+    // An arm64 native gets a host-callable entry here, so
     // HotSpot's calls do not go through the execute-fault path each time.
     // A @CriticalNative method gets its Java arguments only (no JNIEnv*, no jclass).
     void* thunk = make_jni_native_thunk(arm64::host_callable(fn), kinds.data(), kinds.size(),

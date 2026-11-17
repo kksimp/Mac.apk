@@ -42,7 +42,8 @@ void stream_release(const std::shared_ptr<Stream>& s);
 size_t stream_write(Stream* s, const void* samples, size_t count, int encoding, bool blocking);
 void stream_play(Stream* s);
 void stream_pause(Stream* s);
-void stream_stop(Stream* s);
+// Returns the frames played since the last stop or flush, before the count restarts at 0.
+int64_t stream_stop(Stream* s);
 void stream_flush(Stream* s);
 void stream_set_volume(Stream* s, float left, float right);
 int stream_state(Stream* s);

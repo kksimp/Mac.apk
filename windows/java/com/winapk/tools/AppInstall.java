@@ -171,7 +171,11 @@ public final class AppInstall {
                 return false;
             }
             for (Map.Entry<ZipEntry, String> m : select(apks, xapkBase(zip), packageGuess(bundle)).entrySet()) {
-                Path target = dir.resolve(m.getValue());
+                Path target = child(dir, m.getValue());
+                if (target == null) {
+                    System.err.println("[install] skipping " + m.getKey().getName() + ": not a plain file name");
+                    continue;
+                }
                 try (InputStream in = zip.getInputStream(m.getKey())) {
                     Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
                 }
@@ -203,16 +207,34 @@ public final class AppInstall {
                 ZipEntry z = e.nextElement();
                 String name = z.getName();
                 if (z.isDirectory() || !name.startsWith(prefix) || !name.endsWith(".so")) continue;
-                String file = name.substring(prefix.length());
-                if (file.contains("/")) continue;
+                Path target = child(libDir, name.substring(prefix.length()));
+                if (target == null) continue;
                 Files.createDirectories(libDir);
                 try (InputStream in = zip.getInputStream(z)) {
-                    Files.copy(in, libDir.resolve(file), StandardCopyOption.REPLACE_EXISTING);
+                    Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
                 }
                 n++;
             }
         }
         return n;
+    }
+
+    /** dir/name when name is one plain file name, else null. Zip entry names
+     *  come from the archive, and on Windows Path also takes '\', "C:" and
+     *  ".." as path syntax, so a name with any of them could land outside dir. */
+    static Path child(Path dir, String name) {
+        if (name.isEmpty() || name.equals(".") || name.equals("..")
+                || name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || name.indexOf(':') >= 0) {
+            return null;
+        }
+        Path base = dir.toAbsolutePath().normalize();
+        Path target;
+        try {
+            target = base.resolve(name).normalize();
+        } catch (java.nio.file.InvalidPathException e) {
+            return null;
+        }
+        return base.equals(target.getParent()) ? target : null;
     }
 
     /** VMRuntime.getInstructionSet: the directory name an ABI installs under. */
@@ -239,7 +261,8 @@ public final class AppInstall {
         }
     }
 
-    /** The `package` attribute of the manifest's root element. */
+    /** The `package` attribute of the manifest's root element, or null when
+     *  there is none or it is not a valid package name. */
     static String packageName(Path apk) throws IOException {
         byte[] axml;
         try (ZipFile zip = new ZipFile(apk.toFile())) {
@@ -249,8 +272,21 @@ public final class AppInstall {
                 axml = in.readAllBytes();
             }
         }
-        return rootAttribute(axml, "package");
+        String pkg = rootAttribute(axml, "package");
+        if (pkg != null && !pkg.equals("android") && !PACKAGE_NAME.matcher(pkg).matches()) {
+            System.err.println("[install] " + apk.getFileName() + ": the manifest's package is not a package name");
+            return null;
+        }
+        return pkg;
     }
+
+    // Android's own rule for an app's package (PackageParser.validateName with
+    // a separator required; like Android, "android", the platform's own resource
+    // package, is let through by name). The name comes from the APK and becomes a folder
+    // name in the install path, the app's data folder and the host's records,
+    // so anything else ("..", '\', ':', a line break) is refused here, once,
+    // for every caller.
+    static final Pattern PACKAGE_NAME = Pattern.compile("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+");
 
     /** A string attribute of the first element of a binary XML document. */
     static String rootAttribute(byte[] axml, String attr) {

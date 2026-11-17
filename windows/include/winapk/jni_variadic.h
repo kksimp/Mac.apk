@@ -2,11 +2,11 @@
 //
 // Call<T>Method(env, obj, mid, ...) and its ...V (va_list) form pass arguments
 // inline, typed only by the method's JNI signature. The bridge reads the
-// System V argument stream against that signature, repacks it into the jvalue[]
+// AAPCS64 argument stream against that signature, repacks it into the jvalue[]
 // the Call<T>MethodA form takes, and calls HotSpot's A-form. 31 families (3
 // call kinds x 10 return types, plus NewObject) are generated from one template
 // keyed on the A-form slot; the ... forms build their argument stream with the
-// System V variadic entry stub from abi_thunk.cpp, the ...V forms read the
+// AAPCS64 variadic entry stub from abi_thunk.cpp, the ...V forms read the
 // guest's own va_list.
 //
 // The signature of a jmethodID is not available through public JNI, so the

@@ -76,6 +76,7 @@
 #include <winternl.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -127,7 +128,7 @@ constexpr UINT kRunReady = WM_APP + 11;       // the app's window is up; lParam:
 constexpr UINT kGmsAccount = WM_APP + 12;     // lParam: new std::wstring (the signed-in account, or empty)
 constexpr UINT kUpdateChecked = WM_APP + 13;  // lParam: new UpdateCheck (the check, with its result)
 constexpr UINT kUpdateProgress = WM_APP + 14; // wParam: percent of Win.apk-Setup.exe downloaded
-constexpr UINT kUpdateDownloaded = WM_APP + 15;  // wParam: ok (complete and checked)
+constexpr UINT kUpdateDownloaded = WM_APP + 15;  // lParam: new UpdateFile (the installer, checked, or why not)
 constexpr UINT kSetupChanged = WM_APP + 16;   // the Downloads folder changed while the Google services setup is open
 constexpr UINT kSetupChecked = WM_APP + 17;   // lParam: new SetupCheck (winapk-runtime --verify-apk's answer)
 constexpr UINT_PTR kInfoBarTimer = 2;  // the InfoBar closes itself
@@ -1145,10 +1146,54 @@ constexpr wchar_t kRepo[] = L"https://f-droid.org/repo/";
 // In 100 ns units; f-droid.org publishes a few times a day.
 constexpr unsigned long long kCatalogMaxAge = 6ull * 3600 * 10000000;
 
+// Files under store\ are named from the index, which the network hands us: only these names reach a path or
+// a URL, so none can be absolute, a drive ("C:x"), a parent (".."), a stream ("x:y") or a device ("nul.x").
+bool ascii_letter(char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
+bool ascii_alnum(char c) { return ascii_letter(c) || (c >= '0' && c <= '9'); }
+
+// CON, PRN, AUX, NUL, COM0-9 and LPT0-9 name a device, not a file, and before Windows 11 they do so with any
+// extension ("con.x.png"): no name whose first part is one reaches a path.
+bool is_device_name(const std::string& s) {
+    const std::string first = s.substr(0, s.find('.'));
+    auto is = [&first](const char* d) { return _stricmp(first.c_str(), d) == 0; };
+    if (is("con") || is("prn") || is("aux") || is("nul")) return true;
+    if (first.size() != 4 || first[3] < '0' || first[3] > '9') return false;
+    return _strnicmp(first.c_str(), "com", 3) == 0 || _strnicmp(first.c_str(), "lpt", 3) == 0;
+}
+
+// Android's rule for a package (PackageParser.validateName), as the installer checks it, less device names.
+bool is_package_name(const std::string& s) {
+    if (s.size() > 255 || is_device_name(s)) return false;
+    size_t parts = 0;
+    for (size_t i = 0; i <= s.size();) {
+        const size_t dot = (std::min)(s.find('.', i), s.size());
+        if (dot == i || !ascii_letter(s[i])) return false;
+        for (size_t k = i + 1; k < dot; ++k) {
+            if (!ascii_alnum(s[k]) && s[k] != '_') return false;
+        }
+        ++parts;
+        i = dot + 1;
+    }
+    return parts >= 2;
+}
+
+// One plain name in the repository (an APK, an icon, a language): letters, digits, '.', '_' and '-', not
+// starting with a '.'.
+bool is_repo_file_name(const std::string& s) {
+    if (s.empty() || s.size() > 255 || s[0] == '.' || is_device_name(s)) return false;
+    for (const char c : s) {
+        if (!ascii_alnum(c) && c != '.' && c != '_' && c != '-') return false;
+    }
+    return true;
+}
+
 fs::path store_dir() { return data_dir() / L"store"; }
 fs::path catalog_file() { return store_dir() / L"catalog.tsv"; }
 fs::path catalog_etag_file() { return store_dir() / L"catalog.etag"; }
-fs::path store_icon_file(const std::string& pkg) { return store_dir() / L"icons" / (utf8_to_wide(pkg) + L".png"); }
+// Empty for a package that is not one.
+fs::path store_icon_file(const std::string& pkg) {
+    return is_package_name(pkg) ? store_dir() / L"icons" / (utf8_to_wide(pkg) + L".png") : fs::path();
+}
 fs::path downloads_dir() { return store_dir() / L"downloads"; }
 
 struct StoreApp {
@@ -1186,24 +1231,31 @@ HINTERNET http_session() {
 // whole. With an `etag` the server may answer 304, not modified. `progress`
 // gets the bytes so far and the total (0 when unknown); `headers` are more
 // request headers ("Name: value", CRLF between); `session` defaults to the
-// store's. Returns the HTTP status, 0 when the server could not be reached or
-// the body broke off.
+// store's. Only https is fetched, and with `host_ok` only from the hosts it
+// accepts, the one a redirect ends on included. Returns the HTTP status, 0
+// when the server could not be reached, the body broke off or the URL was
+// refused.
 int http_get(const std::wstring& url, const fs::path& out, const std::wstring& etag, std::wstring* new_etag,
              const std::function<void(uint64_t, uint64_t)>& progress, const std::wstring& headers = L"",
-             HINTERNET session = nullptr) {
-    URL_COMPONENTS uc{};
-    uc.dwStructSize = sizeof(uc);
-    uc.dwHostNameLength = uc.dwUrlPathLength = uc.dwExtraInfoLength = static_cast<DWORD>(-1);
-    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return 0;
-    const std::wstring host(uc.lpszHostName, uc.dwHostNameLength);
+             HINTERNET session = nullptr, bool (*host_ok)(const std::wstring&) = nullptr) {
+    // The https host of `u`, empty when it is not an https URL.
+    auto https_host = [](const wchar_t* u, URL_COMPONENTS* c) {
+        *c = URL_COMPONENTS{};
+        c->dwStructSize = sizeof(*c);
+        c->dwHostNameLength = c->dwUrlPathLength = c->dwExtraInfoLength = static_cast<DWORD>(-1);
+        if (!WinHttpCrackUrl(u, 0, 0, c) || c->nScheme != INTERNET_SCHEME_HTTPS) return std::wstring();
+        return std::wstring(c->lpszHostName, c->dwHostNameLength);
+    };
+    URL_COMPONENTS uc;
+    const std::wstring host = https_host(url.c_str(), &uc);
+    if (host.empty() || (host_ok && !host_ok(host))) return 0;
     const std::wstring path = std::wstring(uc.lpszUrlPath, uc.dwUrlPathLength) +
                               std::wstring(uc.lpszExtraInfo, uc.dwExtraInfoLength);
     if (!session) session = http_session();
     if (!session) return 0;
     HINTERNET connection = WinHttpConnect(session, host.c_str(), uc.nPort, 0);
     HINTERNET request = connection ? WinHttpOpenRequest(connection, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER,
-                                                        WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                                        uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0)
+                                                        WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)
                                    : nullptr;
     int status = 0;
     std::wstring header = etag.empty() ? L"" : L"If-None-Match: " + etag;
@@ -1216,6 +1268,16 @@ int http_get(const std::wstring& url, const fs::path& out, const std::wstring& e
         WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                             WINHTTP_HEADER_NAME_BY_INDEX, &code, &size, WINHTTP_NO_HEADER_INDEX);
         status = static_cast<int>(code);
+        // WinHTTP follows redirects on its own: the URL answered is where they ended.
+        DWORD url_size = 0;
+        WinHttpQueryOption(request, WINHTTP_OPTION_URL, nullptr, &url_size);
+        std::wstring final_url(url_size / sizeof(wchar_t), L'\0');
+        URL_COMPONENTS fc;
+        const std::wstring final_host =
+            url_size && WinHttpQueryOption(request, WINHTTP_OPTION_URL, final_url.data(), &url_size)
+                ? https_host(final_url.c_str(), &fc)
+                : std::wstring();
+        if (final_host.empty() || (host_ok && !host_ok(final_host))) status = 0;
         if (status == 200) {
             DWORD total = 0;
             size = sizeof(total);
@@ -1257,13 +1319,11 @@ int http_get(const std::wstring& url, const fs::path& out, const std::wstring& e
     return status;
 }
 
-// The file's SHA-256 in lower-case hex, as F-Droid's index gives it.
-std::string sha256_of(const fs::path& file) {
+// The SHA-256 of what is left to read of `f`, in lower-case hex as F-Droid's index gives it.
+std::string sha256_of_handle(HANDLE f) {
     std::string out;
     BCRYPT_ALG_HANDLE alg = nullptr;
     BCRYPT_HASH_HANDLE hash = nullptr;
-    HANDLE f = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
-                           nullptr);
     if (f != INVALID_HANDLE_VALUE &&
         BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0)) &&
         BCRYPT_SUCCESS(BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0))) {
@@ -1284,6 +1344,13 @@ std::string sha256_of(const fs::path& file) {
     }
     if (hash) BCryptDestroyHash(hash);
     if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    return out;
+}
+
+std::string sha256_of(const fs::path& file) {
+    HANDLE f = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+    const std::string out = sha256_of_handle(f);
     if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
     return out;
 }
@@ -1473,8 +1540,11 @@ void read_index_app(Json& j, IndexApp* a) {
     };
     pick(&a->name, false, {"en-US", "en", "en-GB"}, true);
     pick(&a->summary, true, {"en-US", "en", "en-GB"}, true);
-    if (!top_icon.empty()) a->icon = wide_to_utf8(kRepo) + "icons-240/" + top_icon;
-    else if (!any_icon.empty()) a->icon = wide_to_utf8(kRepo) + a->pkg + "/" + any_icon_lang + "/" + any_icon;
+    if (is_repo_file_name(top_icon)) {
+        a->icon = wide_to_utf8(kRepo) + "icons-240/" + top_icon;
+    } else if (is_package_name(a->pkg) && is_repo_file_name(any_icon_lang) && is_repo_file_name(any_icon)) {
+        a->icon = wide_to_utf8(kRepo) + a->pkg + "/" + any_icon_lang + "/" + any_icon;
+    }
 }
 
 // An APK entry; false when it cannot run here (no arm64-v8a code, where it has native code) or has no SHA-256.
@@ -1494,7 +1564,7 @@ bool read_index_apk(Json& j, IndexApk* apk) {
     apk->code = std::atoll(code.c_str());
     apk->size = std::atoll(size.c_str());
     const bool runs = abis.empty() || std::find(abis.begin(), abis.end(), "arm64-v8a") != abis.end();
-    return runs && hash_type == "sha256" && apk->sha256.size() == 64 && !apk->file.empty();
+    return runs && hash_type == "sha256" && apk->sha256.size() == 64 && is_repo_file_name(apk->file);
 }
 
 std::string tsv_field(std::string s) {
@@ -1543,7 +1613,7 @@ size_t convert_index(const fs::path& json_file, const fs::path& out) {
     size_t count = 0;
     for (const IndexApp& a : apps) {
         const auto it = apks.find(a.pkg);
-        if (a.pkg.empty() || a.name.empty() || it == apks.end() || it->second.empty()) continue;
+        if (!is_package_name(a.pkg) || a.name.empty() || it == apks.end() || it->second.empty()) continue;
         const long long suggested = std::atoll(a.suggested.c_str());
         const IndexApk* best = nullptr;
         for (int pass = 0; pass < 2 && !best; ++pass) {  // the suggested version or older, else any
@@ -1583,7 +1653,7 @@ std::vector<StoreApp> read_catalog() {
             if (tab == std::string::npos) break;
             from = tab + 1;
         }
-        if (v.size() != 12) continue;
+        if (v.size() != 12 || !is_package_name(v[0]) || !is_repo_file_name(v[4])) continue;
         StoreApp a;
         a.pkg = v[0];
         a.code = std::atoll(v[1].c_str());
@@ -1692,7 +1762,8 @@ DWORD WINAPI icon_thread(void*) {
         const auto [pkg, url] = g_icon_queue.back();
         g_icon_queue.pop_back();
         ReleaseSRWLockExclusive(&g_icon_lock);
-        const bool ok = http_get(utf8_to_wide(url), store_icon_file(pkg), L"", nullptr, {}) == 200;
+        const fs::path file = store_icon_file(pkg);
+        const bool ok = !file.empty() && http_get(utf8_to_wide(url), file, L"", nullptr, {}) == 200;
         PostMessageW(g_main, kStoreIcon, ok ? kIconSaved : kIconFailed, reinterpret_cast<LPARAM>(new std::string(pkg)));
     }
 }
@@ -1772,6 +1843,17 @@ fs::path setup_file(const std::wstring& v) {
 HINTERNET updater_session() {
     static const HINTERNET session = open_http_session(L"Win.apk-updater");
     return session;
+}
+
+// The hosts the update check and the installer come from: GitHub's API, a release's download URL and the
+// storage its redirect goes to. What runs as the installer is never taken from anywhere else.
+bool github_host(const std::wstring& host) {
+    static const wchar_t* const kHosts[] = {L"api.github.com", L"github.com", L"objects.githubusercontent.com",
+                                            L"release-assets.githubusercontent.com"};
+    for (const wchar_t* h : kHosts) {
+        if (_wcsicmp(host.c_str(), h) == 0) return true;
+    }
+    return false;
 }
 
 // 0.2.0 of "v0.2.0-preview": the numbers before any -suffix or +build.
@@ -1859,6 +1941,19 @@ struct Release {
     uint64_t size = 0;                       // the asset's bytes
     FILETIME published{};
 };
+
+// The installer's SHA-256 in lower-case hex, from the asset's digest; empty when GitHub gave none, and then
+// the installer is not run.
+std::string setup_sha256(const Release& r) {
+    constexpr size_t kPrefix = sizeof("sha256:") - 1;
+    if (r.digest.size() != kPrefix + 64 || r.digest.compare(0, kPrefix, "sha256:") != 0) return {};
+    std::string hex = r.digest.substr(kPrefix);
+    for (char& c : hex) {
+        if (!std::isxdigit(static_cast<unsigned char>(c))) return {};
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return hex;
+}
 
 // "2026-10-01T12:00:00Z" as a FILETIME; zero when it is not one.
 FILETIME iso_filetime(const std::string& s) {
@@ -1957,7 +2052,7 @@ DWORD WINAPI update_check_thread(void* param) {
             etag = utf8_to_wide(s);
         }
         const int status = http_get(kReleasesUrl, releases_file(), etag, &new_etag, {},
-                                    L"Accept: application/vnd.github+json", updater_session());
+                                    L"Accept: application/vnd.github+json", updater_session(), github_host);
         if (status == 200) {
             std::ofstream(releases_etag_file(), std::ios::binary | std::ios::trunc) << wide_to_utf8(new_etag);
         }
@@ -1974,8 +2069,48 @@ DWORD WINAPI update_check_thread(void* param) {
     return 0;
 }
 
-// Downloads the release's Win.apk-Setup.exe to updates\, and keeps it only when it is whole: the size GitHub
-// gives, and its SHA-256 when GitHub gives that too.
+// What an update thread reports in kUpdateDownloaded. `file` is the installer opened without sharing writing and
+// hashed through that same handle: the UI thread runs the installer while it is still open, so the file run is
+// the file checked. The receiver owns the handle.
+struct UpdateFile {
+    enum Result { kReady, kNotDownloaded, kNotOpened, kBadChecksum };
+    Result result = kNotDownloaded;
+    fs::path path;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    ~UpdateFile() {
+        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    }
+};
+
+// `present`: the file was fully downloaded (or kept) and is worth opening. A file that is whole but does not
+// match its checksum is removed; one that cannot be opened is left, since it may only be in use.
+std::unique_ptr<UpdateFile> verify_setup(const fs::path& path, const std::string& want, bool present) {
+    auto u = std::make_unique<UpdateFile>();
+    u->path = path;
+    if (!present) return u;
+    u->result = UpdateFile::kNotOpened;
+    u->file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                          FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (u->file == INVALID_HANDLE_VALUE) return u;
+    if (want.empty() || sha256_of_handle(u->file) != want) {
+        CloseHandle(u->file);
+        u->file = INVALID_HANDLE_VALUE;
+        std::error_code ec;
+        fs::remove(path, ec);
+        u->result = UpdateFile::kBadChecksum;
+        return u;
+    }
+    u->result = UpdateFile::kReady;
+    return u;
+}
+
+void post_update_file(std::unique_ptr<UpdateFile> u) {
+    UpdateFile* raw = u.release();
+    if (!PostMessageW(g_main, kUpdateDownloaded, 0, reinterpret_cast<LPARAM>(raw))) delete raw;  // closes its handle
+}
+
+// Downloads the release's Win.apk-Setup.exe to updates\, and keeps it only when it is whole: the size and the
+// SHA-256 GitHub gives. start_update asks only for a release that gives both.
 DWORD WINAPI update_download_thread(void* param) {
     std::unique_ptr<Release> r(static_cast<Release*>(param));
     int shown = -1;
@@ -1986,12 +2121,18 @@ DWORD WINAPI update_download_thread(void* param) {
         if (pct == shown) return;
         shown = pct;
         PostMessageW(g_main, kUpdateProgress, static_cast<WPARAM>(pct), 0);
-    }, L"", updater_session());
+    }, L"", updater_session(), github_host);
     std::error_code ec;
-    bool ok = status == 200 && r->size > 0 && fs::file_size(file, ec) == r->size && !ec;
-    if (ok && r->digest.rfind("sha256:", 0) == 0) ok = "sha256:" + sha256_of(file) == r->digest;
-    if (!ok) fs::remove(file, ec);
-    PostMessageW(g_main, kUpdateDownloaded, ok, 0);
+    const bool whole = status == 200 && r->size > 0 && fs::file_size(file, ec) == r->size && !ec;
+    if (!whole) fs::remove(file, ec);
+    post_update_file(verify_setup(file, setup_sha256(*r), whole));
+    return 0;
+}
+
+// Checks an installer already on disk (one kept from an earlier "Update") off the UI thread, the same way.
+DWORD WINAPI update_verify_thread(void* param) {
+    std::unique_ptr<Release> r(static_cast<Release*>(param));
+    post_update_file(verify_setup(setup_file(r->version), setup_sha256(*r), true));
     return 0;
 }
 
@@ -4057,15 +4198,24 @@ void remove_app_files(const std::wstring& name) {
 
 // What the app saved, as Android's "Clear storage" and uninstall take it: its data folder
 // (android\data\data\<package>, and the <package>_<version> folders older runs made) and its folders
-// in shared storage (Android\data and Android\obb).
-void remove_app_data(const std::string& pkg) {
+// in shared storage (Android\data and Android\obb). `others` are the packages still in the library: '_'
+// is legal in a package name, so a <package>_ folder that is one of theirs (com.foo_bar next to
+// com.foo) is not this app's.
+void remove_app_data(const std::string& pkg, const std::vector<std::string>& others) {
     if (pkg.empty() || pkg.find_first_of("/\\:") != std::string::npos || pkg == "." || pkg == "..") return;
     const std::wstring p = utf8_to_wide(pkg);
     const fs::path android = data_dir() / L"android";
     remove_tree(android / L"data" / L"data" / p);
     std::error_code ec;
     for (const auto& e : fs::directory_iterator(android / L"data" / L"data", ec)) {
-        if (e.path().filename().wstring().rfind(p + L"_", 0) == 0) remove_tree(e.path());
+        const std::wstring folder = e.path().filename().wstring();
+        if (folder.rfind(p + L"_", 0) != 0) continue;
+        bool theirs = false;
+        for (const std::string& o : others) {
+            const std::wstring ow = utf8_to_wide(o);
+            theirs = theirs || (ow.size() > p.size() && ow.rfind(p + L"_", 0) == 0 && folder.rfind(ow, 0) == 0);
+        }
+        if (!theirs) remove_tree(e.path());
     }
     remove_tree(android / L"sdcard" / L"Android" / L"data" / p);
     remove_tree(android / L"sdcard" / L"Android" / L"obb" / p);
@@ -4102,12 +4252,14 @@ bool remove_app(const App& app, bool ask, bool with_data = false) {
     const std::vector<std::string> pkg = package_of(copy.name);
     if (!pkg.empty()) {
         bool other = false;
+        std::vector<std::string> others;
         for (const App& a : library()) {
             const std::vector<std::string> p = a.name == copy.name ? std::vector<std::string>{} : package_of(a.name);
             other = other || (!p.empty() && p[0] == pkg[0]);
+            if (!p.empty()) others.push_back(p[0]);
         }
         if (!other) appops_forget(pkg[0]);
-        if (!other && with_data) remove_app_data(pkg[0]);
+        if (!other && with_data) remove_app_data(pkg[0], others);
     }
     remove_app_shortcuts(copy);
     fs::remove(copy.apk, ec);
@@ -4151,6 +4303,7 @@ void store_start(bool force) {
 void store_get(const StoreApp& a) {
     const Offer offer = offer_for(a);
     if (offer != kOfferInstall && offer != kOfferUpdate) return;
+    if (!is_package_name(a.pkg) || !is_repo_file_name(a.apk)) return;
     g_store.downloads[a.pkg] = -1;
     CloseHandle(CreateThread(nullptr, 0, download_thread,
                              new Download{a.pkg, a.sha256, std::wstring(kRepo) + utf8_to_wide(a.apk), a.name,
@@ -4895,24 +5048,42 @@ std::vector<std::wstring> google_accounts() {
     return out;
 }
 
-// The toolbar's account: none without the marker; else the first account, asked on a thread
-// (a JVM start) and posted to the library's window.
+// The signed-in accounts, as last asked. Asking starts a JVM, so it runs on a thread and the Settings
+// page and the toolbar read this copy; they never ask themselves. Without the marker the answer is known: none.
+std::vector<std::wstring> g_accounts;
+bool g_accounts_known = false;  // g_accounts holds an answer (a refresh may still be under way)
+bool g_accounts_busy = false;   // a query is in flight
+bool g_accounts_again = false;  // the accounts changed while it ran: ask once more
+
 DWORD WINAPI account_thread(void*) {
-    const std::vector<std::wstring> accounts = google_accounts();
-    auto* out = new std::wstring(accounts.empty() ? L"" : accounts[0]);
+    auto* out = new std::vector<std::wstring>(google_accounts());
     if (!PostMessageW(g_main, kGmsAccount, 0, reinterpret_cast<LPARAM>(out))) delete out;
     return 0;
 }
 
 void refresh_account() {
     if (!google_account_present()) {
+        g_accounts.clear();
+        g_accounts_known = true;
         g_account.clear();
         g_account_photo_key.clear();
         if (g_main) InvalidateRect(g_main, nullptr, FALSE);
+        if (g_view == kSettingsView) rebuild_page();
         return;
     }
+    if (g_accounts_busy) {
+        g_accounts_again = true;
+        return;
+    }
+    g_accounts_busy = true;
     HANDLE t = CreateThread(nullptr, 0, account_thread, nullptr, 0, nullptr);
-    if (t) CloseHandle(t);
+    if (t) {
+        CloseHandle(t);
+    } else {
+        // No query will answer: show the last answer (or none) rather than "Checking…"; the next activation asks.
+        g_accounts_busy = false;
+        g_accounts_known = true;
+    }
 }
 
 // The sign-in window is the runtime's (--gms signin-window: Google's own
@@ -4945,6 +5116,10 @@ void google_signout(const std::wstring& account) {
     }
     std::wstring text;
     if (run_gms(L"signout " + gms_arg(account), &text) == 0) {
+        // Gone at once, so its Sign out button doesn't outlive it while the query below starts a JVM.
+        g_accounts.erase(std::remove(g_accounts.begin(), g_accounts.end(), account), g_accounts.end());
+        g_account = g_accounts.empty() ? L"" : g_accounts[0];
+        g_account_photo_key.clear();
         info(fmt(L"Signed out of {0}.", {account}), kInfo);
         refresh_account();
     } else {
@@ -4960,9 +5135,10 @@ Section google_account_section() {
     if (g_gms_busy) {
         sec.rows.push_back(text_row(L"Google account", L"Signing in…",
                                     L"Complete the sign-in in the Google window, or close it to cancel."));
+    } else if (!g_accounts_known) {
+        sec.rows.push_back(text_row(L"Google account", L"Checking…", L""));
     } else {
-        const std::vector<std::wstring> accounts = google_accounts();
-        g_account = accounts.empty() ? L"" : accounts[0];
+        const std::vector<std::wstring> accounts = g_accounts;
         for (const std::wstring& a : accounts) {
             sec.rows.push_back(button_row(a, L"", L"Sign out", [a] { google_signout(a); }, true));
         }
@@ -5587,11 +5763,13 @@ bool update_can_start() {
 
 // Runs the downloaded installer and closes the library, so that the installer can replace Win.apk.exe; false
 // when it did not start.
-bool run_installer() {
+bool run_installer(UpdateFile& u) {
     if (!update_can_start()) return false;
-    const fs::path setup = setup_file(g_update.latest().version);
-    const auto r = reinterpret_cast<INT_PTR>(ShellExecuteW(g_main, L"open", setup.c_str(), nullptr, nullptr,
+    // u.file, held open since it was hashed, closes when u does: after the installer has started.
+    const auto r = reinterpret_cast<INT_PTR>(ShellExecuteW(g_main, L"open", u.path.c_str(), nullptr, nullptr,
                                                            SW_SHOWNORMAL));
+    CloseHandle(u.file);
+    u.file = INVALID_HANDLE_VALUE;
     if (r <= 32) {
         info(L"The installer could not be started.", kError);
         return false;
@@ -5612,28 +5790,48 @@ void start_update() {
                       SW_SHOWNORMAL);
         return;
     }
-    if (!update_can_start()) return;
-    std::error_code ec;
-    if (fs::file_size(setup_file(r.version), ec) == r.size && !ec) {  // downloaded and checked before
-        run_installer();
+    if (setup_sha256(r).empty()) {  // nothing to check the installer against, so it is not run
+        info(L"This update can't be verified: its release gives no checksum for the installer.", kError,
+             L"Open release page", [page = r.page.empty() ? std::wstring(kReleasesPage) : r.page] {
+                 ShellExecuteW(nullptr, L"open", page.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+             });
         return;
     }
-    remove_old_setups();
-    fs::create_directories(updates_dir(), ec);
+    if (!update_can_start()) return;
+    std::error_code ec;
+    const bool kept = fs::file_size(setup_file(r.version), ec) == r.size && !ec;  // downloaded before
+    if (!kept) {
+        remove_old_setups();
+        fs::create_directories(updates_dir(), ec);
+    }
     auto* job = new Release(r);
-    if (HANDLE t = CreateThread(nullptr, 0, update_download_thread, job, 0, nullptr)) {
+    if (HANDLE t = CreateThread(nullptr, 0, kept ? update_verify_thread : update_download_thread, job, 0, nullptr)) {
         CloseHandle(t);
+        // The checking of a kept file holds the Update button as a download does, at its last step.
         g_update.begin_download();
-        info(fmt(L"Downloading Win.apk {0}…", {r.version}), kInfo);
+        if (kept) g_update.progress(99);
+        else info(fmt(L"Downloading Win.apk {0}…", {r.version}), kInfo);
     } else {
         delete job;
     }
 }
 
-void update_downloaded(bool ok) {
+void update_downloaded(std::unique_ptr<UpdateFile> u) {
     g_update.downloaded();
-    if (ok && run_installer()) return;  // the library is gone
-    if (!ok) info(L"Couldn't download the update. Check the internet connection.", kError);
+    if (u->result == UpdateFile::kReady && run_installer(*u)) return;  // the library is gone
+    switch (u->result) {
+        case UpdateFile::kNotDownloaded:
+            info(L"Couldn't download the update. Check the internet connection.", kError);
+            break;
+        case UpdateFile::kNotOpened:
+            info(L"Couldn't open the downloaded update. Close any program using it, then try again.", kError);
+            break;
+        case UpdateFile::kBadChecksum:
+            info(L"The downloaded update didn't match its checksum and was removed. Try again.", kError);
+            break;
+        case UpdateFile::kReady:
+            break;  // run_installer said why it did not start
+    }
     if (g_view == kSettingsView) rebuild_page();
 }
 
@@ -8101,7 +8299,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case kUpdateProgress: update_progress(static_cast<int>(wp)); return 0;
-        case kUpdateDownloaded: update_downloaded(wp != 0); return 0;
+        case kUpdateDownloaded:
+            update_downloaded(std::unique_ptr<UpdateFile>(reinterpret_cast<UpdateFile*>(lp)));
+            return 0;
         case WM_GETMINMAXINFO:
             reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = {ipx(680), ipx(520)};
             return 0;
@@ -8125,10 +8325,19 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp && google_account_present() != !g_account.empty()) refresh_account();
             break;
         case kGmsAccount: {
-            std::unique_ptr<std::wstring> account(reinterpret_cast<std::wstring*>(lp));
-            g_account = *account;
+            std::unique_ptr<std::vector<std::wstring>> accounts(reinterpret_cast<std::vector<std::wstring>*>(lp));
+            g_accounts_busy = false;
+            if (g_accounts_again) {
+                g_accounts_again = false;
+                refresh_account();  // this answer predates a sign-in or sign-out
+                return 0;
+            }
+            g_accounts = *accounts;
+            g_accounts_known = true;
+            g_account = g_accounts.empty() ? L"" : g_accounts[0];
             g_account_photo_key.clear();  // a sign-in or sign-out may have changed the picture
             InvalidateRect(hwnd, nullptr, FALSE);
+            if (g_view == kSettingsView) rebuild_page();
             return 0;
         }
         case WM_ACTIVATE:  // back to the window: the keyboard goes to Google Play when it is the view
@@ -9101,7 +9310,7 @@ bool stop_library_app(const std::wstring& name) {
     return stopped;
 }
 
-// The app asking: our parent must be a winapk-runtime.exe that started before
+// The app asking: our parent must be our bin\winapk-runtime.exe that started before
 // us (not a reused process id), and its --apk a library app whose package has
 // one registry row. Nothing the app passes in its arguments is believed.
 bool resolve(Caller* c, std::string* why) {
@@ -9118,10 +9327,13 @@ bool resolve(Caller* c, std::string* why) {
         *why = "the parent process cannot be opened";
         return false;
     }
+    // The parent must be our own runtime by full path: any same-user program can be named
+    // winapk-runtime.exe and pass the library's Play Store APK as its --apk.
     wchar_t image[MAX_PATH * 2];
     DWORD len = MAX_PATH * 2;
+    std::error_code image_ec;
     const bool named = QueryFullProcessImageNameW(p, 0, image, &len) &&
-                       _wcsicmp(fs::path(image).filename().c_str(), L"winapk-runtime.exe") == 0;
+                       fs::equivalent(fs::path(image, image + len), runtime_exe(), image_ec) && !image_ec;
     FILETIME pc{}, sc{}, x1, x2, x3;
     const bool older = GetProcessTimes(p, &pc, &x1, &x2, &x3) &&
                        GetProcessTimes(GetCurrentProcess(), &sc, &x1, &x2, &x3) && CompareFileTime(&pc, &sc) <= 0;

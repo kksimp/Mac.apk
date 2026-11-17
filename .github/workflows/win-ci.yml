@@ -79,6 +79,8 @@ jobs:
           [[ "${{ github.event_name }}" == workflow_dispatch && "${{ inputs.full_sweep }}" == true ]] && full_sweep=true
           printf 'build=%s\ntests=%s\npackage=%s\nfull_sweep=%s\n' \
             "$build" "$tests" "$package" "$full_sweep" | tee -a "$GITHUB_OUTPUT"
+      - name: Check the runtime overlay against upstream
+        run: windows/scripts/check_overlay.sh
 
   guest:
     name: Guest libraries (arm64)
@@ -239,6 +241,7 @@ jobs:
       - name: Run the host-only tests
         run: |
           ./build/winapk-applink-test.exe
+          ./build/winapk-host-url-test.exe
           mkdir -p cds-scratch && ./build/winapk-cds-test.exe "$(cygpath -w "$PWD/cds-scratch")"
           ./build/winapk-paths-test.exe
           ./build/winapk-audio-test.exe "$(cygpath -w "$PWD/windows/test/audio")"
@@ -509,6 +512,7 @@ jobs:
           python windows/test/compat/sweep.py --runtime stage `
             --apks apk-cache --out smoke --frames 150 --timeout 180 `
             --only-from windows/test/compat/smoke.txt --skip dev.lonami.klooni --require-drew
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python windows/scripts/merge_classlists.py framework.classlist (Get-ChildItem classlists/*.classlist)
       - name: An app whose library uses x18 ends and says why
         shell: pwsh

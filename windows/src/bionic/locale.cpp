@@ -464,8 +464,8 @@ WINAPK_GUEST_ABI double g_wcstod(const wchar32* s, wchar32** e) {
 WINAPK_GUEST_ABI float g_wcstof(const wchar32* s, wchar32** e) {
     return wide_number<float>(s, e, [](const char* n, char** x) { return std::strtof(n, x); });
 }
-// A guest long double is binary128 in xmm0 / q0, not the host's (strtold, string.cpp): returned as the host's it
-// was x87's st0 on x64 and a double in d0 on arm64, neither of which the caller reads.
+// A guest long double is binary128 in q0, not the host's (strtold, string.cpp): returned as the host's it
+// would be a double in d0, which the caller does not read.
 WINAPK_GUEST_ABI GuestQuad g_wcstold(const wchar32* s, wchar32** e) {
     return ld_to_quad(wide_number<long double>(s, e, [](const char* n, char** x) { return std::strtold(n, x); }));
 }

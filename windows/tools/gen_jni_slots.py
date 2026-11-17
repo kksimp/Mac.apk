@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """gen_jni_slots.py -- generate windows/src/jni_slots.inc from a JDK's jni.h.
 
-The guest JNIEnv table (windows/src/guest_jni.cpp) needs one System V entry per
+The guest JNIEnv table (windows/src/guest_jni.cpp) needs one guest-ABI entry per
 JNINativeInterface_ slot, in table order. Writing ~230 names by hand invites
 typos, so the list is generated from the spec header and checked in:
 

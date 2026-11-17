@@ -25,10 +25,23 @@ namespace winapk {
 namespace {
 
 // ---- memory ---------------------------------------------------------------
-// Bionic and the UCRT both return 16-byte aligned blocks on x86_64, which is
-// what guest code compiled for Android assumes.
-WINAPK_GUEST_ABI void* g_malloc(size_t n) { return std::malloc(n); }
-WINAPK_GUEST_ABI void* g_calloc(size_t n, size_t sz) { return std::calloc(n, sz); }
+// Bionic and the UCRT both return 16-byte aligned blocks on arm64, which is
+// what guest code compiled for Android assumes. A failed allocation sets the
+// guest's errno: the UCRT sets only its own.
+void* out_of_memory() {
+    *bionic::guest_errno() = bionic::kENOMEM;
+    return nullptr;
+}
+
+WINAPK_GUEST_ABI void* g_malloc(size_t n) {
+    void* p = std::malloc(n);
+    return p ? p : out_of_memory();
+}
+// The UCRT's calloc refuses an n * sz that overflows.
+WINAPK_GUEST_ABI void* g_calloc(size_t n, size_t sz) {
+    void* p = std::calloc(n, sz);
+    return p || n == 0 || sz == 0 ? p : out_of_memory();
+}
 
 // Over-aligned blocks (posix_memalign / memalign / aligned_alloc above 16).
 // The guest frees them with plain free(), so each is carved out of a larger
@@ -42,8 +55,10 @@ std::mutex g_aligned_lock;
 std::unordered_map<void*, AlignedBlock> g_aligned;
 std::atomic<size_t> g_aligned_count{0};
 
+// Null when out of memory; the caller reports it (posix_memalign returns it, the rest set errno).
 void* aligned_block(size_t align, size_t n) {
     if (align <= 16) return std::malloc(n ? n : 1);
+    if (n > SIZE_MAX - align) return nullptr;
     void* base = std::malloc(n + align);
     if (!base) return nullptr;
     // Strictly above base, so an aligned pointer is never a plain block.
@@ -83,11 +98,20 @@ WINAPK_GUEST_ABI void* g_realloc(void* p, size_t n) {
     AlignedBlock b;
     if (p && take_aligned(p, &b)) {
         void* q = std::malloc(n ? n : 1);
-        if (q) std::memcpy(q, p, b.size < n ? b.size : n);
+        if (!q) {
+            // The old block stays the caller's, as C requires.
+            std::lock_guard<std::mutex> hold(g_aligned_lock);
+            g_aligned[p] = b;
+            g_aligned_count.fetch_add(1, std::memory_order_relaxed);
+            return out_of_memory();
+        }
+        std::memcpy(q, p, b.size < n ? b.size : n);
         std::free(b.base);
         return q;
     }
-    return std::realloc(p, n);
+    // realloc(p, 0) frees p and returns null: not a failure.
+    void* q = std::realloc(p, n);
+    return q || n == 0 ? q : out_of_memory();
 }
 WINAPK_GUEST_ABI void g_free(void* p) {
     AlignedBlock b;
@@ -110,16 +134,24 @@ WINAPK_GUEST_ABI int g_posix_memalign(void** out, size_t align, size_t n) {
 }
 WINAPK_GUEST_ABI void* g_memalign(size_t align, size_t n) {
     if (!valid_alignment(align)) {
+        // No power of two above SIZE_MAX / 2 fits in a size_t.
+        if (align > SIZE_MAX / 2 + 1) return out_of_memory();
         size_t a = 16;
         while (a < align) a <<= 1;
         align = a;
     }
-    return aligned_block(align, n);
+    void* p = aligned_block(align, n);
+    return p ? p : out_of_memory();
 }
 WINAPK_GUEST_ABI void* g_aligned_alloc(size_t align, size_t n) {
-    return valid_alignment(align) ? aligned_block(align, n) : nullptr;
+    if (!valid_alignment(align)) return nullptr;
+    void* p = aligned_block(align, n);
+    return p ? p : out_of_memory();
 }
-WINAPK_GUEST_ABI void* g_valloc(size_t n) { return aligned_block(4096, n); }
+WINAPK_GUEST_ABI void* g_valloc(size_t n) {
+    void* p = aligned_block(4096, n);
+    return p ? p : out_of_memory();
+}
 
 // ---- string / memory routines --------------------------------------------
 WINAPK_GUEST_ABI void* g_memcpy(void* d, const void* s, size_t n) { return std::memcpy(d, s, n); }
@@ -254,9 +286,8 @@ WINAPK_GUEST_ABI void g_operator_delete_extra(void* p, size_t) { g_free(p); }  /
 }
 
 // ---- assert ---------------------------------------------------------------------
-// Bionic's assert() calls these, which never return. A stub that returned 0
-// let the code run on past the failed check, into a crash with no message
-// (ChatGPT's libopenai_xplat_export.so); now the check's message is in the log.
+// Bionic's assert() calls these, which never return; a stub that returned would
+// run on past the failed check into a crash with no message.
 [[noreturn]] WINAPK_GUEST_ABI void g_assert2(const char* file, int line, const char* function, const char* failed) {
     std::fprintf(stderr, "[win.apk] guest assertion failed: %s:%d: %s: %s\n", file ? file : "?", line,
                  function ? function : "?", failed ? failed : "?");

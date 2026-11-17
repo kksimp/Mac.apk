@@ -61,7 +61,7 @@ struct MissingTag {
     std::atomic<bool> reported{false};  // two threads may meet in the same stub
 };
 
-// Called (Microsoft x64, from the tagged stub) by the guest; see
+// Called (Windows ARM64, from the tagged stub) by the guest; see
 // make_tagged_zero_stub. The guest gets 0.
 void report_missing(void*, const void* tag) {
     auto* t = static_cast<MissingTag*>(const_cast<void*>(tag));

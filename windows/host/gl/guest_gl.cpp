@@ -2,7 +2,7 @@
 // native code, on ANGLE.
 //
 // Most functions are plain: guest_gl.inc (tools/gen_gl_stubs.py) wraps each
-// forwarder of gl_stubs.inc in a System V function. The ones here differ from
+// forwarder of gl_stubs.inc in a guest-ABI function. The ones here differ from
 // upstream's straight dlsym into ANGLE because Windows has no layer to render
 // a window surface into:
 //
@@ -16,8 +16,8 @@
 //   * eglChooseConfig asks for pbuffer configs instead of window ones and drops
 //     the Android-only attributes ANGLE rejects (upstream drops
 //     EGL_RECORDABLE_ANDROID too);
-//   * eglGetProcAddress answers with the System V functions, and the debug
-//     callback, which ANGLE would call with the Microsoft convention, is not
+//   * eglGetProcAddress answers with the guest-ABI functions, and the debug
+//     callback, which ANGLE would call with the Windows ARM64 convention, is not
 //     installed.
 
 #include <cstdio>
@@ -401,7 +401,7 @@ const std::unordered_map<std::string, void*>& symbols() {
     return m;
 }
 
-// Only functions with a System V wrapper can be handed out; anything else is
+// Only functions with a guest-ABI wrapper can be handed out; anything else is
 // "not supported", which EGL allows.
 WINAPK_GUEST_ABI __eglMustCastToProperFunctionPointerType guest_eglGetProcAddress(const char* name) {
     if (!name) return nullptr;

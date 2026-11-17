@@ -712,8 +712,10 @@ WINAPK_GUEST_ABI int g_select(int nfds, GuestFdSet* rd, GuestFdSet* wr, GuestFdS
     }
     const GuestFdSet in_rd = rd ? *rd : GuestFdSet{}, in_wr = wr ? *wr : GuestFdSet{}, in_ex = ex ? *ex : GuestFdSet{};
     const int ms = tv ? static_cast<int>(tv->tv_sec * 1000 + tv->tv_usec / 1000) : -1;
-    return wait_ready(ms, [&](WaitPlan* plan) {
-        GuestFdSet out_rd{}, out_wr{}, out_ex{};
+    const uint64_t start = now_ms();
+    GuestFdSet out_rd{}, out_wr{}, out_ex{};
+    const int ready = wait_ready(ms, [&](WaitPlan* plan) {
+        out_rd = out_wr = out_ex = GuestFdSet{};
         int n = 0;
         for (int fd = 0; fd < nfds; ++fd) {
             short want = 0;
@@ -729,13 +731,20 @@ WINAPK_GUEST_ABI int g_select(int nfds, GuestFdSet* rd, GuestFdSet* wr, GuestFdS
             // Hung up, in a set that does not report it: nothing to sleep on.
             if (r && n == before) plan->spin = true;
         }
-        if (n > 0) {
-            if (rd) *rd = out_rd;
-            if (wr) *wr = out_wr;
-            if (ex) *ex = out_ex;
-        }
         return n;
     });
+    // As Linux's: the sets keep only the ready descriptors (none after a
+    // timeout), and *tv is left with the time not slept.
+    if (rd) *rd = out_rd;
+    if (wr) *wr = out_wr;
+    if (ex) *ex = out_ex;
+    if (tv) {
+        const int64_t slept_us = static_cast<int64_t>(now_ms() - start) * 1000;
+        const int64_t asked_us = tv->tv_sec * 1000000 + tv->tv_usec;
+        const int64_t left = ready > 0 && slept_us < asked_us ? asked_us - slept_us : 0;
+        *tv = {left / 1000000, left % 1000000};
+    }
+    return ready;
 }
 WINAPK_GUEST_ABI int g_pselect(int nfds, GuestFdSet* rd, GuestFdSet* wr, GuestFdSet* ex, const GuestTimespec* ts,
                                const void*) {

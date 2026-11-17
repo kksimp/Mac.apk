@@ -450,8 +450,35 @@ bool app_overrides(View* v, const std::wstring& url, bool redirect, bool gesture
     std::wstring flags = L"main";
     if (redirect) flags += L",redirect";
     if (gesture) flags += L",gesture";
-    post_event(v->id, EV_SHOULD_OVERRIDE, guest_url(v, url), L"GET", flags, id);
-    const DWORD r = WaitForSingleObject(done, kDecisionWaitMs);
+    const int view = v->id;
+    post_event(view, EV_SHOULD_OVERRIDE, guest_url(v, url), L"GET", flags, id);
+    // This is the WebView2 thread, which the app's own calls from inside the
+    // callback (CookieManager.getCookie, ...) post to and wait on: keep
+    // dispatching its messages and queued work while waiting, or they time out.
+    DWORD r = WAIT_TIMEOUT;
+    const ULONGLONG deadline = GetTickCount64() + kDecisionWaitMs;
+    bool quitting = false;
+    while (!quitting) {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) break;
+        r = MsgWaitForMultipleObjects(1, &done, FALSE, static_cast<DWORD>(deadline - now), QS_ALLINPUT);
+        if (r != WAIT_OBJECT_0 + 1) break;
+        MSG m;
+        while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+            if (m.message == WM_QUIT) {
+                // Re-posted so the thread's main loop still ends; a pending quit makes the
+                // wait return at once, so stop waiting rather than spin until the deadline.
+                PostQuitMessage(static_cast<int>(m.wParam));
+                quitting = true;
+                break;
+            }
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+    // A nested navigation's own wait can outlast this one's deadline, and the app
+    // may have answered this decision meanwhile.
+    if (r != WAIT_OBJECT_0 && WaitForSingleObject(done, 0) == WAIT_OBJECT_0) r = WAIT_OBJECT_0;
     bool allow = true;
     {
         std::lock_guard<std::mutex> hold(g_decisions_lock);
@@ -461,7 +488,7 @@ bool app_overrides(View* v, const std::wstring& url, bool redirect, bool gesture
     CloseHandle(done);
     if (r != WAIT_OBJECT_0) {
         std::fprintf(stderr, "[win.apk] webview %d: no shouldOverrideUrlLoading answer in %lu ms; loading %s\n",
-                     v->id, kDecisionWaitMs, wv2::redact(url).c_str());
+                     view, kDecisionWaitMs, wv2::redact(url).c_str());
         return false;
     }
     return !allow;
@@ -734,6 +761,9 @@ void hook(View* v) {
                     ask = false;
                 }
                 if (ask && app_overrides(v, uri, redirected == TRUE, user == TRUE)) {
+                    // The wait dispatches other work, which may have destroyed the view.
+                    v = find_view(id);
+                    if (!v) return S_OK;
                     v->refused.push_back(uri);
                     if (v->refused.size() > 8) v->refused.erase(v->refused.begin());
                     a->put_Cancel(TRUE);

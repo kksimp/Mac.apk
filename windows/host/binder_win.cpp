@@ -575,8 +575,15 @@ DWORD WINAPI serve_connection(void* param) {
         reply.head.status = kFailedTransaction;
         std::vector<HANDLE> sent;
         if (r) {
-            auto st = static_cast<jintArray>(env->GetObjectArrayElement(r, 0));
-            std::vector<int32_t> sv = from_java(env, st);
+            // This thread stays attached for the whole connection and never
+            // returns to Java, so every local ref made here must be freed here.
+            auto int_element = [&](jsize i) {
+                auto a = static_cast<jintArray>(env->GetObjectArrayElement(r, i));
+                std::vector<int32_t> v = from_java(env, a);
+                if (a) env->DeleteLocalRef(a);
+                return v;
+            };
+            std::vector<int32_t> sv = int_element(0);
             if (!sv.empty()) reply.head.status = sv[0];
             auto d = static_cast<jbyteArray>(env->GetObjectArrayElement(r, 1));
             if (d) {
@@ -584,10 +591,11 @@ DWORD WINAPI serve_connection(void* param) {
                 if (!reply.data.empty())
                     env->GetByteArrayRegion(d, 0, static_cast<jsize>(reply.data.size()),
                                             reinterpret_cast<jbyte*>(reply.data.data()));
+                env->DeleteLocalRef(d);
             }
-            reply.offsets = from_java(env, static_cast<jintArray>(env->GetObjectArrayElement(r, 2)));
-            std::vector<int32_t> rp = from_java(env, static_cast<jintArray>(env->GetObjectArrayElement(r, 3)));
-            std::vector<int32_t> rk = from_java(env, static_cast<jintArray>(env->GetObjectArrayElement(r, 4)));
+            reply.offsets = int_element(2);
+            std::vector<int32_t> rp = int_element(3);
+            std::vector<int32_t> rk = int_element(4);
             if (rp.size() != rk.size() || !outgoing_objects(rp, rk, client, &reply.objects, &sent)) {
                 recall(client, sent);
                 sent.clear();

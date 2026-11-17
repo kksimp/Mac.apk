@@ -1,9 +1,9 @@
 // thunk_test.cpp -- exercises the runtime ABI thunks (windows/src/abi_thunk.cpp)
 // without a JVM: a native-method thunk forwarding a long argument list to a
-// System V target, a variadic entry stub feeding a va_list decoder, and the
+// guest-ABI target, a variadic entry stub feeding a va_list decoder, and the
 // tagged zero stub that stands in for unimplemented host natives.
 //
-// Built for Windows x64 and run under Wine in CI; it is standalone so the
+// Built for Windows ARM64; it is standalone so the
 // machine-code emitter can be validated before the JNIEnv table is built on
 // top of it.
 
@@ -37,7 +37,7 @@ void* env_xlate(void* host) {
     return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(host) == kHostEnv ? kGuestEnv : 0);
 }
 
-// The System V native method the thunk forwards to. The argument list mixes
+// The guest-ABI native method the thunk forwards to. The argument list mixes
 // integer and SSE classes and overflows both into the stack, and includes a
 // narrow (jshort-like) argument to check sign extension.
 WINAPK_GUEST_ABI long long native_target(void* env, void* obj, int a, double b, long long c,
@@ -125,7 +125,7 @@ void test_tagged_zero_stub() {
     static const char kTag[] = "pkg/Cls.method(I)D";
     void* stub = make_tagged_zero_stub(reinterpret_cast<void*>(&tag_handler), kTag);
     if (!stub) { check("tagged stub allocated", false, 0, 1); return; }
-    // Called as a Microsoft x64 function of several return types and with
+    // Called as a Windows ARM64 function of several return types and with
     // more arguments than the handler takes, as HotSpot would.
     auto as_long = reinterpret_cast<long long (*)(void*, void*, int, double, int, int)>(stub);
     auto as_double = reinterpret_cast<double (*)(void*, void*)>(stub);

@@ -25,7 +25,7 @@ setting is also a change to the document that names it.
 | `windows/test/` | Unit tests (`*_test.cpp`), guest libs (`guest/`), `compat/` (app sweep: `apps.txt`, `sweep.py`; `smoke.txt` the ten apps every PR boots) |
 | `windows/package/` | Installer (`winapk.iss`, Inno Setup), `README.txt`, `RELEASE_NOTES.md` (short: the release page's text), `THIRD_PARTY_NOTICES.txt` |
 | `windows/CMakeLists.txt` | All Windows targets. Pulls `runtime/src/native_methods.cpp` (GL bridges) and `native_sqlite.cpp` from upstream |
-| `runtime/java/` | The Android framework in Java + `com/macapk/loader/` (Boot, ActivityHost, package manager...). Names say macapk: that is upstream's, keep them |
+| `runtime/java/` | Upstream's Android framework in Java (never edited; `windows/runtime/` replaces or adds files) + `com/macapk/loader/` (Boot, ActivityHost, package manager...). Names say macapk: that is upstream's, keep them |
 | `runtime/src/`, `runtime/translator/` | Upstream native sources; Windows uses only the two files above |
 | `scripts/build_framework_res.sh` | The platform resource APK (called by `windows/scripts/`) |
 | `.github/workflows/` | `win-ci.yml` (PRs and by hand: what changed, then one ARM64 build on `windows-11-arm` with ccache, feeding unit tests, runtime tests, a 10-app smoke test and packaging; the full app sweep only by hand), `win-release.yml` (by hand only: builds, smoke-tests, publishes `Win.apk-Setup-arm64.exe` and a zip as a pre-release) |
@@ -101,8 +101,11 @@ runtime's permission groups), single instance (`forward_to_running`,
 
 ## Conventions
 
-- Code goes in `windows/`. Touch `runtime/` only for a needed Windows hook, and
-  add it to the list in `windows/README.md`.
+- Code goes in `windows/`. Never edit `runtime/` (upstream's). To change one of
+  its Java files, copy it to the same path under `windows/runtime/`, edit the
+  copy and add a line to `windows/runtime/UPSTREAM.tsv` (upstream's blob, or
+  `new`). `windows/scripts/check_overlay.sh` must pass; list what the copy
+  changes in `windows/README.md`, "Changes to the upstream tree".
 - Match the surrounding style: C++17, 120 columns, comments say why.
 - Don't add app-specific hacks; fix the framework, shim or host.
 - PRs go to `main`; CI must be green. Releases only via the manual

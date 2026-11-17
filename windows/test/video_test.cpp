@@ -607,6 +607,50 @@ void test_encoders(const std::wstring& out_path) {
     }
     src.reset();
     DeleteFileW(out_path.c_str());
+
+    // A file with no sound: the player keeps time on the wall clock and must
+    // still reach the end, and loop.
+    {
+        auto wr = winapk::mp4::Writer::create(out_path, false);
+        winapk::mp4::TrackFormat vf;
+        vf.video = true;
+        vf.width = w;
+        vf.height = h;
+        vf.csd0 = vconfig.data;
+        bool ok = wr && wr->add_track(vf) == 0 && wr->start();
+        for (const vd::Encoded& au : video) {
+            ok = ok && wr->write(0, au.data.data(), au.data.size(), au.pts_us, au.key, false);
+        }
+        check("MP4 writer makes a file with no sound", ok && wr->finish());
+    }
+    auto silent = vd::Player::open(vd::Source::open(out_path));
+    check("player opens the file with no sound", silent != nullptr);
+    if (silent) {
+        bool released = false;
+        silent->seek(1500);
+        silent->start();
+        while (silent->await_frame(1000, &released)) {}
+        for (int i = 0; i < 100 && silent->playing(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        check("player completes a file with no sound",
+              !silent->playing() && silent->position_ms() == silent->duration_ms(),
+              std::to_string(silent->position_ms()) + " of " + std::to_string(silent->duration_ms()));
+        silent->set_looping(true);
+        silent->seek(1500);
+        silent->start();
+        int64_t last = -1;
+        bool wrapped = false;
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+        while (!wrapped && std::chrono::steady_clock::now() < until) {
+            auto f = silent->await_frame(500, &released);
+            if (!f) continue;
+            if (f->pts_us < last) wrapped = true;
+            last = f->pts_us;
+        }
+        check("player loops a file with no sound", wrapped && silent->playing());
+        silent->release();
+    }
+    silent.reset();
+    DeleteFileW(out_path.c_str());
 }
 
 }  // namespace

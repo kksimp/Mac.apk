@@ -71,7 +71,7 @@ const char* mock_signature(void*, jmethodID mid) {
     return nullptr;
 }
 
-// ---- mock host ...A slots (Microsoft x64) ---------------------------------
+// ---- mock host ...A slots (Windows ARM64) ---------------------------------
 jint JNICALL mock_CallIntMethodA(JNIEnv* e, jobject o, jmethodID m, const jvalue* a) {
     record(e, "CallIntMethodA", a, 5, o, nullptr, m);
     return a[0].i + static_cast<jint>(a[1].f) + static_cast<jint>(a[2].j) +
@@ -185,7 +185,7 @@ int main() {
                   std::strcmp(g_seen.slot, "NewObjectA") == 0);
     }
     // va_list form: CallObjectMethodV(env, obj, mid, va) sig (I)Ljava/lang/Object;. Build the
-    // System V va_list by hand: one int argument in the first integer slot.
+    // AAPCS64 va_list by hand: one int argument in the first integer slot.
     {
         uint8_t reg_save[48 + 128] = {0};
         winapk::SysVVaList va{};

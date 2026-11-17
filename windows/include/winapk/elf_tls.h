@@ -49,7 +49,7 @@ void tls_unregister_module(size_t id);
 // The guest's `__tls_get_addr`.
 WINAPK_GUEST_ABI void* tls_get_addr(const TlsIndex* index);
 
-// __cxa_thread_atexit_impl: `fn` (System V, one argument) runs with `obj` when
+// __cxa_thread_atexit_impl: `fn` (guest ABI, one argument) runs with `obj` when
 // the calling thread exits; `dso` is an address inside the library the
 // destructor belongs to (its __dso_handle).
 void tls_thread_atexit(void* fn, void* obj, void* dso);

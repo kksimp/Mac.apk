@@ -170,10 +170,11 @@ Every test is a program built by CMake; `win-ci.yml` runs each on
 | `winapk-jni-test`, `winapk-jni-variadic-test` | The guest `JNIEnv` against a mock JVM; the variadic bridge for every call kind and argument type, through `...` and `va_list` |
 | `winapk-x18-scan-test` | The x18 scan one instruction at a time (encodings from llvm-mc): reads, writes, the `ldp x18, x19` of a context restore that does not count, a range scan |
 | `winapk-arm64-test <guest/arm64>` | `arm64_isa.c` built into the test and three times as guest libraries must agree on every function; `arm64_bridge_guest.c` (calls both ways, variadics, threads, atexit, arm64's `struct stat`); `arm64_flow_guest.c` (returns into ancestor frames, coroutines, RETAA, deep recursion, saturating conversions, exclusives, STLR/LDAR); ELF TLS through TLSDESC; C++ exceptions (`arm64_eh_guest.cpp`, built when `ANDROID_NDK_HOME` names an NDK); `dlclose`; `svc #0`; signals delivered to guest handlers |
-| `winapk-linker-test <guest/aarch64/link>` | A four-library tree with a `DT_NEEDED` cycle and a plugin: constructor order, symbol resolution order, `dlsym` scopes, the guest's `dlopen`, `dlsym`, `dlerror` and `dladdr`, a library opened by its Android path |
+| `winapk-linker-test <guest/aarch64/link>` | A four-library tree with a `DT_NEEDED` cycle and a plugin: constructor order, symbol resolution order, `dlsym` scopes, the guest's `dlopen`, `dlsym`, `dlerror` and `dladdr`, a library opened by its Android path; corrupt ELF headers and tables refused |
 | `winapk-bionic-test <bionic_guest.so> <scratch>` | `test/guest/bionic_guest.c` exercises the shim from guest code: strings, printf/scanf through the guest's `va_list`, threads, files, ELF TLS, properties, locales, futex, large reservations, pipes, eventfd, epoll, sockets (loopback, multicast), `ALooper`, clocks, `mmap`, and calls that must fail as Linux reports it |
 | `winapk-crash-test <scratch>` | `host/crash_report.cpp`: a guest SIGSEGV handler that declines, then the report line and a minidump, pruned to the last three |
 | `winapk-applink-test` | `host/applink_match.h`: which navigation is the App Link sign-in's return to the app |
+| `winapk-host-url-test` | `host/host_url.h`: which URLs an app may hand to Windows (http, https, mailto, tel, sms; geo as a web map; the location settings), escaped; `shell:`, `file:` and every other scheme refused |
 | `winapk-cds-test <scratch>` | `host/cds_util.h`: the patch digest `bake_jre.sh` records, the flags a baked JRE drops, the archive key, the class list merge |
 | `winapk-paths-test` | `src/bionic/paths.cpp`: Android paths to host files |
 | `winapk-audio-test <test/audio>` | The WASAPI mixer and the decoders |
@@ -240,16 +241,28 @@ git switch -c sync/macapk-v1.0.NNNN
 git merge upstream/main
 ```
 
-Conflicts can only fall on upstream files this fork changes, which are listed
-below. Every native a merged class gains needs an answer in `windows/host/`
-(for the classes `host_natives.cpp` binds, an unimplemented one returns 0 or
-null). Merge the pull request with a merge commit, never a squash or rebase, so
-the next `git merge upstream/main` finds its base.
+`runtime/` is never edited, so the merge itself does not conflict. Our changes
+to upstream's Java live in `windows/runtime/`, which mirrors `runtime/`: a file
+there replaces upstream's at the same path (`windows/scripts/build_java.sh`
+compiles ours instead), or adds a new one. `windows/runtime/UPSTREAM.tsv`
+records, for each replaced file, the upstream blob our copy is based on.
+
+After the merge, `windows/scripts/check_overlay.sh` (also a CI step) names each
+file upstream changed under one of our copies. For each: merge upstream's change
+into our copy (`git diff <old blob> <new blob>` shows it), then
+`check_overlay.sh --update <path>` records the new blob. A copy that has become
+identical to upstream's is deleted with its line. With `UPSTREAM_REF=upstream/main`
+the script also fails if `runtime/` itself was edited.
+
+Every native a merged class gains needs an answer in `windows/host/` (for the
+classes `host_natives.cpp` binds, an unimplemented one returns 0 or null). Merge
+the pull request with a merge commit, never a squash or rebase, so the next
+`git merge upstream/main` finds its base.
 
 ### Changes to the upstream tree
 
-Files in `runtime/` are changed only where a Windows hook is unavoidable, and
-every such change is listed here:
+What the copies in `windows/runtime/` change, by file (paths are upstream's,
+under `runtime/`):
 
 - `runtime/java/android/os/MacApkBinderTransport.java`: tries `nativeInit()`
   before looking for upstream's `libmacapk-binder.dylib`, since the Windows
@@ -285,6 +298,14 @@ every such change is listed here:
   and Play services refused its caller ("Unknown calling package name"). A
   refused `checkPackage` and a calling pid with no uid on record are each
   logged once (`[appops]`, `[binder]`).
+- `runtime/java/android/os/ParcelFileDescriptor.java`,
+  `com/macapk/loader/NativeOs.java`: on Windows a `java.io.FileDescriptor`
+  holds a HANDLE (its `handle` field) and its `fd` field stays -1, while native
+  code works with CRT descriptor numbers. `NativeOs.fdOf`, `wrap`,
+  `fdForHandle`, `handleForFd` and `closeHandleOf` convert between the two by
+  duplicating the handle (`windows/host/native_os.cpp`), and
+  `ParcelFileDescriptor.adoptFd` and its raw-fd read use them instead of the
+  `fd` field, so a descriptor is usable by Java streams and native code alike.
 - `runtime/java/android/content/Context.java`, `ContextWrapper.java`:
   `createContextAsUser` (the one user's own Context; Play services calls it),
   and a wrapper's `getSystemService` that comes back to itself for the same
@@ -650,6 +671,10 @@ every such change is listed here:
   was null, so camera2 apps and CameraX's ImageCapture had no still output.
   The characteristics gained the keys they read (3A mode lists, zoom 1.0,
   pixel array, thumbnail sizes, output counts). Not Windows-specific.
+- `runtime/java/android/media/Image.java`: `getFence` and `setFence` (API 33),
+  with `SyncFence`: an image answers an empty, already signalled fence unless
+  one was set, as the images here are finished software buffers. Not
+  Windows-specific.
 - `runtime/java/android/view/SurfaceView.java`: a SurfaceView laid out larger
   than its window (a center-cropped camera preview) whose holder has no GL
   consumer yet (no renderer, not a `GLSurfaceView`, not the native-window
@@ -691,6 +716,9 @@ every such change is listed here:
   AOSP's does, not from inside the call; a null listener or a protocol other
   than `PROTOCOL_DNS_SD` is an `IllegalArgumentException`. Not
   Windows-specific.
+- `runtime/java/android/net/nsd/NsdServiceInfo.java`: is `Parcelable` (name,
+  type, host address, port, TXT record), as AOSP's is, so an app can put one in
+  an Intent or a saved-state Bundle. Not Windows-specific.
 - `runtime/java/android/speech/tts/TextToSpeech.java` and
   `android/media/midi/MidiManager.java`: a request that was accepted and
   never answered now ends in the failure AOSP documents, after the call has
@@ -736,6 +764,18 @@ every such change is listed here:
   scans. A host without these natives (the Mac) keeps the old answers: the
   sockets' "no Bluetooth radio", a GATT client that reports the failure, a
   scan that fails.
+- `runtime/java/android/bluetooth/BluetoothManager.java`, `BluetoothHeadset.java`,
+  `BluetoothUuid.java` (new), `BluetoothCodecConfig.java` (new) and
+  `BluetoothCodecStatus.java` (new): `BluetoothManager` has no GATT server
+  or Classic profile behind it, so `getAdapter` answers the default adapter,
+  `getConnectedDevices` and `getDevicesMatchingConnectionStates` an empty
+  list, `getConnectionState` `STATE_DISCONNECTED` and `openGattServer` null
+  (AOSP's own failure return; upstream's CoreBluetooth `BluetoothPeripheralBridge`
+  is not here). `BluetoothHeadset` gains the system APIs `connect` and
+  `disconnect`, which answer false. The three new classes are AOSP's value
+  types and UUID helpers (no radio needed) that an app's audio and device code
+  links against; no A2DP stream is ever negotiated, so nothing hands one a live
+  codec config.
 - `runtime/java/com/macapk/loader/ActivityHost.java` and
   `MacApkPackageManager.java`: a Custom Tab launch opens in
   `HostBrowserTab` (new, with `HostCustomTabsService`) when the host has a
@@ -785,9 +825,7 @@ every such change is listed here:
   `ChromeTabbedActivity` in `split_chrome.apk`, and was rejected with "no
   launchable activity". `MACAPK_MANIFEST_FEATURE_SPLITS=0` reads the base alone.
   Not Windows-specific.
-- `runtime/java/android/app/HandoffActivityData.java`,
-  `HandoffActivityDataRequestInfo.java` (new, API 37 type-only placeholders)
-  and `com/macapk/loader/ActivityHost.java`: an activity overriding a newer-API
+- `runtime/java/com/macapk/loader/ActivityHost.java`: an activity overriding a newer-API
   callback no longer fails every lifecycle call with `NoClassDefFoundError`;
   a class whose methods cannot be resolved is skipped in favour of the
   superclass declaration, which still dispatches to the override
@@ -881,7 +919,9 @@ every such change is listed here:
   decoder's buffer queues, and `MediaCodecList.java` / `MediaCodecInfo.java` /
   `HostCodecCapability.java` list the two encoders when the host has them;
   `MediaRecorder.java` records the microphone and `VideoSource.SURFACE` on
-  those, and fails `prepare()` for what the host cannot record.
+  those, and fails `prepare()` for what the host cannot record. Its `onInfo`
+  and `onError` are posted to the creating thread's Looper (the main one when
+  there is none), as AOSP does.
 - `runtime/java/android/view/Surface.java`: `macapkSetFrameSink` (new, public):
   what a Canvas posts on the Surface goes to the sink, at the sink's size,
   instead of the window. An encoder's input Surface sets it.
@@ -908,10 +948,13 @@ every such change is listed here:
   them), set before any TLS. `Boot.run` did it for an app's
   process only; `GmsCli.run` (`--gms`, Settings > Google account) now does
   too, or the sign-in's token exchange failed with "PKIX path building
-  failed". The set is kept as one JKS file, `%TEMP%\winapk-trust.jks`, that a
-  start uses at once and, when it is more than a day old, rebuilds in the
-  background 20 s later; only the first start ever builds it before the app (building it cost 0.6-1.3 s of
-  every start). Not on other systems.
+  failed". The set is held in each process's memory, never in a file: a
+  security provider ahead of the JDK's answers the default "PKIX"
+  TrustManagerFactory (`init(null)`) and supplies the "Default" SSLContext
+  (`SSLContext.getDefault`, so `HttpsURLConnection`, `SSLSocketFactory.getDefault`
+  and a context-less `HttpClient`), which the JDK would otherwise build over its
+  own cacerts. The set is built on a background thread at start (0.6-1.3 s). Not
+  on other systems.
 - `runtime/java/com/macapk/gms/AccountPhoto.java` (new),
   `NativeSignIn.java` and `GmsStore.java`: after a sign-in, the picture the
   sign-in window found (`signInPhotoUrl`, a native only Windows has; on the
@@ -951,6 +994,11 @@ every such change is listed here:
   "Google sign-in failed (error: <code>, status <n>)" and stay open instead
   of closing on the app's generic error; leaving then hands the app that
   failure.
+- `runtime/java/com/macapk/gms/GoogleAuthenticator.java`, `SafeParcel.java`:
+  `GoogleAuthenticator.redact` (an email with its local part shortened, for
+  logs) is public and `SafeParcel.beginVariable` / `finishVariable` are
+  package-private, so `AccountManager`, `AccountPhoto` and
+  `AuthorizationService` use them. Same behaviour; not Windows-specific.
 - `runtime/java/android/graphics/drawable/VectorDrawable.java`: a path's
   `android:fillType="evenOdd"` is honoured; icons cut out of a filled shape
   filled solid.
@@ -1130,8 +1178,10 @@ every such change is listed here:
   `MacApkPackageManager.java`: the Identity Authorization API
   (`com.google.android.gms.auth.api.identity.service.authorization.START`,
   `AuthorizationClient.authorize`): a server auth code, an access token or an
-  ID token for the account the app signed in with on this device. Waze asks
-  for a server auth code right after the account is picked; the bind was
+  ID token for the account the app signed in with on this device, also when
+  the request names it (compared without regard to case), but never for one
+  the user has not picked for the app here or has signed out of. Waze asks for
+  a server auth code right after the account is picked; the bind was
   unanswered and the sign-in ended in an error.
 - `runtime/java/com/macapk/dex/NestIndex.java` and `NestPlan.java`: a class
   whose superclass is in the same package and has only private constructors
@@ -1161,19 +1211,6 @@ every such change is listed here:
   `AttributeSet.macapkAttributeText`. The bank app com.ideomobile.mercantile
   ran `Integer.decode` on `getAttributeValue(android, "inputType")` and
   crashed on `"number"`.
-- `runtime/net_spi/com/macapk/net/AndroidCharsetAliasProvider.java` (new,
-  registered in `runtime/net_spi/META-INF/services`): a charset name with `_`
-  for `-` (`"UTF_8"`, `"US_ASCII"`, `"UTF_16LE"`) is the charset, as on
-  Android, whose ICU lookup ignores `-` and `_`. `URLEncoder.encode(s, "UTF_8")`
-  threw `UnsupportedEncodingException`. A `CharsetProvider` on the class path
-  rather than a copy of `java.nio.charset.Charset` in `java_base_patch`: the
-  JDK asks providers only after its own charsets miss.
-- `runtime/java/com/android/internal/graphics/drawable/AnimationScaleListDrawable.java`
-  (new) and `android/content/res/Resources.java`: the platform's progress-bar
-  styles root their indeterminate drawable in this @hide class; it now inflates
-  (the animated child, or the static one when the animator duration scale is 0)
-  instead of a transparent drawable, so a progress bar that draws the style's
-  drawable itself (Google Play) shows its spinner. Not Windows-specific.
 - `runtime/java/com/macapk/loader/MacApkPackageManager.java`, `SystemClient.java`,
   `SystemServer.java` (`PROVIDER_PACKAGE`): with the broker on,
   `resolveContentProvider` also finds an authority another installed package
@@ -1211,13 +1248,6 @@ every such change is listed here:
   change. AnkiDroid's LeakCanary failed with `NoSuchFieldException: mViews`.
   `mRoots` is not provided (one `ViewRootImpl` for the process). Not
   Windows-specific.
-- `runtime/java/android/graphics/FontFamily.java` (new), `Typeface.java`
-  (`createFromFamiliesWithDefault`) and `android/content/res/AssetManager.java`
-  (`openNonAsset`): the hidden family builder androidx.core's
-  `TypefaceCompatApi21/24/26/28Impl` reflect on, backed by our font loader; a
-  family becomes an app font family, so its bold face is used for bold.
-  DroidFish logged `ClassNotFoundException: android.graphics.FontFamily`.
-  Not Windows-specific.
 - `runtime/java/android/content/res/AssetManager.java`: `open`, `openFd` and
   `openNonAssetFd` throw `FileNotFoundException` for a name the APK does not
   have, as AOSP does; they threw a plain `IOException`, which a

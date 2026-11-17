@@ -1696,6 +1696,22 @@ static struct timespec in_ms(long ms) {
     return t;
 }
 
+// Threads reading pages of one descriptor at once, each page filled with its own number: SQLite and
+// LevelDB share a descriptor across threads this way. Returns the number of wrong pages read.
+static int g_pages_fd = -1;
+static void* page_reader(void* arg) {
+    long bad = 0;
+    unsigned char page[4096];
+    for (int i = 0; i < 2000; ++i) {
+        const int n = (int)(((long)arg + i * 7) % 16);
+        if (__pread_chk(g_pages_fd, page, sizeof page, (off_t)n * 4096, sizeof page) != 4096 || page[0] != n ||
+            page[4095] != n) {
+            ++bad;
+        }
+    }
+    return (void*)bad;
+}
+
 static void test_missing_forms(const char* dir) {
     char b[512], path[512], other[512];
     struct stat st;
@@ -1719,10 +1735,31 @@ static void test_missing_forms(const char* dir) {
           pwritev(fd, out, 3, 2) == 6 && preadv(fd, in, 1, 2) == 3 && memcmp(r1, "abc", 3) == 0 &&
               lseek(fd, 0, 1) == 16,
           0);
+    check("pread past the end is 0", __pread_chk(fd, b, 4, 1000, sizeof b) == 0, 0);
+    snprintf(other, sizeof other, "%s/pages.bin", dir);
+    g_pages_fd = open(other, 01102, 0600);
+    for (int n = 0; n < 16; ++n) {
+        memset(b, n, sizeof b);
+        for (int k = 0; k < 8; ++k) write(g_pages_fd, b, sizeof b);
+    }
+    lseek(g_pages_fd, 5, 0);
+    pthread_t readers[4];
+    long wrong = 0;
+    for (long i = 0; i < 4; ++i) pthread_create(&readers[i], 0, page_reader, (void*)i);
+    for (int i = 0; i < 4; ++i) {
+        void* r = 0;
+        pthread_join(readers[i], &r);
+        wrong += (long)r;
+    }
+    check("pread from four threads at once reads every page it asks for and leaves the position",
+          wrong == 0 && lseek(g_pages_fd, 0, 1) == 5, 0);
+    close(g_pages_fd);
+    unlink(other);
     int p[2] = {-1, -1};
     pipe(p);
     write(p[1], "xyz", 3);
     in[0].len = 2;
+    check("pread on a pipe fails with ESPIPE", __pread_chk(p[0], b, 1, 0, sizeof b) == -1 && *__errno() == 29, 0);
     check("readv on a pipe returns what is there", readv(p[0], in, 2) == 3 && r1[1] == 'y' && r2[0] == 'z', 0);
     check("writev to a pipe", writev(p[1], out, 3) == 6 && read(p[0], b, 16) == 6 && memcmp(b, "abcdef", 6) == 0, 0);
     off_t at = 2;  // the file holds "01abcdef89abcdef"

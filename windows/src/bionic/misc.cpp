@@ -880,17 +880,12 @@ WINAPK_GUEST_ABI void* g_mmap(void* addr, size_t len, int prot, int flags, int f
         // A file mapping: a private copy of the file's bytes (MAP_PRIVATE, or a
         // MAP_SHARED one map_shared_view could not make a view of): writes are
         // not carried back to the file.
-        const int64_t at = _lseeki64(fd, 0, SEEK_CUR);
-        if (_lseeki64(fd, off, SEEK_SET) >= 0) {
-            size_t done = 0;
-            while (done < len) {
-                const int r = _read(fd, static_cast<char*>(p) + done,
-                                    static_cast<unsigned>((len - done) > 0x40000000 ? 0x40000000 : len - done));
-                if (r <= 0) break;
-                done += static_cast<size_t>(r);
-            }
+        size_t done = 0;
+        while (done < len) {
+            const int64_t r = fd_pread(fd, static_cast<char*>(p) + done, len - done, off + static_cast<int64_t>(done));
+            if (r <= 0) break;
+            done += static_cast<size_t>(r);
         }
-        if (at >= 0) _lseeki64(fd, at, SEEK_SET);
         if ((flags & 3) == 1 && (prot & 2)) remember_shared_copy(p, len, fd, off);
     }
     DWORD old;

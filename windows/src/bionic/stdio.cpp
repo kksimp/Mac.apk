@@ -304,13 +304,104 @@ WINAPK_GUEST_ABI int g_close(int fd) {
     if (fd_is_host_std(fd)) return 0;  // the runtime's log stays open
     return _close(fd) < 0 ? fail_crt() : 0;
 }
+// ---- the file position ------------------------------------------------------------------
+// pread and pwrite give their offset to ReadFile/WriteFile, so each one reaches the bytes it names even
+// while other threads use the same descriptor (SQLite and LevelDB share one across threads). The handle is
+// synchronous, so the transfer still moves its file pointer, which is the CRT's file position; Linux
+// leaves the position alone. Positional calls therefore share a descriptor's slot, the first one in
+// remembering the position and the last one out putting it back, and read, write and lseek hold the slot
+// alone, so none of them sees the pointer while a positional call has it.
+struct PositionSlot {
+    SRWLOCK io = SRWLOCK_INIT;     // shared: positional calls; exclusive: calls that use the position
+    SRWLOCK count = SRWLOCK_INIT;  // guards the two below
+    int inflight = 0;
+    LARGE_INTEGER saved{};
+};
+constexpr int kPositionSlots = 8192;  // the UCRT's descriptor limit
+PositionSlot g_position[kPositionSlots];
+
+PositionSlot* position_slot(int fd) { return fd >= 0 && fd < kPositionSlots ? &g_position[fd] : nullptr; }
+
+class PositionUse {
+public:
+    explicit PositionUse(int fd) : slot_(position_slot(fd)) {
+        if (slot_) AcquireSRWLockExclusive(&slot_->io);
+    }
+    ~PositionUse() {
+        if (slot_) ReleaseSRWLockExclusive(&slot_->io);
+    }
+    PositionUse(const PositionUse&) = delete;
+    PositionUse& operator=(const PositionUse&) = delete;
+
+private:
+    PositionSlot* slot_;
+};
+
+// Linux's limit for one read or write (MAX_RW_COUNT): it fits a DWORD and the int the CRT returns.
+constexpr size_t kMaxTransfer = 0x7ffff000;
+
+// One pread or pwrite at `off`, leaving the file position where it was.
+int64_t positional(int fd, void* buf, size_t n, int64_t off, bool writing) {
+    if (off < 0) {
+        *guest_errno() = kEINVAL;
+        return -1;
+    }
+    if (auto o = fd_object(fd)) {
+        // A character device has no offset to honour (Linux reads /dev/urandom at any); pipes,
+        // sockets and the rest have none to go to.
+        if (o->mode() == 0020000) return writing ? o->write(buf, n) : o->read(buf, n);
+        *guest_errno() = kESPIPE;
+        return -1;
+    }
+    const HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    if (h == INVALID_HANDLE_VALUE || h == reinterpret_cast<HANDLE>(-2)) {  // -2: a standard stream with none
+        *guest_errno() = kEBADF;
+        return -1;
+    }
+    if (GetFileType(h) != FILE_TYPE_DISK) {  // a pipe or a console
+        *guest_errno() = kESPIPE;
+        return -1;
+    }
+    if (n == 0) return 0;
+    const DWORD want = static_cast<DWORD>(std::min(n, kMaxTransfer));
+    PositionSlot* slot = position_slot(fd);
+    if (slot) {
+        AcquireSRWLockShared(&slot->io);
+        AcquireSRWLockExclusive(&slot->count);
+        if (slot->inflight++ == 0) SetFilePointerEx(h, LARGE_INTEGER{}, &slot->saved, FILE_CURRENT);
+        ReleaseSRWLockExclusive(&slot->count);
+    }
+    OVERLAPPED at{};
+    at.Offset = static_cast<DWORD>(static_cast<uint64_t>(off));
+    at.OffsetHigh = static_cast<DWORD>(static_cast<uint64_t>(off) >> 32);
+    DWORD done = 0;
+    BOOL ok = writing ? WriteFile(h, buf, want, &done, &at) : ReadFile(h, buf, want, &done, &at);
+    DWORD error = ok ? 0 : GetLastError();
+    if (error == ERROR_IO_PENDING) {  // a handle opened for overlapped I/O, which has no pointer to keep
+        ok = GetOverlappedResult(h, &at, &done, TRUE);
+        error = ok ? 0 : GetLastError();
+    }
+    if (slot) {
+        AcquireSRWLockExclusive(&slot->count);
+        if (--slot->inflight == 0) SetFilePointerEx(h, slot->saved, nullptr, FILE_BEGIN);
+        ReleaseSRWLockExclusive(&slot->count);
+        ReleaseSRWLockShared(&slot->io);
+    }
+    if (ok) return done;
+    if (!writing && error == ERROR_HANDLE_EOF) return 0;  // at or past the end
+    set_errno_from_win32(error);
+    return -1;
+}
+
 WINAPK_GUEST_ABI int64_t g_read(int fd, void* buf, size_t n) {
     if (auto o = fd_object(fd)) return o->read(buf, n);
+    PositionUse hold(fd);
     const int r = _read(fd, buf, static_cast<unsigned>(n > 0x7fffffff ? 0x7fffffff : n));
     return r < 0 ? fail_crt() : r;
 }
 WINAPK_GUEST_ABI int64_t g_write(int fd, const void* buf, size_t n) {
     if (auto o = fd_object(fd)) return o->write(buf, n);
+    PositionUse hold(fd);
     const int r = _write(fd, buf, static_cast<unsigned>(n > 0x7fffffff ? 0x7fffffff : n));
     return r < 0 ? fail_crt() : r;
 }
@@ -319,33 +410,15 @@ WINAPK_GUEST_ABI int64_t g_lseek(int fd, int64_t off, int whence) {
         *guest_errno() = kESPIPE;
         return -1;
     }
+    PositionUse hold(fd);
     const int64_t r = _lseeki64(fd, off, whence);
     return r < 0 ? fail_crt() : r;
 }
-// pread/pwrite at an offset without moving the file position.
 WINAPK_GUEST_ABI int64_t g_pread(int fd, void* buf, size_t n, int64_t off) {
-    const int64_t at = _lseeki64(fd, 0, SEEK_CUR);
-    if (at < 0 || _lseeki64(fd, off, SEEK_SET) < 0) return fail_crt();
-    const int r = _read(fd, buf, static_cast<unsigned>(n));
-    const int e = errno;
-    _lseeki64(fd, at, SEEK_SET);
-    if (r < 0) {
-        set_errno_from_crt(e);
-        return -1;
-    }
-    return r;
+    return positional(fd, buf, n, off, false);
 }
 WINAPK_GUEST_ABI int64_t g_pwrite(int fd, const void* buf, size_t n, int64_t off) {
-    const int64_t at = _lseeki64(fd, 0, SEEK_CUR);
-    if (at < 0 || _lseeki64(fd, off, SEEK_SET) < 0) return fail_crt();
-    const int r = _write(fd, buf, static_cast<unsigned>(n));
-    const int e = errno;
-    _lseeki64(fd, at, SEEK_SET);
-    if (r < 0) {
-        set_errno_from_crt(e);
-        return -1;
-    }
-    return r;
+    return positional(fd, const_cast<void*>(buf), n, off, true);
 }
 WINAPK_GUEST_ABI int64_t g_read_chk(int fd, void* buf, size_t n, size_t bn) {
     if (n > bn) {
@@ -2347,6 +2420,7 @@ const ShimSymbol kSymbols[] = {
 
 size_t file_write(void* f, const char* data, size_t n) { return std::fwrite(data, 1, n, host_file(f)); }
 int64_t fd_write(int fd, const void* data, size_t n) { return g_write(fd, data, n); }
+int64_t fd_pread(int fd, void* data, size_t n, int64_t off) { return g_pread(fd, data, n, off); }
 void* host_stream(void* guest_file) { return host_file(guest_file); }
 void* guest_stdout() { return stdout; }
 void* guest_stderr() { return stderr; }

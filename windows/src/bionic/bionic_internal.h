@@ -103,6 +103,8 @@ const char* errno_text(int linux_errno);
 // stdout and stderr.
 size_t file_write(void* guest_file, const char* data, size_t n);
 int64_t fd_write(int fd, const void* data, size_t n);
+// pread(2) on a guest file descriptor: -1 with errno set, and the file position left alone.
+int64_t fd_pread(int fd, void* data, size_t n, int64_t off);
 // The CRT FILE* behind a guest FILE* (the __sF entries are the standard streams).
 void* host_stream(void* guest_file);
 void* guest_stdout();

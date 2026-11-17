@@ -1179,9 +1179,10 @@ under `runtime/`):
   (`com.google.android.gms.auth.api.identity.service.authorization.START`,
   `AuthorizationClient.authorize`): a server auth code, an access token or an
   ID token for the account the app signed in with on this device, also when
-  the request names it, but never for one the user has not picked for the app
-  here or has signed out of. Waze asks for a server auth code right after the
-  account is picked; the bind was unanswered and the sign-in ended in an error.
+  the request names it (compared without regard to case), but never for one
+  the user has not picked for the app here or has signed out of. Waze asks for
+  a server auth code right after the account is picked; the bind was
+  unanswered and the sign-in ended in an error.
 - `runtime/java/com/macapk/dex/NestIndex.java` and `NestPlan.java`: a class
   whose superclass is in the same package and has only private constructors
   is put in that superclass's nest when R8 dropped the enclosing-class

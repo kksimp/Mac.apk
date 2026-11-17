@@ -26,7 +26,8 @@
 // THE ACCOUNT is the one the request names, else the one the app last signed in
 // with on this device (GoogleSignInBroker.lastSignedIn): the user picked it in
 // the chooser, which is the consent GMS asks for. A named account must have been
-// picked for this app the same way (and not signed out of since). Without one, the answer is
+// picked for this app the same way (and not signed out of since); the name is
+// matched without regard to case, as Google's addresses are. Without one, the answer is
 // SIGN_IN_REQUIRED and no resolution; GMS would offer its account picker there,
 // which apps reach through their own sign-in first anyway.
 //
@@ -137,13 +138,26 @@ public final class AuthorizationService extends android.app.Service {
         }
         GoogleSignInBroker.log("authorization: authorize " + r);
         Thread t = new Thread(() -> {
-            String account = r.accountHint != null ? r.accountHint : GoogleSignInBroker.lastSignedIn(r.callerPkg);
             // Minting below sends consent (has_permission), so a named account must meet
             // lastSignedIn's gate: picked for this app on this device, not signed out since.
-            // Knowing the user's address is not their consent.
-            if (account != null && !(GoogleSignInBroker.usedOnThisDevice(account, r.callerPkg)
-                    && GoogleSignInBroker.autoSignInAllowed(account, r.callerPkg))) {
-                account = null;
+            // Knowing the user's address is not their consent. A hint that fails it gets no
+            // other account in its place: the app would take that one's tokens for the one it named.
+            String account = null;
+            if (r.accountHint == null) {
+                account = GoogleSignInBroker.lastSignedIn(r.callerPkg);
+            } else {
+                // Google addresses are case-insensitive; the store keeps the spelling it signed in with.
+                for (String a : GmsStore.accountNames()) {
+                    if (a != null && !a.startsWith("_") && a.toLowerCase(java.util.Locale.ROOT)
+                            .equals(r.accountHint.toLowerCase(java.util.Locale.ROOT))) {
+                        account = a;
+                        break;
+                    }
+                }
+                if (account != null && !(GoogleSignInBroker.usedOnThisDevice(account, r.callerPkg)
+                        && GoogleSignInBroker.autoSignInAllowed(account, r.callerPkg))) {
+                    account = null;
+                }
             }
             if (account == null || GmsStore.masterToken(account) == null) {
                 GoogleSignInBroker.log("authorization: no account signed in to " + r.callerPkg + " -> SIGN_IN_REQUIRED");

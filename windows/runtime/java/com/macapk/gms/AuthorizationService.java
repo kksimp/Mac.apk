@@ -25,7 +25,8 @@
 //
 // THE ACCOUNT is the one the request names, else the one the app last signed in
 // with on this device (GoogleSignInBroker.lastSignedIn): the user picked it in
-// the chooser, which is the consent GMS asks for. With neither, the answer is
+// the chooser, which is the consent GMS asks for. A named account must have been
+// picked for this app the same way (and not signed out of since). Without one, the answer is
 // SIGN_IN_REQUIRED and no resolution; GMS would offer its account picker there,
 // which apps reach through their own sign-in first anyway.
 //
@@ -137,6 +138,13 @@ public final class AuthorizationService extends android.app.Service {
         GoogleSignInBroker.log("authorization: authorize " + r);
         Thread t = new Thread(() -> {
             String account = r.accountHint != null ? r.accountHint : GoogleSignInBroker.lastSignedIn(r.callerPkg);
+            // Minting below sends consent (has_permission), so a named account must meet
+            // lastSignedIn's gate: picked for this app on this device, not signed out since.
+            // Knowing the user's address is not their consent.
+            if (account != null && !(GoogleSignInBroker.usedOnThisDevice(account, r.callerPkg)
+                    && GoogleSignInBroker.autoSignInAllowed(account, r.callerPkg))) {
+                account = null;
+            }
             if (account == null || GmsStore.masterToken(account) == null) {
                 GoogleSignInBroker.log("authorization: no account signed in to " + r.callerPkg + " -> SIGN_IN_REQUIRED");
                 reply(cb, STATUS_SIGN_IN_REQUIRED, "Sign in to the app first", null, null);

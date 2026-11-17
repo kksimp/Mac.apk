@@ -286,9 +286,8 @@ WINAPK_GUEST_ABI void g_operator_delete_extra(void* p, size_t) { g_free(p); }  /
 }
 
 // ---- assert ---------------------------------------------------------------------
-// Bionic's assert() calls these, which never return. A stub that returned 0
-// let the code run on past the failed check, into a crash with no message
-// (ChatGPT's libopenai_xplat_export.so); now the check's message is in the log.
+// Bionic's assert() calls these, which never return; a stub that returned would
+// run on past the failed check into a crash with no message.
 [[noreturn]] WINAPK_GUEST_ABI void g_assert2(const char* file, int line, const char* function, const char* failed) {
     std::fprintf(stderr, "[win.apk] guest assertion failed: %s:%d: %s: %s\n", file ? file : "?", line,
                  function ? function : "?", failed ? failed : "?");

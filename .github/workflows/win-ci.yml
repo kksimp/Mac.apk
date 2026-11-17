@@ -79,6 +79,8 @@ jobs:
           [[ "${{ github.event_name }}" == workflow_dispatch && "${{ inputs.full_sweep }}" == true ]] && full_sweep=true
           printf 'build=%s\ntests=%s\npackage=%s\nfull_sweep=%s\n' \
             "$build" "$tests" "$package" "$full_sweep" | tee -a "$GITHUB_OUTPUT"
+      - name: Check the runtime overlay against upstream
+        run: windows/scripts/check_overlay.sh
 
   guest:
     name: Guest libraries (arm64)

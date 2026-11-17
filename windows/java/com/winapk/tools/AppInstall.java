@@ -273,7 +273,7 @@ public final class AppInstall {
             }
         }
         String pkg = rootAttribute(axml, "package");
-        if (pkg != null && !PACKAGE_NAME.matcher(pkg).matches()) {
+        if (pkg != null && !pkg.equals("android") && !PACKAGE_NAME.matcher(pkg).matches()) {
             System.err.println("[install] " + apk.getFileName() + ": the manifest's package is not a package name");
             return null;
         }
@@ -281,7 +281,8 @@ public final class AppInstall {
     }
 
     // Android's own rule for an app's package (PackageParser.validateName with
-    // a separator required). The name comes from the APK and becomes a folder
+    // a separator required; like Android, "android", the platform's own resource
+    // package, is let through by name). The name comes from the APK and becomes a folder
     // name in the install path, the app's data folder and the host's records,
     // so anything else ("..", '\', ':', a line break) is refused here, once,
     // for every caller.

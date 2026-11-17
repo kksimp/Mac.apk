@@ -25,19 +25,29 @@ public final class HostTrust {
      * fetches public roots on demand, so one it never needed may be missing.
      *
      * The merged set lives in this process's memory only, never in a file
-     * another process could replace: a security provider ahead of the JDK's
-     * supplies the "PKIX" TrustManagerFactory, which answers
-     * TrustManagerFactory.init((KeyStore) null) -- what apps (OkHttp, Volley,
-     * Conscrypt-style code), the GMS clients and SSLContext.getDefault use for
-     * "the default trust store" -- with the merged set, and an init with an
-     * explicit KeyStore or parameters goes to the JDK's factory unchanged. An
-     * explicit javax.net.ssl.trustStore is left alone, which also makes a
+     * another process could replace. A security provider ahead of the JDK's
+     * reaches it by two doors, because the JDK's own default context never
+     * calls init(null): its trust managers come from the first "PKIX" factory,
+     * and when that is not SunJSSE's it is initialised with the JDK's cacerts
+     * KeyStore, an explicit store that must stay untouched (an app's own store
+     * looks the same).
+     * <ul>
+     * <li>The "PKIX" TrustManagerFactory answers init((KeyStore) null) -- what
+     * apps (OkHttp, Volley, Conscrypt-style code) and the GMS clients use for
+     * "the default trust store" -- with the merged set; an init with an
+     * explicit KeyStore or parameters goes to the JDK's factory unchanged.</li>
+     * <li>The "Default" SSLContext, which SSLContext.getDefault and so
+     * HttpsURLConnection, SSLSocketFactory.getDefault and an HttpClient with no
+     * context use, is replaced by one over the same merged set
+     * ({@link DefaultContext}).</li>
+     * </ul>
+     * An explicit javax.net.ssl.trustStore is left alone, which also makes a
      * second call a no-op.
      *
      * Building the set costs 0.6-1.3 s (the JDK's TLS classes, cacerts, the
      * Windows store), so install() only registers the provider and starts the
      * build on a background thread; a connection that needs the set before it
-     * is done waits for it.
+     * is done waits for it, the default context's included.
      */
     public static synchronized void install() {
         if (!System.getProperty("os.name", "").startsWith("Windows")) return;
@@ -97,7 +107,7 @@ public final class HostTrust {
         return merged;
     }
 
-    /** Puts {@link Factory} ahead of the JDK's "PKIX" TrustManagerFactory. */
+    /** Puts {@link Factory} and {@link DefaultContext} ahead of the JDK's "PKIX" factory and "Default" context. */
     public static final class Provider extends java.security.Provider {
         static final String NAME = "WinApkTrust";
         static final String ALGORITHM = "PKIX";
@@ -106,6 +116,7 @@ public final class HostTrust {
         public Provider() {
             super(NAME, "1.0", "TLS trust anchors: the JDK's plus the roots Windows trusts");
             put("TrustManagerFactory." + ALGORITHM, Factory.class.getName());
+            put("SSLContext.Default", DefaultContext.class.getName());
         }
     }
 
@@ -155,6 +166,106 @@ public final class HostTrust {
         protected javax.net.ssl.TrustManager[] engineGetTrustManagers() {
             if (delegate == null) throw new IllegalStateException("TrustManagerFactoryImpl is not initialized");
             return delegate.getTrustManagers();
+        }
+    }
+
+    /**
+     * What SSLContext.getInstance("Default") returns while this provider is installed: SunJSSE's "TLS" context
+     * (so the jdk.tls.* properties apply, as they do to the JDK's default) with the merged trust managers and
+     * the javax.net.ssl.keyStore* key managers the JDK's default would have. One context is shared by every
+     * instance, as the JDK's is, so sessions are cached across callers.
+     */
+    public static final class DefaultContext extends javax.net.ssl.SSLContextSpi {
+        private static javax.net.ssl.SSLContext shared;
+
+        private final javax.net.ssl.SSLContext ctx;
+
+        public DefaultContext() throws java.security.GeneralSecurityException, java.io.IOException {
+            ctx = shared();
+        }
+
+        private static synchronized javax.net.ssl.SSLContext shared()
+                throws java.security.GeneralSecurityException, java.io.IOException {
+            if (shared == null) {
+                Factory f = new Factory();
+                f.engineInit((java.security.KeyStore) null);
+                javax.net.ssl.SSLContext c = javax.net.ssl.SSLContext.getInstance("TLS", "SunJSSE");
+                c.init(keyManagers(), f.engineGetTrustManagers(), null);
+                shared = c;
+            }
+            return shared;
+        }
+
+        /** The JDK default context's key managers: javax.net.ssl.keyStore* (an empty store when unset). */
+        private static javax.net.ssl.KeyManager[] keyManagers()
+                throws java.security.GeneralSecurityException, java.io.IOException {
+            String path = System.getProperty("javax.net.ssl.keyStore", "");
+            String type = System.getProperty("javax.net.ssl.keyStoreType", java.security.KeyStore.getDefaultType());
+            String prov = System.getProperty("javax.net.ssl.keyStoreProvider", "");
+            String pw = System.getProperty("javax.net.ssl.keyStorePassword", "");
+            char[] passwd = pw.isEmpty() ? null : pw.toCharArray();
+            java.security.KeyStore ks = null;
+            if (!type.isEmpty()) {
+                ks = prov.isEmpty() ? java.security.KeyStore.getInstance(type)
+                                    : java.security.KeyStore.getInstance(type, prov);
+                if (path.isEmpty() || path.equals("NONE")) {
+                    ks.load(null, passwd);
+                } else {
+                    try (java.io.InputStream in = new java.io.FileInputStream(path)) {
+                        ks.load(in, passwd);
+                    }
+                }
+            }
+            javax.net.ssl.KeyManagerFactory kmf = javax.net.ssl.KeyManagerFactory.getInstance(
+                javax.net.ssl.KeyManagerFactory.getDefaultAlgorithm());
+            kmf.init(ks, "PKCS11".equals(type) ? null : passwd);
+            return kmf.getKeyManagers();
+        }
+
+        @Override
+        protected void engineInit(javax.net.ssl.KeyManager[] km, javax.net.ssl.TrustManager[] tm,
+                java.security.SecureRandom sr) throws java.security.KeyManagementException {
+            throw new java.security.KeyManagementException("Default SSLContext is initialized automatically");
+        }
+
+        @Override
+        protected javax.net.ssl.SSLSocketFactory engineGetSocketFactory() {
+            return ctx.getSocketFactory();
+        }
+
+        @Override
+        protected javax.net.ssl.SSLServerSocketFactory engineGetServerSocketFactory() {
+            return ctx.getServerSocketFactory();
+        }
+
+        @Override
+        protected javax.net.ssl.SSLEngine engineCreateSSLEngine() {
+            return ctx.createSSLEngine();
+        }
+
+        @Override
+        protected javax.net.ssl.SSLEngine engineCreateSSLEngine(String host, int port) {
+            return ctx.createSSLEngine(host, port);
+        }
+
+        @Override
+        protected javax.net.ssl.SSLSessionContext engineGetServerSessionContext() {
+            return ctx.getServerSessionContext();
+        }
+
+        @Override
+        protected javax.net.ssl.SSLSessionContext engineGetClientSessionContext() {
+            return ctx.getClientSessionContext();
+        }
+
+        @Override
+        protected javax.net.ssl.SSLParameters engineGetDefaultSSLParameters() {
+            return ctx.getDefaultSSLParameters();
+        }
+
+        @Override
+        protected javax.net.ssl.SSLParameters engineGetSupportedSSLParameters() {
+            return ctx.getSupportedSSLParameters();
         }
     }
 

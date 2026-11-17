@@ -950,8 +950,11 @@ under `runtime/`):
   too, or the sign-in's token exchange failed with "PKIX path building
   failed". The set is held in each process's memory, never in a file: a
   security provider ahead of the JDK's answers the default "PKIX"
-  TrustManagerFactory (`init(null)`, `SSLContext.getDefault`), and is built on a
-  background thread at start (0.6-1.3 s). Not on other systems.
+  TrustManagerFactory (`init(null)`) and supplies the "Default" SSLContext
+  (`SSLContext.getDefault`, so `HttpsURLConnection`, `SSLSocketFactory.getDefault`
+  and a context-less `HttpClient`), which the JDK would otherwise build over its
+  own cacerts. The set is built on a background thread at start (0.6-1.3 s). Not
+  on other systems.
 - `runtime/java/com/macapk/gms/AccountPhoto.java` (new),
   `NativeSignIn.java` and `GmsStore.java`: after a sign-in, the picture the
   sign-in window found (`signInPhotoUrl`, a native only Windows has; on the

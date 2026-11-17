@@ -4143,15 +4143,24 @@ void remove_app_files(const std::wstring& name) {
 
 // What the app saved, as Android's "Clear storage" and uninstall take it: its data folder
 // (android\data\data\<package>, and the <package>_<version> folders older runs made) and its folders
-// in shared storage (Android\data and Android\obb).
-void remove_app_data(const std::string& pkg) {
+// in shared storage (Android\data and Android\obb). `others` are the packages still in the library: '_'
+// is legal in a package name, so a <package>_ folder that is one of theirs (com.foo_bar next to
+// com.foo) is not this app's.
+void remove_app_data(const std::string& pkg, const std::vector<std::string>& others) {
     if (pkg.empty() || pkg.find_first_of("/\\:") != std::string::npos || pkg == "." || pkg == "..") return;
     const std::wstring p = utf8_to_wide(pkg);
     const fs::path android = data_dir() / L"android";
     remove_tree(android / L"data" / L"data" / p);
     std::error_code ec;
     for (const auto& e : fs::directory_iterator(android / L"data" / L"data", ec)) {
-        if (e.path().filename().wstring().rfind(p + L"_", 0) == 0) remove_tree(e.path());
+        const std::wstring folder = e.path().filename().wstring();
+        if (folder.rfind(p + L"_", 0) != 0) continue;
+        bool theirs = false;
+        for (const std::string& o : others) {
+            const std::wstring ow = utf8_to_wide(o);
+            theirs = theirs || (ow.size() > p.size() && ow.rfind(p + L"_", 0) == 0 && folder.rfind(ow, 0) == 0);
+        }
+        if (!theirs) remove_tree(e.path());
     }
     remove_tree(android / L"sdcard" / L"Android" / L"data" / p);
     remove_tree(android / L"sdcard" / L"Android" / L"obb" / p);
@@ -4188,12 +4197,14 @@ bool remove_app(const App& app, bool ask, bool with_data = false) {
     const std::vector<std::string> pkg = package_of(copy.name);
     if (!pkg.empty()) {
         bool other = false;
+        std::vector<std::string> others;
         for (const App& a : library()) {
             const std::vector<std::string> p = a.name == copy.name ? std::vector<std::string>{} : package_of(a.name);
             other = other || (!p.empty() && p[0] == pkg[0]);
+            if (!p.empty()) others.push_back(p[0]);
         }
         if (!other) appops_forget(pkg[0]);
-        if (!other && with_data) remove_app_data(pkg[0]);
+        if (!other && with_data) remove_app_data(pkg[0], others);
     }
     remove_app_shortcuts(copy);
     fs::remove(copy.apk, ec);

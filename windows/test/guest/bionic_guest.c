@@ -1762,6 +1762,8 @@ static void test_missing_forms(const char* dir) {
               lseek(fd, 0, 1) == 16,
           0);
     check("pread past the end is 0", __pread_chk(fd, b, 4, 1000, sizeof b) == 0, 0);
+    check("ftruncate to the same size keeps the position", lseek(fd, 7, 0) == 7 && ftruncate(fd, 16) == 0 &&
+                                                               lseek(fd, 0, 1) == 7, 0);
     snprintf(other, sizeof other, "%s/pages.bin", dir);
     g_pages_fd = open(other, 01102, 0600);
     for (int n = 0; n < 16; ++n) {

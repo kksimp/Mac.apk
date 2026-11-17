@@ -297,20 +297,18 @@ WINAPK_GUEST_ABI int g_openat(int dirfd, const char* path, int flags, unsigned m
 }
 WINAPK_GUEST_ABI int g_openat_2(int dirfd, const char* path, int flags) { return g_openat(dirfd, path, flags, 0); }
 WINAPK_GUEST_ABI int g_creat(const char* path, unsigned mode) { return g_open(path, kOWrOnly | kOCreat | kOTrunc, mode); }
-// Pipes, eventfds, epoll and sockets are objects (fd.cpp); each descriptor
-// call checks for one first.
-WINAPK_GUEST_ABI int g_close(int fd) {
-    if (fd_close(fd)) return 0;
-    if (fd_is_host_std(fd)) return 0;  // the runtime's log stays open
-    return _close(fd) < 0 ? fail_crt() : 0;
-}
 // ---- the file position ------------------------------------------------------------------
 // pread and pwrite give their offset to ReadFile/WriteFile, so each one reaches the bytes it names even
 // while other threads use the same descriptor (SQLite and LevelDB share one across threads). The handle is
 // synchronous, so the transfer still moves its file pointer, which is the CRT's file position; Linux
 // leaves the position alone. Positional calls therefore share a descriptor's slot, the first one in
-// remembering the position and the last one out putting it back, and read, write and lseek hold the slot
-// alone, so none of them sees the pointer while a positional call has it.
+// remembering the position and the last one out putting it back. On a disk file, read, write, lseek,
+// ftruncate and posix_fallocate hold the slot alone, so none of them sees the pointer while a positional
+// call has it; close holds it too, so that no positional call is left with a handle that was closed and
+// may by now name another file. Not covered: the stdio streams (fread, fseek... go to the CRT directly)
+// and a dup'd descriptor, which shares the kernel's pointer but has a slot of its own number; mixing
+// either with pread or pwrite on one open file can see the pointer mid-call. Pipes and consoles have no
+// offset and skip the slot, so a blocking read does not stall a write on the same descriptor.
 struct PositionSlot {
     SRWLOCK io = SRWLOCK_INIT;     // shared: positional calls; exclusive: calls that use the position
     SRWLOCK count = SRWLOCK_INIT;  // guards the two below
@@ -324,7 +322,13 @@ PositionSlot* position_slot(int fd) { return fd >= 0 && fd < kPositionSlots ? &g
 
 class PositionUse {
 public:
-    explicit PositionUse(int fd) : slot_(position_slot(fd)) {
+    enum Kind { Always, DiskOnly };
+    // DiskOnly takes the slot only for a disk file: one GetFileType, small beside the I/O it guards.
+    explicit PositionUse(int fd, Kind kind = Always) : slot_(position_slot(fd)) {
+        if (slot_ && kind == DiskOnly) {
+            const intptr_t h = _get_osfhandle(fd);
+            if (h == -1 || h == -2 || GetFileType(reinterpret_cast<HANDLE>(h)) != FILE_TYPE_DISK) slot_ = nullptr;
+        }
         if (slot_) AcquireSRWLockExclusive(&slot_->io);
     }
     ~PositionUse() {
@@ -337,6 +341,14 @@ private:
     PositionSlot* slot_;
 };
 
+// Pipes, eventfds, epoll and sockets are objects (fd.cpp); each descriptor
+// call checks for one first.
+WINAPK_GUEST_ABI int g_close(int fd) {
+    if (fd_close(fd)) return 0;
+    if (fd_is_host_std(fd)) return 0;  // the runtime's log stays open
+    PositionUse hold(fd);
+    return _close(fd) < 0 ? fail_crt() : 0;
+}
 // Linux's limit for one read or write (MAX_RW_COUNT): it fits a DWORD and the int the CRT returns.
 constexpr size_t kMaxTransfer = 0x7ffff000;
 
@@ -353,6 +365,18 @@ int64_t positional(int fd, void* buf, size_t n, int64_t off, bool writing) {
         *guest_errno() = kESPIPE;
         return -1;
     }
+    // Shared before the handle is looked up, so that a close (which holds the slot alone) can't free it between
+    // the lookup and the last SetFilePointerEx.
+    PositionSlot* slot = position_slot(fd);
+    struct Share {
+        PositionSlot* slot;
+        explicit Share(PositionSlot* s) : slot(s) {
+            if (slot) AcquireSRWLockShared(&slot->io);
+        }
+        ~Share() {
+            if (slot) ReleaseSRWLockShared(&slot->io);
+        }
+    } share(slot);
     const HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
     if (h == INVALID_HANDLE_VALUE || h == reinterpret_cast<HANDLE>(-2)) {  // -2: a standard stream with none
         *guest_errno() = kEBADF;
@@ -364,9 +388,7 @@ int64_t positional(int fd, void* buf, size_t n, int64_t off, bool writing) {
     }
     if (n == 0) return 0;
     const DWORD want = static_cast<DWORD>(std::min(n, kMaxTransfer));
-    PositionSlot* slot = position_slot(fd);
     if (slot) {
-        AcquireSRWLockShared(&slot->io);
         AcquireSRWLockExclusive(&slot->count);
         if (slot->inflight++ == 0) SetFilePointerEx(h, LARGE_INTEGER{}, &slot->saved, FILE_CURRENT);
         ReleaseSRWLockExclusive(&slot->count);
@@ -385,7 +407,6 @@ int64_t positional(int fd, void* buf, size_t n, int64_t off, bool writing) {
         AcquireSRWLockExclusive(&slot->count);
         if (--slot->inflight == 0) SetFilePointerEx(h, slot->saved, nullptr, FILE_BEGIN);
         ReleaseSRWLockExclusive(&slot->count);
-        ReleaseSRWLockShared(&slot->io);
     }
     if (ok) return done;
     if (!writing && error == ERROR_HANDLE_EOF) return 0;  // at or past the end
@@ -395,13 +416,13 @@ int64_t positional(int fd, void* buf, size_t n, int64_t off, bool writing) {
 
 WINAPK_GUEST_ABI int64_t g_read(int fd, void* buf, size_t n) {
     if (auto o = fd_object(fd)) return o->read(buf, n);
-    PositionUse hold(fd);
+    PositionUse hold(fd, PositionUse::DiskOnly);
     const int r = _read(fd, buf, static_cast<unsigned>(n > 0x7fffffff ? 0x7fffffff : n));
     return r < 0 ? fail_crt() : r;
 }
 WINAPK_GUEST_ABI int64_t g_write(int fd, const void* buf, size_t n) {
     if (auto o = fd_object(fd)) return o->write(buf, n);
-    PositionUse hold(fd);
+    PositionUse hold(fd, PositionUse::DiskOnly);
     const int r = _write(fd, buf, static_cast<unsigned>(n > 0x7fffffff ? 0x7fffffff : n));
     return r < 0 ? fail_crt() : r;
 }
@@ -410,7 +431,7 @@ WINAPK_GUEST_ABI int64_t g_lseek(int fd, int64_t off, int whence) {
         *guest_errno() = kESPIPE;
         return -1;
     }
-    PositionUse hold(fd);
+    PositionUse hold(fd, PositionUse::DiskOnly);
     const int64_t r = _lseeki64(fd, off, whence);
     return r < 0 ? fail_crt() : r;
 }
@@ -487,6 +508,7 @@ WINAPK_GUEST_ABI int g_fsync(int fd) {
     return fail_crt();
 }
 WINAPK_GUEST_ABI int g_ftruncate(int fd, int64_t len) {
+    PositionUse hold(fd);  // _chsize_s seeks
     const errno_t e = _chsize_s(fd, len);
     if (e) {
         set_errno_from_crt(e);
@@ -502,8 +524,10 @@ WINAPK_GUEST_ABI int g_ftruncate(int fd, int64_t len) {
 // missing-function stub answered success without growing it.
 WINAPK_GUEST_ABI int g_posix_fallocate(int fd, int64_t offset, int64_t len) {
     if (offset < 0 || len <= 0) return 22;  // EINVAL
+    if (fd_object(fd)) return 9;  // EBADF
+    PositionUse hold(fd);  // before the lookup: a close can't free the handle while it is in use
     const intptr_t h = _get_osfhandle(fd);
-    if (h == -1 || fd_object(fd)) return 9;  // EBADF
+    if (h == -1) return 9;
     const HANDLE file = reinterpret_cast<HANDLE>(h);
     LARGE_INTEGER size{};
     if (!GetFileSizeEx(file, &size)) return 9;

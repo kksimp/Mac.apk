@@ -109,8 +109,8 @@ WINAPK_GUEST_ABI int64_t g_time(int64_t* t) {
     if (t) *t = s;
     return s;
 }
-// difftime returns a double (xmm0): the missing-function stub's 0 in rax would
-// leave the caller reading whatever xmm0 held.
+// difftime returns a double (d0): the missing-function stub's 0 in x0 would
+// leave the caller reading whatever d0 held.
 WINAPK_GUEST_ABI double g_difftime(int64_t end, int64_t start) {
     return static_cast<double>(end) - static_cast<double>(start);
 }
@@ -1771,7 +1771,7 @@ long double quad_to_ld(GuestQuad q) {
 
 }  // namespace
 
-// Through frexp, not the bytes: the host's long double is x87's 80 bits on x64 but a double on arm64. Both are
+// Through frexp, not the bytes: the host's long double is a plain double on Windows ARM64, which is
 // exact in binary128.
 GuestQuad ld_to_quad(long double v) {
     const uint64_t sign = std::signbit(v) ? 1ull << 63 : 0;
@@ -1909,7 +1909,7 @@ WINAPK_GUEST_ABI GuestPasswd* g_getpwuid(uint32_t uid) {
 //
 // A plain binary search tree, as bionic's: the node's first member is the
 // key, which is what a caller reads through the returned pointer. The
-// comparator and twalk's action are the guest's, called as System V
+// comparator and twalk's action are the guest's, called as AAPCS64
 // functions (an arm64 guest's through the bridge).
 struct TNode {
     const void* key;

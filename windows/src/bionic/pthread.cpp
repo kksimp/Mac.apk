@@ -9,7 +9,7 @@
 // syscall. No side table, nothing to initialize lazily.
 //
 // Threads: pthread_t is a pointer to a host record. A guest start routine is
-// System V; the host thread procedure calls it and then runs the guest's
+// AAPCS64; the host thread procedure calls it and then runs the guest's
 // thread-specific-data destructors, as Bionic's pthread_exit does. Threads the
 // guest did not create (the JVM's) get a record on first use.
 

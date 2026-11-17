@@ -1,7 +1,7 @@
 // string.cpp -- <string.h>, <strings.h>, the <stdlib.h> conversions, <ctype.h>
 // and FORTIFY's _chk variants, for guest code.
 //
-// Most of these are the CRT's own functions behind a System V entry point.
+// Most of these are the CRT's own functions behind an entry point the guest can call.
 // Two things are not: FORTIFY's checks (abort on overflow, as Bionic does) and
 // the wide-character functions, because Android's wchar_t is 32 bits and
 // Windows' is 16.
@@ -213,11 +213,8 @@ WINAPK_GUEST_ABI double g_strtod(const char* s, char** e) {
 WINAPK_GUEST_ABI float g_strtof(const char* s, char** e) {
     return converted<float>([&] { return std::strtof(s, e); });
 }
-// Android's long double is IEEE binary128 on x86_64 and arm64 alike, returned
-// in xmm0 / q0. The CRT's is the x87 80-bit format, and a System V function
-// returning it takes a hidden result pointer in rdi: every argument moved one
-// register over, so strtold(s, e) read its string from e (Waze's map, NULL).
-// On arm64 the CRT's is a double. ld_to_quad converts either.
+// Android's long double is IEEE binary128, returned in q0. The CRT's is a plain
+// double, returned in d0, which the caller would not read. ld_to_quad converts.
 WINAPK_GUEST_ABI GuestQuad g_strtold(const char* s, char** e) {
     return ld_to_quad(converted<long double>([&] { return std::strtold(s, e); }));
 }

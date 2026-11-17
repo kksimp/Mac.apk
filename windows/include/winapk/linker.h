@@ -27,7 +27,7 @@
 //     of a symbol the library defines itself).
 //   * dlsym(handle) walks the handle's dependency tree breadth-first, so a
 //     dependency's Java_* symbols are found through the library that needs it.
-//     The addresses it returns are raw System V addresses: a guest that calls
+//     The addresses it returns are raw guest addresses: a guest that calls
 //     another library's JNI_OnLoad itself (Unity's libmain does) gets the real
 //     function.
 //   * dlclose: each dlopen (and each open() by the host, for a library
@@ -65,7 +65,7 @@ struct LinkerConfig {
     // the library that needs it.
     std::vector<std::filesystem::path> search_paths;
     // The host shim: libc, libm, liblog and the other system libraries. Must
-    // return System V callable addresses (or data addresses).
+    // return guest-callable addresses (or data addresses).
     SymbolResolver host;
     LoadOptions load;
 };

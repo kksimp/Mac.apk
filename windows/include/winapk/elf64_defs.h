@@ -1,7 +1,7 @@
 // elf64_defs.h -- the slice of the ELF64 format the Win.apk loader reads.
 //
 // Windows has no <elf.h>, so the layouts are spelled out here. Field names
-// and constant values follow the System V gABI and the x86-64 psABI exactly,
+// and constant values follow the System V gABI (the ELF64 format, shared by every architecture) exactly,
 // so anything here can be checked against `readelf` output one-to-one. The
 // AArch64 relocation types follow Arm's "ELF for the Arm 64-bit Architecture".
 

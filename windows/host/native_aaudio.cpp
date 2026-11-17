@@ -225,7 +225,7 @@ WINAPK_GUEST_ABI int AAudioStreamBuilder_openStream(void* b, void** stream) {
     s->input_preset = bld->input_preset > 0 ? bld->input_preset : 6;
     s->raw_data_cb = bld->data_cb;
     s->user_data = bld->user_data;
-    // A guest function pointer: arm64 code gets a System V entry for the host.
+    // A guest function pointer: arm64 code gets an entry the host can call.
     s->data_cb = reinterpret_cast<DataCallback>(bld->data_cb ? arm64::host_callable(bld->data_cb) : nullptr);
     s->out = audio::stream_create(s->sample_rate, s->channels, s->encoding(), s->buffer_capacity);
     if (!s->out) {

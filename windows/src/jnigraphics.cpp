@@ -11,12 +11,12 @@
 // (R, G, B, A, premultiplied for a premultiplied bitmap), and unlockPixels
 // merges the guest's writes back into the int[].
 //
-// What this file adds is the boundary: System V entry points, and the guest's
+// What this file adds is the boundary: guest-ABI entry points, and the guest's
 // JNIEnv swapped for the host one it wraps (jobject handles are HotSpot's on
 // both sides). AndroidBitmapInfo has the same layout on both sides, so it is
 // filled in place:
 //
-//   AndroidBitmapInfo   Android x86_64       Windows x64
+//   AndroidBitmapInfo   Android arm64        Windows ARM64
 //   width                0  uint32_t          0  uint32_t
 //   height               4  uint32_t          4  uint32_t
 //   stride               8  uint32_t          8  uint32_t

@@ -7,11 +7,11 @@
 // as "output buffer full" then grows its buffer until memcpy faults.
 //
 // The work is done by the real zlib, linked statically (MSYS2's libz.a, zlib
-// license). This file is the boundary. Calls arrive System V, and the structs
+// license). This file is the boundary. Calls arrive AAPCS64, and the structs
 // differ, because zlib is written in uInt, 32 bits on both sides, and uLong,
 // which is 64 bits on Android (LP64) and 32 bits on Windows (LLP64):
 //
-//   z_stream    Android x86_64 (guest)     Windows x64 (host zlib)
+//   z_stream    Android arm64 (LP64, guest)  Windows ARM64 (LLP64, host zlib)
 //               offset  size               offset  size
 //   next_in        0     8                    0     8
 //   avail_in       8     4                    8     4
@@ -115,7 +115,7 @@ static_assert(offsetof(gzFile_s, next) == 8 && offsetof(gzFile_s, pos) == 16 && 
 using GuestAlloc = void*(WINAPK_GUEST_ABI*)(void* opaque, uInt items, uInt size);
 using GuestFree = void(WINAPK_GUEST_ABI*)(void* opaque, void* address);
 
-// Android's z_stream on x86_64.
+// Android's z_stream on arm64 (LP64).
 struct GuestZStream {
     const Bytef* next_in;
     uInt avail_in;
@@ -136,7 +136,7 @@ static_assert(sizeof(GuestZStream) == 112 && offsetof(GuestZStream, total_in) ==
                   offsetof(GuestZStream, state) == 56 && offsetof(GuestZStream, adler) == 96,
               "Android's z_stream, as drawn at the top of the file");
 
-// Android's gz_header on x86_64.
+// Android's gz_header on arm64 (LP64).
 struct GuestGzHeader {
     int text;
     gulong time;

@@ -10,7 +10,7 @@
 //     copy with a .source sidecar naming the ELF (guest_libs.h), opened
 //     through the guest linker, and the entry point looked up in it. Neither
 //     runs JNI_OnLoad, as AOSP's OpenNativeLibrary + dlsym do not.
-//   * Guest code calls System V functions and hands back System V callbacks
+//   * Guest code calls AAPCS64 functions and hands back AAPCS64 callbacks
 //     (guest_abi.h), so every function the guest calls is WINAPK_GUEST_ABI and
 //     every callback pointer in ANativeActivityCallbacks is a WINAPK_GUEST_ABI
 //     type. An arm64 library's callbacks run through the arm64 bridge's

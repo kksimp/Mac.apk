@@ -28,9 +28,9 @@ namespace winapk::bionic {
 // (LP64), Windows' is 32 (LLP64). Never write `long` in a guest signature.
 using glong = int64_t;
 using gulong = uint64_t;
-// A guest long double (IEEE binary128) as System V passes it: in one SSE register.
+// A guest long double (IEEE binary128) as AAPCS64 passes it: in one Q register.
 typedef long long GuestQuad __attribute__((vector_size(16)));
-// The host's long double (x87's 80 bits on x64, a double on arm64) as a guest one (misc.cpp).
+// The host's long double (a plain double on Windows ARM64) as a guest one (misc.cpp).
 GuestQuad ld_to_quad(long double v);
 
 struct ShimSymbol {

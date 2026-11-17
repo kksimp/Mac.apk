@@ -25,7 +25,7 @@ namespace winapk {
 namespace {
 
 // ---- memory ---------------------------------------------------------------
-// Bionic and the UCRT both return 16-byte aligned blocks on x86_64, which is
+// Bionic and the UCRT both return 16-byte aligned blocks on arm64, which is
 // what guest code compiled for Android assumes. A failed allocation sets the
 // guest's errno: the UCRT sets only its own.
 void* out_of_memory() {

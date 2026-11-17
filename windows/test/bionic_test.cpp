@@ -4,7 +4,7 @@
 //   winapk-bionic-test <libwinapk_bionic_guest.so> <scratch dir>
 //
 // The guest library is loaded through the guest linker with the shim as its
-// libc, so every call is a real System V call into the shim with Bionic's
+// libc, so every call is a real AAPCS64 call into the shim with Bionic's
 // layouts. An import the shim does not provide fails the load and is listed.
 //
 // Exit code: the number of failed checks.

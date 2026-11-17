@@ -128,7 +128,7 @@ constexpr UINT kRunReady = WM_APP + 11;       // the app's window is up; lParam:
 constexpr UINT kGmsAccount = WM_APP + 12;     // lParam: new std::wstring (the signed-in account, or empty)
 constexpr UINT kUpdateChecked = WM_APP + 13;  // lParam: new UpdateCheck (the check, with its result)
 constexpr UINT kUpdateProgress = WM_APP + 14; // wParam: percent of Win.apk-Setup.exe downloaded
-constexpr UINT kUpdateDownloaded = WM_APP + 15;  // wParam: ok (complete and checked)
+constexpr UINT kUpdateDownloaded = WM_APP + 15;  // lParam: new UpdateFile (the installer, checked, or why not)
 constexpr UINT kSetupChanged = WM_APP + 16;   // the Downloads folder changed while the Google services setup is open
 constexpr UINT kSetupChecked = WM_APP + 17;   // lParam: new SetupCheck (winapk-runtime --verify-apk's answer)
 constexpr UINT_PTR kInfoBarTimer = 2;  // the InfoBar closes itself
@@ -2069,6 +2069,46 @@ DWORD WINAPI update_check_thread(void* param) {
     return 0;
 }
 
+// What an update thread reports in kUpdateDownloaded. `file` is the installer opened without sharing writing and
+// hashed through that same handle: the UI thread runs the installer while it is still open, so the file run is
+// the file checked. The receiver owns the handle.
+struct UpdateFile {
+    enum Result { kReady, kNotDownloaded, kNotOpened, kBadChecksum };
+    Result result = kNotDownloaded;
+    fs::path path;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    ~UpdateFile() {
+        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    }
+};
+
+// `present`: the file was fully downloaded (or kept) and is worth opening. A file that is whole but does not
+// match its checksum is removed; one that cannot be opened is left, since it may only be in use.
+std::unique_ptr<UpdateFile> verify_setup(const fs::path& path, const std::string& want, bool present) {
+    auto u = std::make_unique<UpdateFile>();
+    u->path = path;
+    if (!present) return u;
+    u->result = UpdateFile::kNotOpened;
+    u->file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                          FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (u->file == INVALID_HANDLE_VALUE) return u;
+    if (want.empty() || sha256_of_handle(u->file) != want) {
+        CloseHandle(u->file);
+        u->file = INVALID_HANDLE_VALUE;
+        std::error_code ec;
+        fs::remove(path, ec);
+        u->result = UpdateFile::kBadChecksum;
+        return u;
+    }
+    u->result = UpdateFile::kReady;
+    return u;
+}
+
+void post_update_file(std::unique_ptr<UpdateFile> u) {
+    UpdateFile* raw = u.release();
+    if (!PostMessageW(g_main, kUpdateDownloaded, 0, reinterpret_cast<LPARAM>(raw))) delete raw;  // closes its handle
+}
+
 // Downloads the release's Win.apk-Setup.exe to updates\, and keeps it only when it is whole: the size and the
 // SHA-256 GitHub gives. start_update asks only for a release that gives both.
 DWORD WINAPI update_download_thread(void* param) {
@@ -2083,11 +2123,16 @@ DWORD WINAPI update_download_thread(void* param) {
         PostMessageW(g_main, kUpdateProgress, static_cast<WPARAM>(pct), 0);
     }, L"", updater_session(), github_host);
     std::error_code ec;
-    const std::string want = setup_sha256(*r);
-    bool ok = status == 200 && r->size > 0 && fs::file_size(file, ec) == r->size && !ec;
-    ok = ok && !want.empty() && sha256_of(file) == want;
-    if (!ok) fs::remove(file, ec);
-    PostMessageW(g_main, kUpdateDownloaded, ok, 0);
+    const bool whole = status == 200 && r->size > 0 && fs::file_size(file, ec) == r->size && !ec;
+    if (!whole) fs::remove(file, ec);
+    post_update_file(verify_setup(file, setup_sha256(*r), whole));
+    return 0;
+}
+
+// Checks an installer already on disk (one kept from an earlier "Update") off the UI thread, the same way.
+DWORD WINAPI update_verify_thread(void* param) {
+    std::unique_ptr<Release> r(static_cast<Release*>(param));
+    post_update_file(verify_setup(setup_file(r->version), setup_sha256(*r), true));
     return 0;
 }
 
@@ -5718,24 +5763,13 @@ bool update_can_start() {
 
 // Runs the downloaded installer and closes the library, so that the installer can replace Win.apk.exe; false
 // when it did not start.
-bool run_installer() {
+bool run_installer(UpdateFile& u) {
     if (!update_can_start()) return false;
-    const fs::path setup = setup_file(g_update.latest().version);
-    const std::string want = setup_sha256(g_update.latest());
-    // Hashed through a handle that shares no writing and stays open until the installer has started, so that
-    // the file run is the file checked, whether just downloaded or kept from an earlier "Update".
-    HANDLE f = CreateFileW(setup.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE || want.empty() || sha256_of_handle(f) != want) {
-        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
-        std::error_code ec;
-        fs::remove(setup, ec);
-        info(L"The downloaded update didn't match its checksum and was removed. Try again.", kError);
-        return false;
-    }
-    const auto r = reinterpret_cast<INT_PTR>(ShellExecuteW(g_main, L"open", setup.c_str(), nullptr, nullptr,
+    // u.file, held open since it was hashed, closes when u does: after the installer has started.
+    const auto r = reinterpret_cast<INT_PTR>(ShellExecuteW(g_main, L"open", u.path.c_str(), nullptr, nullptr,
                                                            SW_SHOWNORMAL));
-    CloseHandle(f);
+    CloseHandle(u.file);
+    u.file = INVALID_HANDLE_VALUE;
     if (r <= 32) {
         info(L"The installer could not be started.", kError);
         return false;
@@ -5765,26 +5799,39 @@ void start_update() {
     }
     if (!update_can_start()) return;
     std::error_code ec;
-    if (fs::file_size(setup_file(r.version), ec) == r.size && !ec) {  // downloaded before; run_installer hashes it
-        run_installer();
-        return;
+    const bool kept = fs::file_size(setup_file(r.version), ec) == r.size && !ec;  // downloaded before
+    if (!kept) {
+        remove_old_setups();
+        fs::create_directories(updates_dir(), ec);
     }
-    remove_old_setups();
-    fs::create_directories(updates_dir(), ec);
     auto* job = new Release(r);
-    if (HANDLE t = CreateThread(nullptr, 0, update_download_thread, job, 0, nullptr)) {
+    if (HANDLE t = CreateThread(nullptr, 0, kept ? update_verify_thread : update_download_thread, job, 0, nullptr)) {
         CloseHandle(t);
+        // The checking of a kept file holds the Update button as a download does, at its last step.
         g_update.begin_download();
-        info(fmt(L"Downloading Win.apk {0}…", {r.version}), kInfo);
+        if (kept) g_update.progress(99);
+        else info(fmt(L"Downloading Win.apk {0}…", {r.version}), kInfo);
     } else {
         delete job;
     }
 }
 
-void update_downloaded(bool ok) {
+void update_downloaded(std::unique_ptr<UpdateFile> u) {
     g_update.downloaded();
-    if (ok && run_installer()) return;  // the library is gone
-    if (!ok) info(L"Couldn't download the update. Check the internet connection.", kError);
+    if (u->result == UpdateFile::kReady && run_installer(*u)) return;  // the library is gone
+    switch (u->result) {
+        case UpdateFile::kNotDownloaded:
+            info(L"Couldn't download the update. Check the internet connection.", kError);
+            break;
+        case UpdateFile::kNotOpened:
+            info(L"Couldn't open the downloaded update. Close any program using it, then try again.", kError);
+            break;
+        case UpdateFile::kBadChecksum:
+            info(L"The downloaded update didn't match its checksum and was removed. Try again.", kError);
+            break;
+        case UpdateFile::kReady:
+            break;  // run_installer said why it did not start
+    }
     if (g_view == kSettingsView) rebuild_page();
 }
 
@@ -8252,7 +8299,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case kUpdateProgress: update_progress(static_cast<int>(wp)); return 0;
-        case kUpdateDownloaded: update_downloaded(wp != 0); return 0;
+        case kUpdateDownloaded:
+            update_downloaded(std::unique_ptr<UpdateFile>(reinterpret_cast<UpdateFile*>(lp)));
+            return 0;
         case WM_GETMINMAXINFO:
             reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = {ipx(680), ipx(520)};
             return 0;

@@ -301,6 +301,10 @@ int pipe(int[2]);
 int eventfd(unsigned, int);
 struct pollfd { int fd; short events, revents; };
 int poll(struct pollfd*, unsigned long, int);
+typedef struct { unsigned long bits[16]; } guest_fd_set;
+struct guest_timeval { long sec, usec; };
+int select(int, guest_fd_set*, guest_fd_set*, guest_fd_set*, struct guest_timeval*);
+#define GUEST_FD_ISSET(fd, s) (((s)->bits[(fd) / 64] >> ((fd) % 64)) & 1)
 int epoll_create1(int);
 struct WINAPK_EPOLL_PACKED epoll_event { unsigned events; unsigned long data; };
 int epoll_ctl(int, int, int, struct epoll_event*);
@@ -349,8 +353,18 @@ static void test_event_fds(void) {
     check("pipe write/read", pipe(p) == 0 && write(p[1], "ping", 4) == 4 && read(p[0], b, 16) == 4 && !strcmp(b, "ping"), b);
     struct pollfd pf = {p[0], 1, 0};
     check("poll: empty pipe times out", poll(&pf, 1, 10) == 0, 0);
+    guest_fd_set rs = {{0}};
+    rs.bits[p[0] / 64] |= 1UL << (p[0] % 64);
+    struct guest_timeval tv = {0, 10000};
+    check("select: empty pipe times out, clears the set and the timeout",
+          select(p[0] + 1, &rs, 0, 0, &tv) == 0 && !GUEST_FD_ISSET(p[0], &rs) && tv.sec == 0 && tv.usec == 0, 0);
     write(p[1], "x", 1);
     check("poll: pipe readable", poll(&pf, 1, 100) == 1 && (pf.revents & 1), 0);
+    rs.bits[p[0] / 64] |= 1UL << (p[0] % 64);
+    tv = (struct guest_timeval){5, 0};
+    check("select: pipe readable, the timeout keeps the time left",
+          select(p[0] + 1, &rs, 0, 0, &tv) == 1 && GUEST_FD_ISSET(p[0], &rs) && tv.sec >= 4 &&
+              tv.sec * 1000000 + tv.usec <= 5000000, 0);
     read(p[0], b, 1);
     fcntl(p[0], 4, 04000);  // F_SETFL O_NONBLOCK
     check("non-blocking empty read is EAGAIN", read(p[0], b, 1) == -1 && *__errno() == 11, 0);

@@ -489,6 +489,13 @@ under `runtime/`):
   AOSP's `PhoneWindow` does (a view added to the decor floats over the content),
   and `findViewById(android.R.id.content)` finds the sub-decor's frame in that
   tree before upstream's frame-root unwrap.
+- `runtime/java/android/app/Activity.java`: a canvas-path view's
+  `ViewCanvasDriver` is registered with the host behind `CanvasViewRenderer`,
+  which makes the hop to the main loop itself and drops the frame there once
+  the content swap has released the view. A frame the host asked for just
+  before the swap otherwise presented the old screen after it, and that frame
+  stayed as the overlay over a GL content view (glmark2's benchmark ran under a
+  frozen copy of its menu). On the Mac a view out of the window gets no draws.
 - `runtime/java/android/bluetooth/` (`BluetoothAdapter`, `BluetoothDevice`,
   `BluetoothGatt`, `BluetoothManager`, `le/BluetoothLeScanner`,
   `le/ScanRecord`): WinARM.apk's `HostBluetooth` versions (below); the pre-API-21

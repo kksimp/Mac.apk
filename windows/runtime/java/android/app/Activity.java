@@ -2700,7 +2700,9 @@ public class Activity extends ContextThemeWrapper
             if (mtkv != 0) {
                 com.macapk.loader.ViewCanvasDriver driver
                     = new com.macapk.loader.ViewCanvasDriver(view);
-                com.macapk.loader.NativeCocoa.setRenderer(mtkv, driver);
+                CanvasViewRenderer renderer = new CanvasViewRenderer(driver);
+                canvasRenderers.put(mtkv, renderer);
+                com.macapk.loader.NativeCocoa.setRenderer(mtkv, renderer);
                 viewHandle = mtkv;
                 // v1.0.572: remember that this wiring saw NO native surface,
                 // so a SurfaceView attached to this tree LATER can rewire the
@@ -2854,7 +2856,61 @@ public class Activity extends ContextThemeWrapper
     /** The canvas-path MTKView currently installed as the window content, or 0. */
     private static long canvasOnlyWiredMtkv;
 
+    /** The renderer of each canvas-path view still registered with the host, by view. */
+    private static final java.util.Map<Long, CanvasViewRenderer> canvasRenderers =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** What the host ticks for a canvas-path view: its ViewCanvasDriver, behind a
+     *  gate that closes when the view stops being the window content.
+     *
+     *  The host's tick asks for a frame from its render thread, and the driver
+     *  posts the traversal and present to the main loop. A frame asked for just
+     *  before a content swap therefore ran just AFTER it: the old screen's tree
+     *  was presented once more, after setContentView had cleared the window's
+     *  tree layer, and stayed there as the overlay over the new content's GL
+     *  frames (glmark2: Run opened the benchmark's GLSurfaceView, which rendered
+     *  at full rate under a frozen copy of the menu). On the Mac a view out of
+     *  the window simply gets no more draws. Here the hop to the main loop is
+     *  made by this wrapper, and the gate is checked there: the swap releases
+     *  the view on that same thread, so a frame either presents before the
+     *  swap (whose clear then drops it) or not at all. */
+    private static final class CanvasViewRenderer implements com.macapk.loader.MetalSurfaceCallbacks {
+        private final com.macapk.loader.ViewCanvasDriver driver;
+        private final java.util.concurrent.atomic.AtomicBoolean framePending =
+            new java.util.concurrent.atomic.AtomicBoolean();
+        private volatile boolean retired;
+        private android.os.Handler loop;
+
+        CanvasViewRenderer(com.macapk.loader.ViewCanvasDriver driver) { this.driver = driver; }
+
+        /** Main loop only (where the content swap runs). */
+        void retire() { retired = true; }
+
+        @Override public void macapkSurfaceChanged(int widthPx, int heightPx) {
+            if (!retired) driver.macapkSurfaceChanged(widthPx, heightPx);
+        }
+
+        @Override public void macapkDrawFrame() {
+            if (retired) return;
+            if (android.os.Looper.MACAPK_REAL_LOOPER && !android.os.Looper.macapkIsActivityThread()) {
+                // At most one frame in flight, as the driver itself coalesces.
+                if (!framePending.compareAndSet(false, true)) return;
+                if (loop == null) {
+                    loop = android.os.Handler.macapkCreateOwnerOnly(android.os.Looper.getMainLooper());
+                }
+                loop.post(() -> {
+                    framePending.set(false);
+                    if (!retired) driver.macapkDrawFrame();   // on the loop: the driver draws inline
+                });
+                return;
+            }
+            driver.macapkDrawFrame();
+        }
+    }
+
     private static void macapkReleaseCanvasView(long mtkv) {
+        CanvasViewRenderer renderer = canvasRenderers.remove(mtkv);
+        if (renderer != null) renderer.retire();
         try { NativeCocoa.releaseRenderer(mtkv); }
         catch (Throwable t) {
             com.macapk.loader.NativeLog.w("Mac.apk.Activity", "releaseRenderer failed: " + t);

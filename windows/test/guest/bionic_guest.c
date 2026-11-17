@@ -323,6 +323,7 @@ static void* waker(void* arg) {
 
 size_t malloc_usable_size(const void*);
 int posix_memalign(void**, size_t, size_t);
+void* realloc(void*, size_t);
 static void test_malloc_usable_size(void) {
     void* p = malloc(100);
     check("malloc_usable_size of a malloc block is at least its size", p && malloc_usable_size(p) >= 100, 0);
@@ -330,6 +331,15 @@ static void test_malloc_usable_size(void) {
     void* q = 0;
     check("malloc_usable_size of a posix_memalign(64) block", posix_memalign(&q, 64, 200) == 0 && q &&
               malloc_usable_size(q) >= 200, 0);
+    // A size the over-aligned path cannot pad without wrapping, and a realloc that fails: the old block is kept.
+    const size_t huge = (size_t)-1 - 8;
+    void* r = 0;
+    check("posix_memalign of a size that would wrap is ENOMEM", posix_memalign(&r, 64, huge) == 12 && !r, 0);
+    if (q) memset(q, 0x5a, 200);
+    *__errno() = 0;
+    check("a failed realloc of an aligned block is ENOMEM", q && realloc(q, huge) == 0 && *__errno() == 12, 0);
+    check("a failed realloc keeps the aligned block",
+          q && ((unsigned char*)q)[199] == 0x5a && malloc_usable_size(q) >= 200, 0);
     free(q);
 }
 

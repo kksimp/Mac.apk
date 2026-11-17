@@ -1147,13 +1147,23 @@ constexpr wchar_t kRepo[] = L"https://f-droid.org/repo/";
 constexpr unsigned long long kCatalogMaxAge = 6ull * 3600 * 10000000;
 
 // Files under store\ are named from the index, which the network hands us: only these names reach a path or
-// a URL, so none can be absolute, a drive ("C:x"), a parent ("..") or a stream ("x:y").
+// a URL, so none can be absolute, a drive ("C:x"), a parent (".."), a stream ("x:y") or a device ("nul.x").
 bool ascii_letter(char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
 bool ascii_alnum(char c) { return ascii_letter(c) || (c >= '0' && c <= '9'); }
 
-// Android's rule for a package (PackageParser.validateName), as the installer checks it.
+// CON, PRN, AUX, NUL, COM0-9 and LPT0-9 name a device, not a file, and before Windows 11 they do so with any
+// extension ("con.x.png"): no name whose first part is one reaches a path.
+bool is_device_name(const std::string& s) {
+    const std::string first = s.substr(0, s.find('.'));
+    auto is = [&first](const char* d) { return _stricmp(first.c_str(), d) == 0; };
+    if (is("con") || is("prn") || is("aux") || is("nul")) return true;
+    if (first.size() != 4 || first[3] < '0' || first[3] > '9') return false;
+    return _strnicmp(first.c_str(), "com", 3) == 0 || _strnicmp(first.c_str(), "lpt", 3) == 0;
+}
+
+// Android's rule for a package (PackageParser.validateName), as the installer checks it, less device names.
 bool is_package_name(const std::string& s) {
-    if (s.size() > 255) return false;
+    if (s.size() > 255 || is_device_name(s)) return false;
     size_t parts = 0;
     for (size_t i = 0; i <= s.size();) {
         const size_t dot = (std::min)(s.find('.', i), s.size());
@@ -1170,7 +1180,7 @@ bool is_package_name(const std::string& s) {
 // One plain name in the repository (an APK, an icon, a language): letters, digits, '.', '_' and '-', not
 // starting with a '.'.
 bool is_repo_file_name(const std::string& s) {
-    if (s.empty() || s.size() > 255 || s[0] == '.') return false;
+    if (s.empty() || s.size() > 255 || s[0] == '.' || is_device_name(s)) return false;
     for (const char c : s) {
         if (!ascii_alnum(c) && c != '.' && c != '_' && c != '-') return false;
     }
@@ -5025,7 +5035,9 @@ void refresh_account() {
     if (t) {
         CloseHandle(t);
     } else {
+        // No query will answer: show the last answer (or none) rather than "Checking…"; the next activation asks.
         g_accounts_busy = false;
+        g_accounts_known = true;
     }
 }
 
@@ -5059,6 +5071,10 @@ void google_signout(const std::wstring& account) {
     }
     std::wstring text;
     if (run_gms(L"signout " + gms_arg(account), &text) == 0) {
+        // Gone at once, so its Sign out button doesn't outlive it while the query below starts a JVM.
+        g_accounts.erase(std::remove(g_accounts.begin(), g_accounts.end(), account), g_accounts.end());
+        g_account = g_accounts.empty() ? L"" : g_accounts[0];
+        g_account_photo_key.clear();
         info(fmt(L"Signed out of {0}.", {account}), kInfo);
         refresh_account();
     } else {

@@ -511,6 +511,7 @@ jobs:
           python windows/test/compat/sweep.py --runtime stage `
             --apks apk-cache --out smoke --frames 150 --timeout 180 `
             --only-from windows/test/compat/smoke.txt --skip dev.lonami.klooni --require-drew
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python windows/scripts/merge_classlists.py framework.classlist (Get-ChildItem classlists/*.classlist)
       - name: An app whose library uses x18 ends and says why
         shell: pwsh

@@ -457,7 +457,8 @@ bool app_overrides(View* v, const std::wstring& url, bool redirect, bool gesture
     // dispatching its messages and queued work while waiting, or they time out.
     DWORD r = WAIT_TIMEOUT;
     const ULONGLONG deadline = GetTickCount64() + kDecisionWaitMs;
-    for (;;) {
+    bool quitting = false;
+    while (!quitting) {
         const ULONGLONG now = GetTickCount64();
         if (now >= deadline) break;
         r = MsgWaitForMultipleObjects(1, &done, FALSE, static_cast<DWORD>(deadline - now), QS_ALLINPUT);
@@ -465,13 +466,19 @@ bool app_overrides(View* v, const std::wstring& url, bool redirect, bool gesture
         MSG m;
         while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
             if (m.message == WM_QUIT) {
+                // Re-posted so the thread's main loop still ends; a pending quit makes the
+                // wait return at once, so stop waiting rather than spin until the deadline.
                 PostQuitMessage(static_cast<int>(m.wParam));
+                quitting = true;
                 break;
             }
             TranslateMessage(&m);
             DispatchMessageW(&m);
         }
     }
+    // A nested navigation's own wait can outlast this one's deadline, and the app
+    // may have answered this decision meanwhile.
+    if (r != WAIT_OBJECT_0 && WaitForSingleObject(done, 0) == WAIT_OBJECT_0) r = WAIT_OBJECT_0;
     bool allow = true;
     {
         std::lock_guard<std::mutex> hold(g_decisions_lock);

@@ -76,6 +76,7 @@
 #include <winternl.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1186,24 +1187,31 @@ HINTERNET http_session() {
 // whole. With an `etag` the server may answer 304, not modified. `progress`
 // gets the bytes so far and the total (0 when unknown); `headers` are more
 // request headers ("Name: value", CRLF between); `session` defaults to the
-// store's. Returns the HTTP status, 0 when the server could not be reached or
-// the body broke off.
+// store's. Only https is fetched, and with `host_ok` only from the hosts it
+// accepts, the one a redirect ends on included. Returns the HTTP status, 0
+// when the server could not be reached, the body broke off or the URL was
+// refused.
 int http_get(const std::wstring& url, const fs::path& out, const std::wstring& etag, std::wstring* new_etag,
              const std::function<void(uint64_t, uint64_t)>& progress, const std::wstring& headers = L"",
-             HINTERNET session = nullptr) {
-    URL_COMPONENTS uc{};
-    uc.dwStructSize = sizeof(uc);
-    uc.dwHostNameLength = uc.dwUrlPathLength = uc.dwExtraInfoLength = static_cast<DWORD>(-1);
-    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return 0;
-    const std::wstring host(uc.lpszHostName, uc.dwHostNameLength);
+             HINTERNET session = nullptr, bool (*host_ok)(const std::wstring&) = nullptr) {
+    // The https host of `u`, empty when it is not an https URL.
+    auto https_host = [](const wchar_t* u, URL_COMPONENTS* c) {
+        *c = URL_COMPONENTS{};
+        c->dwStructSize = sizeof(*c);
+        c->dwHostNameLength = c->dwUrlPathLength = c->dwExtraInfoLength = static_cast<DWORD>(-1);
+        if (!WinHttpCrackUrl(u, 0, 0, c) || c->nScheme != INTERNET_SCHEME_HTTPS) return std::wstring();
+        return std::wstring(c->lpszHostName, c->dwHostNameLength);
+    };
+    URL_COMPONENTS uc;
+    const std::wstring host = https_host(url.c_str(), &uc);
+    if (host.empty() || (host_ok && !host_ok(host))) return 0;
     const std::wstring path = std::wstring(uc.lpszUrlPath, uc.dwUrlPathLength) +
                               std::wstring(uc.lpszExtraInfo, uc.dwExtraInfoLength);
     if (!session) session = http_session();
     if (!session) return 0;
     HINTERNET connection = WinHttpConnect(session, host.c_str(), uc.nPort, 0);
     HINTERNET request = connection ? WinHttpOpenRequest(connection, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER,
-                                                        WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                                        uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0)
+                                                        WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)
                                    : nullptr;
     int status = 0;
     std::wstring header = etag.empty() ? L"" : L"If-None-Match: " + etag;
@@ -1216,6 +1224,16 @@ int http_get(const std::wstring& url, const fs::path& out, const std::wstring& e
         WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                             WINHTTP_HEADER_NAME_BY_INDEX, &code, &size, WINHTTP_NO_HEADER_INDEX);
         status = static_cast<int>(code);
+        // WinHTTP follows redirects on its own: the URL answered is where they ended.
+        DWORD url_size = 0;
+        WinHttpQueryOption(request, WINHTTP_OPTION_URL, nullptr, &url_size);
+        std::wstring final_url(url_size / sizeof(wchar_t), L'\0');
+        URL_COMPONENTS fc;
+        const std::wstring final_host =
+            url_size && WinHttpQueryOption(request, WINHTTP_OPTION_URL, final_url.data(), &url_size)
+                ? https_host(final_url.c_str(), &fc)
+                : std::wstring();
+        if (final_host.empty() || (host_ok && !host_ok(final_host))) status = 0;
         if (status == 200) {
             DWORD total = 0;
             size = sizeof(total);
@@ -1257,13 +1275,11 @@ int http_get(const std::wstring& url, const fs::path& out, const std::wstring& e
     return status;
 }
 
-// The file's SHA-256 in lower-case hex, as F-Droid's index gives it.
-std::string sha256_of(const fs::path& file) {
+// The SHA-256 of what is left to read of `f`, in lower-case hex as F-Droid's index gives it.
+std::string sha256_of_handle(HANDLE f) {
     std::string out;
     BCRYPT_ALG_HANDLE alg = nullptr;
     BCRYPT_HASH_HANDLE hash = nullptr;
-    HANDLE f = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
-                           nullptr);
     if (f != INVALID_HANDLE_VALUE &&
         BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0)) &&
         BCRYPT_SUCCESS(BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0))) {
@@ -1284,6 +1300,13 @@ std::string sha256_of(const fs::path& file) {
     }
     if (hash) BCryptDestroyHash(hash);
     if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    return out;
+}
+
+std::string sha256_of(const fs::path& file) {
+    HANDLE f = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+    const std::string out = sha256_of_handle(f);
     if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
     return out;
 }
@@ -1774,6 +1797,17 @@ HINTERNET updater_session() {
     return session;
 }
 
+// The hosts the update check and the installer come from: GitHub's API, a release's download URL and the
+// storage its redirect goes to. What runs as the installer is never taken from anywhere else.
+bool github_host(const std::wstring& host) {
+    static const wchar_t* const kHosts[] = {L"api.github.com", L"github.com", L"objects.githubusercontent.com",
+                                            L"release-assets.githubusercontent.com"};
+    for (const wchar_t* h : kHosts) {
+        if (_wcsicmp(host.c_str(), h) == 0) return true;
+    }
+    return false;
+}
+
 // 0.2.0 of "v0.2.0-preview": the numbers before any -suffix or +build.
 std::vector<unsigned> version_numbers(const std::wstring& v) {
     std::vector<unsigned> out;
@@ -1859,6 +1893,19 @@ struct Release {
     uint64_t size = 0;                       // the asset's bytes
     FILETIME published{};
 };
+
+// The installer's SHA-256 in lower-case hex, from the asset's digest; empty when GitHub gave none, and then
+// the installer is not run.
+std::string setup_sha256(const Release& r) {
+    constexpr size_t kPrefix = sizeof("sha256:") - 1;
+    if (r.digest.size() != kPrefix + 64 || r.digest.compare(0, kPrefix, "sha256:") != 0) return {};
+    std::string hex = r.digest.substr(kPrefix);
+    for (char& c : hex) {
+        if (!std::isxdigit(static_cast<unsigned char>(c))) return {};
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return hex;
+}
 
 // "2026-10-01T12:00:00Z" as a FILETIME; zero when it is not one.
 FILETIME iso_filetime(const std::string& s) {
@@ -1957,7 +2004,7 @@ DWORD WINAPI update_check_thread(void* param) {
             etag = utf8_to_wide(s);
         }
         const int status = http_get(kReleasesUrl, releases_file(), etag, &new_etag, {},
-                                    L"Accept: application/vnd.github+json", updater_session());
+                                    L"Accept: application/vnd.github+json", updater_session(), github_host);
         if (status == 200) {
             std::ofstream(releases_etag_file(), std::ios::binary | std::ios::trunc) << wide_to_utf8(new_etag);
         }
@@ -1974,8 +2021,8 @@ DWORD WINAPI update_check_thread(void* param) {
     return 0;
 }
 
-// Downloads the release's Win.apk-Setup.exe to updates\, and keeps it only when it is whole: the size GitHub
-// gives, and its SHA-256 when GitHub gives that too.
+// Downloads the release's Win.apk-Setup.exe to updates\, and keeps it only when it is whole: the size and the
+// SHA-256 GitHub gives. start_update asks only for a release that gives both.
 DWORD WINAPI update_download_thread(void* param) {
     std::unique_ptr<Release> r(static_cast<Release*>(param));
     int shown = -1;
@@ -1986,10 +2033,11 @@ DWORD WINAPI update_download_thread(void* param) {
         if (pct == shown) return;
         shown = pct;
         PostMessageW(g_main, kUpdateProgress, static_cast<WPARAM>(pct), 0);
-    }, L"", updater_session());
+    }, L"", updater_session(), github_host);
     std::error_code ec;
+    const std::string want = setup_sha256(*r);
     bool ok = status == 200 && r->size > 0 && fs::file_size(file, ec) == r->size && !ec;
-    if (ok && r->digest.rfind("sha256:", 0) == 0) ok = "sha256:" + sha256_of(file) == r->digest;
+    ok = ok && !want.empty() && sha256_of(file) == want;
     if (!ok) fs::remove(file, ec);
     PostMessageW(g_main, kUpdateDownloaded, ok, 0);
     return 0;
@@ -5590,8 +5638,21 @@ bool update_can_start() {
 bool run_installer() {
     if (!update_can_start()) return false;
     const fs::path setup = setup_file(g_update.latest().version);
+    const std::string want = setup_sha256(g_update.latest());
+    // Hashed through a handle that shares no writing and stays open until the installer has started, so that
+    // the file run is the file checked, whether just downloaded or kept from an earlier "Update".
+    HANDLE f = CreateFileW(setup.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE || want.empty() || sha256_of_handle(f) != want) {
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        std::error_code ec;
+        fs::remove(setup, ec);
+        info(L"The downloaded update didn't match its checksum and was removed. Try again.", kError);
+        return false;
+    }
     const auto r = reinterpret_cast<INT_PTR>(ShellExecuteW(g_main, L"open", setup.c_str(), nullptr, nullptr,
                                                            SW_SHOWNORMAL));
+    CloseHandle(f);
     if (r <= 32) {
         info(L"The installer could not be started.", kError);
         return false;
@@ -5612,9 +5673,16 @@ void start_update() {
                       SW_SHOWNORMAL);
         return;
     }
+    if (setup_sha256(r).empty()) {  // nothing to check the installer against, so it is not run
+        info(L"This update can't be verified: its release gives no checksum for the installer.", kError,
+             L"Open release page", [page = r.page.empty() ? std::wstring(kReleasesPage) : r.page] {
+                 ShellExecuteW(nullptr, L"open", page.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+             });
+        return;
+    }
     if (!update_can_start()) return;
     std::error_code ec;
-    if (fs::file_size(setup_file(r.version), ec) == r.size && !ec) {  // downloaded and checked before
+    if (fs::file_size(setup_file(r.version), ec) == r.size && !ec) {  // downloaded before; run_installer hashes it
         run_installer();
         return;
     }

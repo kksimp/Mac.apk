@@ -138,12 +138,25 @@ struct PackState {
     bool es3 = false, subimage = false;
     void save() {
         EGLint version = 2;
-        eglQueryContext(eglGetCurrentDisplay(), eglGetCurrentContext(), EGL_CONTEXT_CLIENT_VERSION, &version);
+        const EGLContext context = eglGetCurrentContext();
+        eglQueryContext(eglGetCurrentDisplay(), context, EGL_CONTEXT_CLIENT_VERSION, &version);
         es3 = version >= 3;
         subimage = es3;
         if (!es3) {
-            const char* ext = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
-            subimage = ext && std::strstr(ext, "GL_NV_pack_subimage") != nullptr;
+            // The extension string is long and a context's never changes: scanned once per ES2 context a thread
+            // reads from, not every frame. The version is still asked each time, since a destroyed context's handle
+            // can come back as one of another version; ES2 contexts on ANGLE all expose the same extensions.
+            struct Known {
+                EGLContext context = EGL_NO_CONTEXT;
+                bool subimage = false;
+            };
+            thread_local Known known;
+            if (context != known.context) {
+                const char* ext = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+                known.subimage = ext && std::strstr(ext, "GL_NV_pack_subimage") != nullptr;
+                known.context = context;
+            }
+            subimage = known.subimage;
         }
         // glReadPixels reads the read framebuffer; on ES2 that is the single framebuffer binding.
         glGetIntegerv(es3 ? GL_READ_FRAMEBUFFER_BINDING : GL_FRAMEBUFFER_BINDING, &read_fbo);

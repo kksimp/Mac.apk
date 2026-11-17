@@ -298,6 +298,14 @@ under `runtime/`):
   and Play services refused its caller ("Unknown calling package name"). A
   refused `checkPackage` and a calling pid with no uid on record are each
   logged once (`[appops]`, `[binder]`).
+- `runtime/java/android/os/ParcelFileDescriptor.java`,
+  `com/macapk/loader/NativeOs.java`: on Windows a `java.io.FileDescriptor`
+  holds a HANDLE (its `handle` field) and its `fd` field stays -1, while native
+  code works with CRT descriptor numbers. `NativeOs.fdOf`, `wrap`,
+  `fdForHandle`, `handleForFd` and `closeHandleOf` convert between the two by
+  duplicating the handle (`windows/host/native_os.cpp`), and
+  `ParcelFileDescriptor.adoptFd` and its raw-fd read use them instead of the
+  `fd` field, so a descriptor is usable by Java streams and native code alike.
 - `runtime/java/android/content/Context.java`, `ContextWrapper.java`:
   `createContextAsUser` (the one user's own Context; Play services calls it),
   and a wrapper's `getSystemService` that comes back to itself for the same
@@ -663,6 +671,10 @@ under `runtime/`):
   was null, so camera2 apps and CameraX's ImageCapture had no still output.
   The characteristics gained the keys they read (3A mode lists, zoom 1.0,
   pixel array, thumbnail sizes, output counts). Not Windows-specific.
+- `runtime/java/android/media/Image.java`: `getFence` and `setFence` (API 33),
+  with `SyncFence`: an image answers an empty, already signalled fence unless
+  one was set, as the images here are finished software buffers. Not
+  Windows-specific.
 - `runtime/java/android/view/SurfaceView.java`: a SurfaceView laid out larger
   than its window (a center-cropped camera preview) whose holder has no GL
   consumer yet (no renderer, not a `GLSurfaceView`, not the native-window
@@ -704,6 +716,9 @@ under `runtime/`):
   AOSP's does, not from inside the call; a null listener or a protocol other
   than `PROTOCOL_DNS_SD` is an `IllegalArgumentException`. Not
   Windows-specific.
+- `runtime/java/android/net/nsd/NsdServiceInfo.java`: is `Parcelable` (name,
+  type, host address, port, TXT record), as AOSP's is, so an app can put one in
+  an Intent or a saved-state Bundle. Not Windows-specific.
 - `runtime/java/android/speech/tts/TextToSpeech.java` and
   `android/media/midi/MidiManager.java`: a request that was accepted and
   never answered now ends in the failure AOSP documents, after the call has
@@ -749,6 +764,18 @@ under `runtime/`):
   scans. A host without these natives (the Mac) keeps the old answers: the
   sockets' "no Bluetooth radio", a GATT client that reports the failure, a
   scan that fails.
+- `runtime/java/android/bluetooth/BluetoothManager.java`, `BluetoothHeadset.java`,
+  `BluetoothUuid.java` (new), `BluetoothCodecConfig.java` (new) and
+  `BluetoothCodecStatus.java` (new): `BluetoothManager` has no GATT server
+  or Classic profile behind it, so `getAdapter` answers the default adapter,
+  `getConnectedDevices` and `getDevicesMatchingConnectionStates` an empty
+  list, `getConnectionState` `STATE_DISCONNECTED` and `openGattServer` null
+  (AOSP's own failure return; upstream's CoreBluetooth `BluetoothPeripheralBridge`
+  is not here). `BluetoothHeadset` gains the system APIs `connect` and
+  `disconnect`, which answer false. The three new classes are AOSP's value
+  types and UUID helpers (no radio needed) that an app's audio and device code
+  links against; no A2DP stream is ever negotiated, so nothing hands one a live
+  codec config.
 - `runtime/java/com/macapk/loader/ActivityHost.java` and
   `MacApkPackageManager.java`: a Custom Tab launch opens in
   `HostBrowserTab` (new, with `HostCustomTabsService`) when the host has a
@@ -798,9 +825,7 @@ under `runtime/`):
   `ChromeTabbedActivity` in `split_chrome.apk`, and was rejected with "no
   launchable activity". `MACAPK_MANIFEST_FEATURE_SPLITS=0` reads the base alone.
   Not Windows-specific.
-- `runtime/java/android/app/HandoffActivityData.java`,
-  `HandoffActivityDataRequestInfo.java` (new, API 37 type-only placeholders)
-  and `com/macapk/loader/ActivityHost.java`: an activity overriding a newer-API
+- `runtime/java/com/macapk/loader/ActivityHost.java`: an activity overriding a newer-API
   callback no longer fails every lifecycle call with `NoClassDefFoundError`;
   a class whose methods cannot be resolved is skipped in favour of the
   superclass declaration, which still dispatches to the override
@@ -966,6 +991,11 @@ under `runtime/`):
   "Google sign-in failed (error: <code>, status <n>)" and stay open instead
   of closing on the app's generic error; leaving then hands the app that
   failure.
+- `runtime/java/com/macapk/gms/GoogleAuthenticator.java`, `SafeParcel.java`:
+  `GoogleAuthenticator.redact` (an email with its local part shortened, for
+  logs) is public and `SafeParcel.beginVariable` / `finishVariable` are
+  package-private, so `AccountManager`, `AccountPhoto` and
+  `AuthorizationService` use them. Same behaviour; not Windows-specific.
 - `runtime/java/android/graphics/drawable/VectorDrawable.java`: a path's
   `android:fillType="evenOdd"` is honoured; icons cut out of a filled shape
   filled solid.
@@ -1177,19 +1207,6 @@ under `runtime/`):
   `AttributeSet.macapkAttributeText`. The bank app com.ideomobile.mercantile
   ran `Integer.decode` on `getAttributeValue(android, "inputType")` and
   crashed on `"number"`.
-- `runtime/net_spi/com/macapk/net/AndroidCharsetAliasProvider.java` (new,
-  registered in `runtime/net_spi/META-INF/services`): a charset name with `_`
-  for `-` (`"UTF_8"`, `"US_ASCII"`, `"UTF_16LE"`) is the charset, as on
-  Android, whose ICU lookup ignores `-` and `_`. `URLEncoder.encode(s, "UTF_8")`
-  threw `UnsupportedEncodingException`. A `CharsetProvider` on the class path
-  rather than a copy of `java.nio.charset.Charset` in `java_base_patch`: the
-  JDK asks providers only after its own charsets miss.
-- `runtime/java/com/android/internal/graphics/drawable/AnimationScaleListDrawable.java`
-  (new) and `android/content/res/Resources.java`: the platform's progress-bar
-  styles root their indeterminate drawable in this @hide class; it now inflates
-  (the animated child, or the static one when the animator duration scale is 0)
-  instead of a transparent drawable, so a progress bar that draws the style's
-  drawable itself (Google Play) shows its spinner. Not Windows-specific.
 - `runtime/java/com/macapk/loader/MacApkPackageManager.java`, `SystemClient.java`,
   `SystemServer.java` (`PROVIDER_PACKAGE`): with the broker on,
   `resolveContentProvider` also finds an authority another installed package
@@ -1227,13 +1244,6 @@ under `runtime/`):
   change. AnkiDroid's LeakCanary failed with `NoSuchFieldException: mViews`.
   `mRoots` is not provided (one `ViewRootImpl` for the process). Not
   Windows-specific.
-- `runtime/java/android/graphics/FontFamily.java` (new), `Typeface.java`
-  (`createFromFamiliesWithDefault`) and `android/content/res/AssetManager.java`
-  (`openNonAsset`): the hidden family builder androidx.core's
-  `TypefaceCompatApi21/24/26/28Impl` reflect on, backed by our font loader; a
-  family becomes an app font family, so its bold face is used for bold.
-  DroidFish logged `ClassNotFoundException: android.graphics.FontFamily`.
-  Not Windows-specific.
 - `runtime/java/android/content/res/AssetManager.java`: `open`, `openFd` and
   `openNonAssetFd` throw `FileNotFoundException` for a name the APK does not
   have, as AOSP does; they threw a plain `IOException`, which a

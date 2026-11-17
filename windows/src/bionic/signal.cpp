@@ -808,7 +808,10 @@ int inject(uint32_t tid, int sig) {
     HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
                           FALSE, tid);
     if (!h) return kESRCH;
-    if (SuspendThread(h) == static_cast<DWORD>(-1)) {
+    // A tid is only a number: Windows reuses it, and a caller can name any. Checked on the open handle, so
+    // the thread cannot change owner between the check and the suspend; another process's thread is not ours
+    // to redirect.
+    if (GetProcessIdOfThread(h) != GetCurrentProcessId() || SuspendThread(h) == static_cast<DWORD>(-1)) {
         CloseHandle(h);
         return kESRCH;
     }
@@ -1033,8 +1036,9 @@ int signal_send(uint32_t tid, int sig) {
         if (tid == 0 || tid == GetCurrentThreadId()) return 0;
         HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
         if (!h) return kESRCH;
+        const bool own = GetProcessIdOfThread(h) == GetCurrentProcessId();
         CloseHandle(h);
-        return 0;
+        return own ? 0 : kESRCH;
     }
     if (!valid(sig)) return kEINVAL;
     if (sig == kSigKill) {

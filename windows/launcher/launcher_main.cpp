@@ -1146,10 +1146,44 @@ constexpr wchar_t kRepo[] = L"https://f-droid.org/repo/";
 // In 100 ns units; f-droid.org publishes a few times a day.
 constexpr unsigned long long kCatalogMaxAge = 6ull * 3600 * 10000000;
 
+// Files under store\ are named from the index, which the network hands us: only these names reach a path or
+// a URL, so none can be absolute, a drive ("C:x"), a parent ("..") or a stream ("x:y").
+bool ascii_letter(char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
+bool ascii_alnum(char c) { return ascii_letter(c) || (c >= '0' && c <= '9'); }
+
+// Android's rule for a package (PackageParser.validateName), as the installer checks it.
+bool is_package_name(const std::string& s) {
+    if (s.size() > 255) return false;
+    size_t parts = 0;
+    for (size_t i = 0; i <= s.size();) {
+        const size_t dot = (std::min)(s.find('.', i), s.size());
+        if (dot == i || !ascii_letter(s[i])) return false;
+        for (size_t k = i + 1; k < dot; ++k) {
+            if (!ascii_alnum(s[k]) && s[k] != '_') return false;
+        }
+        ++parts;
+        i = dot + 1;
+    }
+    return parts >= 2;
+}
+
+// One plain name in the repository (an APK, an icon, a language): letters, digits, '.', '_' and '-', not
+// starting with a '.'.
+bool is_repo_file_name(const std::string& s) {
+    if (s.empty() || s.size() > 255 || s[0] == '.') return false;
+    for (const char c : s) {
+        if (!ascii_alnum(c) && c != '.' && c != '_' && c != '-') return false;
+    }
+    return true;
+}
+
 fs::path store_dir() { return data_dir() / L"store"; }
 fs::path catalog_file() { return store_dir() / L"catalog.tsv"; }
 fs::path catalog_etag_file() { return store_dir() / L"catalog.etag"; }
-fs::path store_icon_file(const std::string& pkg) { return store_dir() / L"icons" / (utf8_to_wide(pkg) + L".png"); }
+// Empty for a package that is not one.
+fs::path store_icon_file(const std::string& pkg) {
+    return is_package_name(pkg) ? store_dir() / L"icons" / (utf8_to_wide(pkg) + L".png") : fs::path();
+}
 fs::path downloads_dir() { return store_dir() / L"downloads"; }
 
 struct StoreApp {
@@ -1496,8 +1530,11 @@ void read_index_app(Json& j, IndexApp* a) {
     };
     pick(&a->name, false, {"en-US", "en", "en-GB"}, true);
     pick(&a->summary, true, {"en-US", "en", "en-GB"}, true);
-    if (!top_icon.empty()) a->icon = wide_to_utf8(kRepo) + "icons-240/" + top_icon;
-    else if (!any_icon.empty()) a->icon = wide_to_utf8(kRepo) + a->pkg + "/" + any_icon_lang + "/" + any_icon;
+    if (is_repo_file_name(top_icon)) {
+        a->icon = wide_to_utf8(kRepo) + "icons-240/" + top_icon;
+    } else if (is_package_name(a->pkg) && is_repo_file_name(any_icon_lang) && is_repo_file_name(any_icon)) {
+        a->icon = wide_to_utf8(kRepo) + a->pkg + "/" + any_icon_lang + "/" + any_icon;
+    }
 }
 
 // An APK entry; false when it cannot run here (no arm64-v8a code, where it has native code) or has no SHA-256.
@@ -1517,7 +1554,7 @@ bool read_index_apk(Json& j, IndexApk* apk) {
     apk->code = std::atoll(code.c_str());
     apk->size = std::atoll(size.c_str());
     const bool runs = abis.empty() || std::find(abis.begin(), abis.end(), "arm64-v8a") != abis.end();
-    return runs && hash_type == "sha256" && apk->sha256.size() == 64 && !apk->file.empty();
+    return runs && hash_type == "sha256" && apk->sha256.size() == 64 && is_repo_file_name(apk->file);
 }
 
 std::string tsv_field(std::string s) {
@@ -1566,7 +1603,7 @@ size_t convert_index(const fs::path& json_file, const fs::path& out) {
     size_t count = 0;
     for (const IndexApp& a : apps) {
         const auto it = apks.find(a.pkg);
-        if (a.pkg.empty() || a.name.empty() || it == apks.end() || it->second.empty()) continue;
+        if (!is_package_name(a.pkg) || a.name.empty() || it == apks.end() || it->second.empty()) continue;
         const long long suggested = std::atoll(a.suggested.c_str());
         const IndexApk* best = nullptr;
         for (int pass = 0; pass < 2 && !best; ++pass) {  // the suggested version or older, else any
@@ -1606,7 +1643,7 @@ std::vector<StoreApp> read_catalog() {
             if (tab == std::string::npos) break;
             from = tab + 1;
         }
-        if (v.size() != 12) continue;
+        if (v.size() != 12 || !is_package_name(v[0]) || !is_repo_file_name(v[4])) continue;
         StoreApp a;
         a.pkg = v[0];
         a.code = std::atoll(v[1].c_str());
@@ -1715,7 +1752,8 @@ DWORD WINAPI icon_thread(void*) {
         const auto [pkg, url] = g_icon_queue.back();
         g_icon_queue.pop_back();
         ReleaseSRWLockExclusive(&g_icon_lock);
-        const bool ok = http_get(utf8_to_wide(url), store_icon_file(pkg), L"", nullptr, {}) == 200;
+        const fs::path file = store_icon_file(pkg);
+        const bool ok = !file.empty() && http_get(utf8_to_wide(url), file, L"", nullptr, {}) == 200;
         PostMessageW(g_main, kStoreIcon, ok ? kIconSaved : kIconFailed, reinterpret_cast<LPARAM>(new std::string(pkg)));
     }
 }
@@ -4199,6 +4237,7 @@ void store_start(bool force) {
 void store_get(const StoreApp& a) {
     const Offer offer = offer_for(a);
     if (offer != kOfferInstall && offer != kOfferUpdate) return;
+    if (!is_package_name(a.pkg) || !is_repo_file_name(a.apk)) return;
     g_store.downloads[a.pkg] = -1;
     CloseHandle(CreateThread(nullptr, 0, download_thread,
                              new Download{a.pkg, a.sha256, std::wstring(kRepo) + utf8_to_wide(a.apk), a.name,

@@ -1,0 +1,43 @@
+// launcher.rc -- Win.apk.exe's icon, manifest and version.
+
+#include <winver.h>
+
+// The version: a release build stamps its tag's (CMakeLists.txt writes winapk_version.h from WINAPK_VERSION);
+// any other build, the quick windres check included, says 0.1.0. The updater compares FILEVERSION with the
+// newest release's tag, so a release must not keep the default.
+#ifdef WINAPK_VERSION_FILE
+#include "winapk_version.h"
+#endif
+#ifndef WINAPK_VERSION_MAJOR
+#define WINAPK_VERSION_MAJOR 0
+#define WINAPK_VERSION_MINOR 1
+#define WINAPK_VERSION_PATCH 0
+#define WINAPK_VERSION_TEXT "0.1.0"
+#endif
+
+1 ICON "winapk.ico"
+2 RCDATA "winapk.png"
+1 24 "launcher.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION WINAPK_VERSION_MAJOR,WINAPK_VERSION_MINOR,WINAPK_VERSION_PATCH,0
+PRODUCTVERSION WINAPK_VERSION_MAJOR,WINAPK_VERSION_MINOR,WINAPK_VERSION_PATCH,0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "Win.apk"
+      VALUE "ProductName", "Win.apk"
+      VALUE "FileVersion", WINAPK_VERSION_TEXT
+      VALUE "ProductVersion", WINAPK_VERSION_TEXT
+      VALUE "OriginalFilename", "Win.apk.exe"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

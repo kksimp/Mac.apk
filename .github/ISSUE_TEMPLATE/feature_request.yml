@@ -1,0 +1,24 @@
+name: Feature request
+description: Something WinARM.apk should do, or do differently
+title: "<A few words>"
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What should happen
+      description: The behaviour you want, as a user would see it.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What it is for, and which apps or situations need it.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: Today
+      description: What WinARM.apk does now, and any workaround you use.

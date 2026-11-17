@@ -1,0 +1,118 @@
+# The compatibility sweep's app corpus: open-source apps from F-Droid, pinned
+# to one version each so results compare across runs. One "package
+# versionCode" per line; the APK is fetched from
+# https://f-droid.org/repo/<package>_<versionCode>.apk (or /archive/ once
+# F-Droid retires the version).
+#
+# Without native libraries, selected 2026-10-20 from 44 candidates:
+com.github.muellerma.coffee 47
+org.secuso.privacyfriendlysudoku 101
+org.secuso.privacyfriendlynotes 105
+org.secuso.privacyfriendlytodolist 103
+org.secuso.privacyfriendlydicer 101
+org.secuso.privacyfriendly2048 100
+org.secuso.privacyfriendlymemory 100
+org.secuso.privacyfriendlytapemeasure 100
+org.secuso.privacyfriendlyactivitytracker 100
+net.gsantner.markor 163
+org.billthefarmer.editor 198
+org.billthefarmer.diary 1105
+org.billthefarmer.currency 158
+io.github.muntashirakon.Music 10603
+com.github.ashutoshgngwr.noice 72
+de.dennisguse.opentracks 6766
+org.isoron.uhabits 20301
+org.dmfs.tasks 82200
+de.reimardoeffinger.quickdic 134
+ch.blinkenlights.android.vanilla 13200
+com.vonglasow.michael.satstat 30600
+org.ligi.passandroid 373
+
+# With arm64-v8a native libraries. The two small androidx
+# libraries (Compose's graphics.path, DataStore's shared counter) are in most
+# current apps; the rest cover libGDX, SDL, Rust, CameraX and plain JNI.
+dk.cocode.chess 5020
+de.moekadu.tuner 50
+com.wbrawner.simplemarkdown.free 62
+me.haroldmartin.golwallpaper 3
+net.multun.gamecounter.fdroid 14
+org.unifiedpush.distributor.nextpush 54
+cn.super12138.todo 1295
+micro.repl.ma7moud3ly 18
+ogz.tripeaks 36
+dev.lonami.klooni 860
+com.github.m374lx.alexvsbus 5
+se.voxelmanip.tensy 2
+de.markusfisch.android.shadereditor 94
+eu.faircode.netguard 2026080101
+com.kunzisoft.keepass.libre 45500
+com.ichi2.anki 22502300
+
+# Added 2026-11-01, to cover every kind of app, not only the ones that
+# happened to work: games in native code (libGDX, SDL2, NativeActivity, JNI
+# engines), today's Kotlin and Compose apps, the cross-platform frameworks
+# (Flutter, React Native, WebView shells), native-heavy apps (VLC, maps,
+# OpenGL), input methods, and apps built for old API levels. Where F-Droid
+# offers one build per ABI, the arm64-v8a one is pinned.
+
+# Games
+com.shatteredpixel.shatteredpixeldungeon 921   # libGDX
+io.anuke.mindustry 1115                        # libGDX, large
+com.agateau.tinywheels.android 33              # libGDX + Bullet physics
+com.unciv.app 1279                             # libGDX, Kotlin
+name.boyle.chris.sgtpuzzles 149                # JNI C, Canvas
+org.petero.droidfish 100                       # Stockfish engine over JNI, targets API 28
+org.moire.opensudoku 20261008                  # arm64-v8a only
+org.ppsspp.ppsspp 119030000                    # NativeActivity, OpenGL ES
+com.retroarch 1597175267                       # NativeActivity, targets API 28
+net.minetest.minetest 5170000                  # SDL2, OpenGL ES
+org.dolphinemu.dolphinemu 42460                # OpenGL ES / Vulkan
+ch.logixisland.anuto 34                        # Java, Canvas
+com.serwylo.lexica 30018                       # Java
+
+# Kotlin and Compose
+org.fossify.gallery 30
+org.fossify.calendar 24
+org.fossify.notes 13
+org.fossify.clock 10
+org.fossify.filemanager 15
+com.flxrs.dankchat 40046                       # Compose, minSdk 30
+app.pachli 56
+com.jerboa 88                                  # Compose
+org.breezyweather 60202                        # Compose
+org.tasks 151202
+org.oxycblt.auxio 75                           # Media3
+com.github.libretube 72                        # Compose, Media3
+org.fdroid.fdroid 2000052
+com.aurora.store 76
+com.beemdevelopment.aegis 82
+net.thunderbird.android 33
+org.schabi.newpipe 1015 org.schabi.newpipe_1015_cb84069.apk
+de.danoeh.antennapod 3120395
+
+# Cross-platform frameworks
+org.localsend.localsend_app 641                # Flutter, x86_64 build
+org.jitsi.meet 26000004                        # React Native (Hermes), x86_64 build
+org.jellyfin.mobile 2070399                    # WebView shell
+net.bible.android.activity 1117                # WebView content
+com.ominous.quickweather 112
+
+# Native-heavy, media, maps, devices
+org.videolan.vlc 13070208                      # libvlc, x86_64 build
+app.organicmaps 26092932                       # C++ map engine, OpenGL ES
+com.google.android.stardroid 1771              # OpenGL ES, sensors
+org.connectbot 11101000
+com.osfans.trime 20260901                      # input method (Rime, C++)
+com.menny.android.anysoftkeyboard 8175         # input method
+com.artifex.mupdf.viewer.app 270               # no x86_64 build: arm64-v8a
+com.termoneplus 571                            # terminal, pty in native code
+nodomain.freeyourgadget.gadgetbridge 255 nodomain.freeyourgadget.gadgetbridge_255_01cce93.apk
+de.blinkt.openvpn 225                          # VPN service
+net.sourceforge.opencamera 96                  # camera
+com.github.cvzi.darkmodewallpaper 67           # live wallpaper
+org.sufficientlysecure.keychain 60400          # targets API 34, old UI toolkit
+at.bitfire.davdroid 405210002
+org.adaway 60104
+org.smssecure.smssecure 211                    # targets API 26
+io.github.sds100.keymapper 288
+org.equeim.tremotesf 4063

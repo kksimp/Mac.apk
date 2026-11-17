@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical"
+    android:background="#FFFFFFFF" android:padding="8dp">
+    <ImageView android:id="@+id/a" android:layout_width="48dp" android:layout_height="48dp" android:src="@drawable/ic_more" android:scaleType="center" />
+    <ImageView android:id="@+id/b" android:layout_width="48dp" android:layout_height="48dp" android:src="@drawable/ic_more" android:tint="#FFD81B60" />
+    <ImageView android:id="@+id/c" android:layout_width="48dp" android:layout_height="48dp" android:src="@drawable/ic_search" android:background="@drawable/bg_oval" android:scaleType="centerInside" />
+    <ImageView android:id="@+id/d" android:layout_width="48dp" android:layout_height="48dp" android:src="@drawable/ic_search" android:tint="@color/tint_states" android:background="#FF202124" />
+    <View android:id="@+id/e" android:layout_width="120dp" android:layout_height="48dp" android:background="@drawable/bg_round" />
+    <View android:id="@+id/f" android:layout_width="58dp" android:layout_height="58dp" android:background="@drawable/bg_layers" />
+    <View android:id="@+id/g" android:layout_width="192dp" android:layout_height="54dp" android:background="@drawable/bg_gradient" />
+    <TextView android:id="@+id/h" android:layout_width="wrap_content" android:layout_height="wrap_content" android:background="@drawable/bg_round" android:text="@string/he_short" android:textColor="#FF1A73E8" />
+    <View android:id="@+id/i" android:layout_width="120dp" android:layout_height="40dp" android:background="@drawable/bg_ripple" />
+    <View android:id="@+id/j" android:layout_width="120dp" android:layout_height="40dp" android:background="@drawable/bg_oval" android:backgroundTint="#FF1A73E8" />
+    <ImageView android:id="@+id/k" android:layout_width="48dp" android:layout_height="48dp" android:src="@drawable/bg_oval" android:alpha="0.5" />
+    <CheckBox android:id="@+id/l" android:layout_width="wrap_content" android:layout_height="wrap_content" android:checked="true" android:text="@string/en_short" />
+    <Switch android:id="@+id/m" android:layout_width="wrap_content" android:layout_height="wrap_content" android:checked="true" />
+    <ProgressBar android:id="@+id/n" style="?android:attr/progressBarStyleHorizontal" android:layout_width="200dp" android:layout_height="wrap_content" android:max="100" android:progress="40" />
+    <Button android:id="@+id/o" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/en_short" />
+    <EditText android:id="@+id/p" android:layout_width="200dp" android:layout_height="wrap_content" android:text="@string/en_short" />
+</LinearLayout>

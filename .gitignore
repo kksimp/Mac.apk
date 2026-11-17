@@ -41,3 +41,9 @@ scripts/.release.env
 *.p12
 *.keystore
 *.jks
+
+# Windows build (Win.apk)
+stage/
+.ccache/
+thirdparty/angle-win/
+thirdparty/webview2-sdk/

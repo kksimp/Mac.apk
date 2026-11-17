@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <attr name="probeLabelStyle" format="reference" />
+    <style name="ProbeTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="probeLabelStyle">@style/ProbeLabel</item>
+    </style>
+    <style name="ProbeLabelBase">
+        <item name="android:textAlignment">viewStart</item>
+        <item name="android:textSize">16sp</item>
+    </style>
+    <style name="ProbeLabel" parent="ProbeLabelBase">
+        <item name="android:gravity">center_vertical</item>
+        <item name="android:ellipsize">end</item>
+        <item name="android:lines">1</item>
+    </style>
+    <string name="he_hint">לאן היית רוצה להגיע?</string>
+    <string name="he_short">שלום עולם</string>
+    <string name="he_long">כל מה שצריך זה תעודה ביד ועשר דקות פנויות כדי לפתוח חשבון בנק חדש מהבית</string>
+    <string name="en_short">Station</string>
+    <string name="mixed">אבו יאיר Vs אבו טבלה 2026</string>
+    <string name="number">212798409</string>
+    <string name="he_para">כדי להמשיך יש לאשר את תנאי השימוש ואת מדיניות הפרטיות של השירות. לאחר האישור נשלח אליך קוד אימות בהודעת טקסט למספר הטלפון שמסרת, והוא יהיה בתוקף למשך עשר דקות בלבד. אם הקוד לא הגיע אפשר לבקש קוד חדש.</string>
+    <string name="en_para">To continue, accept the terms of use and the privacy policy of the service. A verification code is then sent by text message to the phone number you gave, and it stays valid for ten minutes only.</string>
+    <string name="mixed_para">ההזמנה מספר 4471-A אושרה ב-12.11.2026 ותישלח ל-Tel Aviv בתוך 3 ימי עסקים; לפרטים: support@example.com</string>
+    <string name="lines">שורה ראשונה\nSecond line\nשורה שלישית</string>
+    <string name="long_word">Pneumonoultramicroscopicsilicovolcanoconiosis and after</string>
+    <string name="dialog_title">למחוק את ההודעה?</string>
+    <string name="dialog_message">ההודעה תימחק מהמכשיר הזה ולא יהיה אפשר לשחזר אותה.</string>
+    <string name="dialog_yes">מחיקה</string>
+    <string name="dialog_no">ביטול</string>
+</resources>

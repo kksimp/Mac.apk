@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<dev.winapk.probe.ProbeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="100dp">
+    <View android:id="@+id/a" android:layout_width="40dp" android:layout_height="30dp" android:layout_marginStart="5dp" android:layout_marginTop="7dp" />
+    <View android:id="@+id/b" android:layout_width="0dp" android:layout_height="match_parent" />
+    <View android:id="@+id/c" android:layout_width="wrap_content" android:layout_height="20dp" android:layout_margin="3dp" />
+</dev.winapk.probe.ProbeLayout>

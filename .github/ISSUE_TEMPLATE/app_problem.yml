@@ -1,0 +1,99 @@
+name: An app does not work
+description: An app that does not install, does not start, crashes, or misbehaves in WinARM.apk
+title: "<App name> <version>: <what goes wrong, in a few words>"
+labels: ["app"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The exact steps, a screenshot and the whole log are what make a report fixable; CONTRIBUTING.md says why.
+
+        Before posting, look in the open issues for the same app, and add to an existing issue rather than opening a second one.
+  - type: input
+    id: winapk-version
+    attributes:
+      label: WinARM.apk version
+      description: Settings > About, or the installer's file name.
+      placeholder: 0.2.0-preview
+    validations:
+      required: true
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2, Snapdragon X Elite
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: Graphics
+      description: The GPU, or "none" for a VM or remote desktop.
+      placeholder: Intel UHD 620
+  - type: input
+    id: app
+    attributes:
+      label: App and version
+      description: The name as the library shows it, and the version from the app's About screen or its store page.
+      placeholder: Markor 2.12.4 (net.gsantner.markor)
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Where the APK came from
+      options:
+        - The Store tab (F-Droid)
+        - f-droid.org, downloaded by hand
+        - Aurora Store (Google Play)
+        - The app's own site or GitHub release
+        - An .apkm / .xapk / .apks bundle from a mirror
+        - Somewhere else (say where below)
+    validations:
+      required: true
+  - type: textarea
+    id: what-happens
+    attributes:
+      label: What happens
+      description: What you expected, and what you got instead.
+      placeholder: The app opens to its list screen, but tapping any item shows a blank page and the window stays blank until closed.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps from a fresh start, so someone else can follow them and see the same thing. Say whether it happens every time. Try once more after installing the app again (App details > Update from a file), to rule out a broken install.
+      value: |
+        1. Install the app (how: Store / drag the APK / double-click)
+        2. Open it
+        3.
+      render: markdown
+    validations:
+      required: true
+  - type: textarea
+    id: screenshot
+    attributes:
+      label: Screenshot or recording
+      description: A screenshot of the app's window at the point it goes wrong (Win+Shift+S, then paste here), or a short recording for anything that moves. Please attach the log as well, not instead.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Paste the whole `%LOCALAPPDATA%\Win.apk\logs\last-run.log` (Logs at the bottom of the library; Copy puts it on the clipboard), or attach it as a file. If installing failed, `logs\install-<app>.log` instead. Look it over first; it can contain file names and the app's own output.
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I installed the app again and tried once more
+          required: true
+        - label: I looked in the open issues for this app
+          required: true
+        - label: The whole log is attached, not only a screenshot of it
+          required: true

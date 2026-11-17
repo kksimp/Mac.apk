@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A picture twice as wide as it is tall, with a mark in each corner so a crop or a flip shows. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp" android:height="24dp" android:viewportWidth="48" android:viewportHeight="24">
+    <path android:fillColor="#FF1A73E8" android:pathData="M0,0h48v24h-48z" />
+    <path android:fillColor="#FFD81B60" android:pathData="M0,0h8v8h-8z" />
+    <path android:fillColor="#FFFFB300" android:pathData="M40,16h8v8h-8z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M20,8h8v8h-8z" />
+</vector>

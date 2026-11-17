@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Text that does not fit one line: wrapping, a line limit, the ellipsis, spacing. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical"
+    android:background="?android:attr/colorBackground" android:padding="8dp">
+    <TextView android:id="@+id/a" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="@string/he_para" android:textSize="14sp" />
+    <TextView android:id="@+id/b" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="@string/he_para" android:textSize="14sp" android:maxLines="2" android:ellipsize="end" />
+    <TextView android:id="@+id/c" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="@string/en_para" android:textSize="14sp" android:maxLines="2" android:ellipsize="end" />
+    <TextView android:id="@+id/d" android:layout_width="200dp" android:layout_height="wrap_content"
+        android:text="@string/he_long" android:textSize="16sp" android:singleLine="true" android:ellipsize="end" />
+    <TextView android:id="@+id/e" android:layout_width="200dp" android:layout_height="wrap_content"
+        android:text="@string/en_para" android:textSize="16sp" android:singleLine="true" android:ellipsize="middle" />
+    <TextView android:id="@+id/f" android:layout_width="200dp" android:layout_height="wrap_content"
+        android:text="@string/en_para" android:textSize="16sp" android:singleLine="true" android:ellipsize="start" />
+    <TextView android:id="@+id/g" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="@string/he_para" android:textSize="14sp" android:gravity="center" android:maxLines="3"
+        android:lineSpacingExtra="6dp" />
+    <TextView android:id="@+id/h" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="@string/en_para" android:textSize="14sp" android:lineSpacingMultiplier="1.5"
+        android:maxLines="3" android:ellipsize="end" />
+    <TextView android:id="@+id/i" android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:text="@string/he_para" android:textSize="14sp" android:maxWidth="220dp" />
+    <TextView android:id="@+id/j" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="@string/lines" android:textSize="14sp" android:includeFontPadding="false" />
+    <TextView android:id="@+id/k" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="@string/mixed_para" android:textSize="14sp" android:textAlignment="viewEnd" />
+    <TextView android:id="@+id/l" android:layout_width="match_parent" android:layout_height="60dp"
+        android:text="@string/he_para" android:textSize="14sp" android:gravity="bottom" android:lines="2" />
+    <TextView android:id="@+id/m" android:layout_width="150dp" android:layout_height="wrap_content"
+        android:text="@string/long_word" android:textSize="14sp" />
+    <TextView android:id="@+id/n" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="@string/en_para" android:textSize="14sp" android:letterSpacing="0.1" android:maxLines="2"
+        android:textStyle="bold" />
+    <TextView android:id="@+id/o" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="@string/he_para" android:textSize="14sp" android:minLines="5" android:maxLines="5" />
+</LinearLayout>

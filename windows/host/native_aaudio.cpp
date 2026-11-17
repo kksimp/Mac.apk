@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 namespace winapk::host {
@@ -95,10 +96,15 @@ struct AStream {
     // The engine's played count restarts at 0 on stop and flush; AAudio's
     // framesRead never goes back (apps difference it for latency), so it is
     // this base plus the engine's count.
+    // Taken for "base + position" and for "stop/flush and move the count into
+    // the base", so a reader never sees the count twice or going back. Only
+    // engine calls run under it (no callback, no join).
     std::atomic<int64_t> frames_read_base{0};
+    mutable std::mutex read_lock;
 
     int encoding() const { return format == kFormatFloat ? kEncodingFloat : kEncodingPcm16; }
     int64_t frames_read() const {
+        std::lock_guard<std::mutex> hold(read_lock);
         return frames_read_base.load(std::memory_order_relaxed) + audio::stream_position(out.get());
     }
     int64_t buffered() const { return frames_written.load(std::memory_order_relaxed) - frames_read(); }
@@ -142,8 +148,8 @@ void join_feeder(AStream* s) {
 // What was written before the stop still plays out and the engine counts it
 // from 0 again, so the frames played so far move into the base.
 void stop_engine(AStream* s) {
-    s->frames_read_base.fetch_add(audio::stream_position(s->out.get()), std::memory_order_relaxed);
-    audio::stream_stop(s->out.get());
+    std::lock_guard<std::mutex> hold(s->read_lock);
+    s->frames_read_base.fetch_add(audio::stream_stop(s->out.get()), std::memory_order_relaxed);
 }
 
 Builder* B(void* b) { return static_cast<Builder*>(b); }
@@ -306,6 +312,7 @@ WINAPK_GUEST_ABI int AAudioStream_requestFlush(void* st) {
     // are dropped and count as read, as AOSP's flush moves framesRead up to
     // framesWritten.
     if (s->state.load(std::memory_order_acquire) == kStateStarted) return kOk;
+    std::lock_guard<std::mutex> hold(s->read_lock);
     audio::stream_flush(s->out.get());
     s->frames_read_base.store(s->frames_written.load(std::memory_order_relaxed), std::memory_order_relaxed);
     return kOk;

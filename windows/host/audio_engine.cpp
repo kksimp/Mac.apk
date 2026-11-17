@@ -271,13 +271,17 @@ public:
         if (state_ == kPlaying) state_ = kPaused;
         room_.notify_all();
     }
-    void stop() {
+    // Returns the frames played up to the reset, read under the same lock, so
+    // none played in between are lost.
+    int64_t stop() {
         std::lock_guard<std::mutex> hold(lock_);
+        const int64_t played = played_;
         draining_ = state_ == kPlaying && !buf_.empty();
         state_ = kStopped;
         played_ = 0;
         has_timestamp_reset();
         room_.notify_all();
+        return played;
     }
     void flush() {
         std::lock_guard<std::mutex> hold(lock_);
@@ -382,7 +386,7 @@ size_t stream_write(Stream* s, const void* p, size_t count, int encoding, bool b
 }
 void stream_play(Stream* s) { s->play(); }
 void stream_pause(Stream* s) { s->pause(); }
-void stream_stop(Stream* s) { s->stop(); }
+int64_t stream_stop(Stream* s) { return s->stop(); }
 void stream_flush(Stream* s) { s->flush(); }
 void stream_set_volume(Stream* s, float l, float r) { s->volume(l, r); }
 int stream_state(Stream* s) { return s->state(); }

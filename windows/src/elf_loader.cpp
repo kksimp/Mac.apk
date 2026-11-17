@@ -30,6 +30,10 @@ constexpr uint64_t kPage = 0x1000;
 uint64_t page_down(uint64_t v) { return v & ~(kPage - 1); }
 uint64_t page_up(uint64_t v) { return (v + kPage - 1) & ~(kPage - 1); }
 
+// [off, off + len) lies within [0, size), written so that no sum can wrap: a
+// corrupt header's huge values must fail the check, not pass it.
+bool fits(uint64_t off, uint64_t len, uint64_t size) { return off <= size && len <= size - off; }
+
 // Tags lld emits for RELR when targeting Android API < 30 (--use-android-relr-tags).
 constexpr Sxword kDtAndroidRelr = 0x6fffe000;
 constexpr Sxword kDtAndroidRelrSz = 0x6fffe001;
@@ -139,8 +143,7 @@ std::unique_ptr<ElfImage> ElfImage::map(const std::filesystem::path& path, std::
         *error = "not a shared object (e_type " + std::to_string(eh.e_type) + ")";
         return nullptr;
     }
-    if (eh.e_phentsize != sizeof(Phdr) ||
-        eh.e_phoff + static_cast<uint64_t>(eh.e_phnum) * sizeof(Phdr) > file.size()) {
+    if (eh.e_phentsize != sizeof(Phdr) || !fits(eh.e_phoff, uint64_t{eh.e_phnum} * sizeof(Phdr), file.size())) {
         *error = "program header table out of bounds";
         return nullptr;
     }
@@ -154,7 +157,9 @@ std::unique_ptr<ElfImage> ElfImage::map(const std::filesystem::path& path, std::
         std::memcpy(&ph, file.data() + eh.e_phoff + i * sizeof(Phdr), sizeof(ph));
         img->phdrs_.push_back(ph);
         if (ph.p_type == kPtLoad) {
-            if (ph.p_filesz > ph.p_memsz || ph.p_offset + ph.p_filesz > file.size()) {
+            // The segment's end is rounded up to a page (map_segments), so that too must not wrap.
+            if (ph.p_filesz > ph.p_memsz || !fits(ph.p_offset, ph.p_filesz, file.size()) ||
+                !fits(ph.p_vaddr, ph.p_memsz, UINT64_MAX - (kPage - 1))) {
                 *error = "PT_LOAD " + std::to_string(i) + " out of bounds";
                 return nullptr;
             }
@@ -333,11 +338,16 @@ bool ElfImage::read_dynamic(std::string* error) {
             default: break;
         }
     }
-    if (!strtab_ || !symtab_ || !in_image(strtab_, strsz_)) {
+    if (!strtab_ || !symtab_ || !strsz_ || !in_image(strtab_, strsz_) || !in_image(symtab_, sizeof(Sym))) {
         *error = "missing or out-of-range DT_STRTAB/DT_SYMTAB";
         return false;
     }
     const char* strtab = at<const char>(strtab_);
+    // With a terminated table, any st_name below strsz_ is a C string inside it.
+    if (strtab[strsz_ - 1] != '\0') {
+        *error = "DT_STRTAB does not end in a NUL";
+        return false;
+    }
     auto str = [&](uint64_t off) -> std::string {
         return off < strsz_ ? std::string(strtab + off, strnlen(strtab + off, strsz_ - off)) : std::string();
     };
@@ -345,28 +355,61 @@ bool ElfImage::read_dynamic(std::string* error) {
     if (soname_offset != UINT64_MAX) soname_ = str(soname_offset);
 
     // Symbol count: DT_HASH stores it (nchain); DT_GNU_HASH has to be walked
-    // to the end of its last non-empty chain.
-    size_t nsyms = 0;
+    // to the end of its last non-empty chain. Every table is bounded here, once,
+    // so relocation and symbol lookup can index them without checks of their own.
+    uint64_t nsyms = 0;
     if (hash_) {
+        if (!in_image(hash_, 2 * sizeof(uint32_t))) {
+            *error = "DT_HASH outside the image";
+            return false;
+        }
         nsyms = at<const uint32_t>(hash_)[1];
     } else if (gnu_hash_) {
+        if (!in_image(gnu_hash_, 4 * sizeof(uint32_t))) {
+            *error = "DT_GNU_HASH outside the image";
+            return false;
+        }
         const uint32_t* gh = at<const uint32_t>(gnu_hash_);
         const uint32_t nbuckets = gh[0], symoffset = gh[1], bloom_words = gh[2];
-        const uint32_t* buckets = reinterpret_cast<const uint32_t*>(
-            reinterpret_cast<const uint64_t*>(gh + 4) + bloom_words);
-        const uint32_t* chain = buckets + nbuckets;
-        uint32_t last = 0;
-        for (uint32_t b = 0; b < nbuckets; ++b) last = std::max(last, buckets[b]);
+        // At most 16 + 2^35 + 2^34 bytes: the sum cannot wrap.
+        const uint64_t buckets_vaddr = gnu_hash_ + 4 * sizeof(uint32_t) + uint64_t{bloom_words} * sizeof(uint64_t);
+        const uint64_t chain_vaddr = buckets_vaddr + uint64_t{nbuckets} * sizeof(uint32_t);
+        if (!in_image(gnu_hash_, chain_vaddr - gnu_hash_)) {
+            *error = "DT_GNU_HASH buckets outside the image";
+            return false;
+        }
+        const uint32_t* buckets = at<const uint32_t>(buckets_vaddr);
+        uint64_t last = 0;
+        for (uint32_t b = 0; b < nbuckets; ++b) last = std::max<uint64_t>(last, buckets[b]);
         if (last >= symoffset) {
-            while (!(chain[last - symoffset] & 1)) ++last;
+            for (;; ++last) {
+                const uint64_t link = chain_vaddr + (last - symoffset) * sizeof(uint32_t);
+                if (!in_image(link, sizeof(uint32_t))) {
+                    *error = "DT_GNU_HASH chain runs past the image";
+                    return false;
+                }
+                if (*at<const uint32_t>(link) & 1) break;
+            }
             nsyms = last + 1;
         } else {
             nsyms = symoffset;
         }
     }
-    nsyms_ = nsyms;
+    // Symbol 0 is always there: relocations name it for "no symbol".
+    nsyms = std::max<uint64_t>(nsyms, 1);
+    if (nsyms > (hi_vaddr_ - symtab_) / sizeof(Sym)) {
+        *error = "DT_SYMTAB with " + std::to_string(nsyms) + " symbols runs past the image";
+        return false;
+    }
+    nsyms_ = static_cast<size_t>(nsyms);
     const Sym* syms = at<const Sym>(symtab_);
-    for (size_t i = 1; i < nsyms; ++i) {
+    for (size_t i = 0; i < nsyms_; ++i) {
+        if (syms[i].st_name >= strsz_) {
+            *error = "symbol " + std::to_string(i) + "'s name is outside DT_STRTAB";
+            return false;
+        }
+    }
+    for (size_t i = 1; i < nsyms_; ++i) {
         const Sym& s = syms[i];
         const uint8_t bind = st_bind(s.st_info);
         if (s.st_shndx == kShnUndef || (bind != kStbGlobal && bind != kStbWeak)) continue;
@@ -386,7 +429,15 @@ bool ElfImage::apply_relocations(const SymbolResolver& resolve, const TlsSymbolR
     std::vector<std::string> missing;
     std::string fatal;
 
+    // read_dynamic() checked every symbol below nsyms_ and its name; a relocation can name any index.
+    auto symbol_in_range = [&](uint32_t idx) -> bool {
+        if (idx < nsyms_) return true;
+        fatal = "relocation names symbol " + std::to_string(idx) + ", the table has " + std::to_string(nsyms_);
+        return false;
+    };
+
     auto symbol_value = [&](uint32_t idx, uint64_t* out) -> bool {
+        if (!symbol_in_range(idx)) return false;
         const Sym& s = syms[idx];
         const char* name = strtab + s.st_name;
         if (st_type(s.st_info) == kSttTls) {
@@ -429,6 +480,7 @@ bool ElfImage::apply_relocations(const SymbolResolver& resolve, const TlsSymbolR
     // The (module, offset) pair of a dynamic TLS relocation's symbol. Symbol 0
     // stands for this library's own block (local-dynamic code).
     auto tls_symbol_value = [&](uint32_t idx, size_t* module, uint64_t* offset) -> bool {
+        if (!symbol_in_range(idx)) return false;
         if (idx == 0 || syms[idx].st_shndx != kShnUndef) {
             if (!tls_module_) {
                 fatal = "TLS relocation in a library without PT_TLS";

@@ -11,16 +11,25 @@
 // destructors holding a library, and dependencies going with their root.
 // Four more libraries check the order symbols are looked up in: libc at its
 // place in the DT_NEEDED order, the global group before it.
+// Before the tree, small ELF files with one corrupt header or table each must
+// be refused.
 //
 // Exit code: the number of failed checks.
 
 #include "winapk/arm64_guest.h"
+#include "winapk/elf64_defs.h"
+#include "winapk/elf_loader.h"
 #include "winapk/guest_abi.h"
 #include "winapk/linker.h"
 #include "winapk/mini_bionic.h"
 
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <vector>
 
 #include <windows.h>
 
@@ -86,6 +95,78 @@ DWORD WINAPI dtor_thread(void* p) {
 
 }  // namespace
 
+// A small ELF file built in memory: one read-only PT_LOAD over the whole page
+// and a PT_DYNAMIC naming a string table, a one-symbol table and a DT_HASH.
+// Each case corrupts one field; map() must refuse the file, not crash.
+struct TinyElf {
+    static constexpr uint64_t kDyn = 0x200, kStr = 0x400, kSym = 0x500, kHash = 0x600;
+    std::vector<uint8_t> bytes = std::vector<uint8_t>(0x1000, 0);
+    winapk::elf::Ehdr* eh() { return reinterpret_cast<winapk::elf::Ehdr*>(bytes.data()); }
+    winapk::elf::Phdr* ph(int i) { return reinterpret_cast<winapk::elf::Phdr*>(bytes.data() + 64) + i; }
+    uint32_t* hash() { return reinterpret_cast<uint32_t*>(bytes.data() + kHash); }
+    winapk::elf::Dyn* dyn() { return reinterpret_cast<winapk::elf::Dyn*>(bytes.data() + kDyn); }
+
+    TinyElf() {
+        using namespace winapk::elf;
+        const uint8_t ident[] = {kMag0, kMag1, kMag2, kMag3, kClass64, kData2Lsb, 1};
+        std::memcpy(eh()->e_ident, ident, sizeof ident);
+        eh()->e_type = kEtDyn;
+        eh()->e_machine = kEmAarch64;
+        eh()->e_phoff = 64;
+        eh()->e_phentsize = sizeof(Phdr);
+        eh()->e_phnum = 2;
+        *ph(0) = Phdr{kPtLoad, kPfR, 0, 0, 0, bytes.size(), bytes.size(), 0x1000};
+        *ph(1) = Phdr{kPtDynamic, kPfR, kDyn, kDyn, kDyn, 5 * sizeof(Dyn), 5 * sizeof(Dyn), 8};
+        const Sxword tags[] = {kDtStrTab, kDtStrSz, kDtSymTab, kDtHash, kDtNull};
+        const Xword vals[] = {kStr, 1, kSym, kHash, 0};
+        for (int i = 0; i < 5; ++i) {
+            dyn()[i].d_tag = tags[i];
+            dyn()[i].d_un.d_val = vals[i];
+        }
+        hash()[1] = 1;  // nchain: symbol 0 only
+    }
+};
+
+void expect_refused(const char* what, const TinyElf& elf, const char* want) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "winapk-linker-test-malformed.so";
+    {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char*>(elf.bytes.data()), static_cast<std::streamsize>(elf.bytes.size()));
+    }
+    std::string error;
+    const bool refused = winapk::ElfImage::map(path, &error) == nullptr;
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    if (!want) {
+        check(what, !refused, error);
+        return;
+    }
+    check(what, refused && error.find(want) != std::string::npos, refused ? error : "loaded");
+}
+
+void malformed_files() {
+    expect_refused("a well-formed tiny ELF file maps", TinyElf(), nullptr);
+    TinyElf phoff;
+    phoff.eh()->e_phoff = UINT64_MAX - 15;
+    expect_refused("a program header offset that wraps is refused", phoff, "program header table out of bounds");
+    TinyElf offset;
+    offset.ph(0)->p_offset = UINT64_MAX - 7;
+    expect_refused("a PT_LOAD file range that wraps is refused", offset, "PT_LOAD 0 out of bounds");
+    TinyElf vaddr;
+    vaddr.ph(0)->p_vaddr = UINT64_MAX - 0xfff;
+    expect_refused("a PT_LOAD memory range that wraps is refused", vaddr, "PT_LOAD 0 out of bounds");
+    TinyElf nchain;
+    nchain.hash()[1] = 0x10000000;
+    expect_refused("a DT_HASH symbol count past the image is refused", nchain, "DT_SYMTAB with");
+    TinyElf bloom;
+    bloom.dyn()[3].d_tag = winapk::elf::kDtGnuHash;
+    bloom.hash()[2] = 0xffffffff;  // bloom words
+    expect_refused("a DT_GNU_HASH bloom filter past the image is refused", bloom, "DT_GNU_HASH buckets");
+    TinyElf name;
+    reinterpret_cast<winapk::elf::Sym*>(name.bytes.data() + TinyElf::kSym)->st_name = 0x7fffffff;
+    expect_refused("a symbol name past DT_STRTAB is refused", name, "outside DT_STRTAB");
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: winapk-linker-test <dir with libwinapk_link_*.so>\n");
@@ -95,6 +176,7 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);  // keep the output if a guest crashes
     winapk::arm64::enter_thread();
     std::printf("Win.apk guest linker\n");
+    malformed_files();
     winapk::LinkerConfig config;
     config.search_paths.push_back(std::filesystem::u8path(argv[1]));
     config.host = winapk::mini_bionic_resolve;

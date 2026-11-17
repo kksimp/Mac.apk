@@ -970,18 +970,20 @@ private:
 };
 
 // Waits for an async operation: through its completion handler when the
-// runtime accepts ours, else by polling its status. True when it completed
-// (then GetResults may be called); on a timeout the operation is cancelled.
+// runtime accepts ours, else by polling its status. When it completed,
+// get_results runs before the operation is closed: IAsyncInfo::Close ends
+// access to its results. On a timeout the operation is cancelled.
 struct Done {
     std::mutex m;
     std::condition_variable cv;
     bool done = false;
 };
 
-bool await(IInspectable* op, const bt::Guid& handler_iid, int timeout_ms) {
-    if (!op) return false;
+template <typename F>
+void await(IInspectable* op, const bt::Guid& handler_iid, int timeout_ms, F&& get_results) {
+    if (!op) return;
     IAsyncInfoAbi* info = query<IAsyncInfoAbi>(op, kIidAsyncInfo);
-    if (!info) return false;
+    if (!info) return;
     auto done = std::make_shared<Done>();
     Delegate* handler = new Delegate(handler_iid, [done](IInspectable*, void*) {
         std::lock_guard<std::mutex> l(done->m);
@@ -998,16 +1000,18 @@ bool await(IInspectable* op, const bt::Guid& handler_iid, int timeout_ms) {
     }
     while (SUCCEEDED(info->get_Status(&status)) && status == 0 && std::chrono::steady_clock::now() < deadline) Sleep(5);
     if (status == 0) info->Cancel();
+    if (status == 1) get_results();
     info->Close();
     info->Release();
-    return status == 1;
 }
 
 template <typename T>
 T* await_result(IAsyncOp<T*>* op, const bt::Guid& handler_iid, int timeout_ms) {
     T* result = nullptr;
     if (op) {
-        if (await(op, handler_iid, timeout_ms) && FAILED(op->GetResults(&result))) result = nullptr;
+        await(op, handler_iid, timeout_ms, [&] {
+            if (FAILED(op->GetResults(&result))) result = nullptr;
+        });
         op->Release();
     }
     return result;
@@ -1017,7 +1021,9 @@ T* await_result(IAsyncOp<T*>* op, const bt::Guid& handler_iid, int timeout_ms) {
 int await_int(IAsyncOp<int>* op, const bt::Guid& handler_iid, int timeout_ms) {
     int value = -1;
     if (op) {
-        if (await(op, handler_iid, timeout_ms) && FAILED(op->GetResults(&value))) value = -1;
+        await(op, handler_iid, timeout_ms, [&] {
+            if (FAILED(op->GetResults(&value))) value = -1;
+        });
         op->Release();
     }
     return value;

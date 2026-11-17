@@ -114,6 +114,15 @@ public class MediaRecorder implements AudioRecordingMonitor, AudioRouting, Micro
     private boolean mPrivacySensitiveExplicit;
     private AudioDeviceInfo mPreferredDevice;
 
+    // Events reach the app on the thread that created the recorder, as AOSP's EventHandler does.
+    private final android.os.Handler mEvents = newEventHandler();
+
+    private static android.os.Handler newEventHandler() {
+        android.os.Looper looper = android.os.Looper.myLooper();
+        if (looper == null) looper = android.os.Looper.getMainLooper();
+        return looper == null ? null : new android.os.Handler(looper);
+    }
+
     public MediaRecorder() { }
 
     /** API 31. AOSP uses the Context to attribute the capture for the
@@ -309,8 +318,24 @@ public class MediaRecorder implements AudioRecordingMonitor, AudioRouting, Micro
     }
 
     private void info(final int what) {
-        final OnInfoListener l = mOnInfo;
-        if (l != null) l.onInfo(this, what, 0);
+        post(() -> {
+            final OnInfoListener l = mOnInfo;
+            if (l != null) l.onInfo(this, what, 0);
+        });
+    }
+
+    private void error(final int what) {
+        post(() -> {
+            final OnErrorListener l = mOnError;
+            if (l != null) l.onError(this, what, 0);
+        });
+    }
+
+    /** Never waits: the encoder threads are joined by stop() and release(), which the app may call from a callback. */
+    private void post(Runnable event) {
+        final android.os.Handler h = mEvents;
+        if (h == null) return;
+        h.post(() -> { if (mState != STATE_RELEASED) event.run(); });
     }
 
     /** An encoder's output format: its track, and the file once every track
@@ -376,8 +401,7 @@ public class MediaRecorder implements AudioRecordingMonitor, AudioRouting, Micro
             mWroteSample = true;
         } catch (java.io.IOException | RuntimeException e) {
             mLimitReached = true;   // a full disk: nothing more can be written
-            final OnErrorListener l = mOnError;
-            if (l != null) l.onError(this, MEDIA_RECORDER_ERROR_UNKNOWN, 0);
+            error(MEDIA_RECORDER_ERROR_UNKNOWN);
         }
     }
 

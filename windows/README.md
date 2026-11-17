@@ -894,7 +894,9 @@ under `runtime/`):
   decoder's buffer queues, and `MediaCodecList.java` / `MediaCodecInfo.java` /
   `HostCodecCapability.java` list the two encoders when the host has them;
   `MediaRecorder.java` records the microphone and `VideoSource.SURFACE` on
-  those, and fails `prepare()` for what the host cannot record.
+  those, and fails `prepare()` for what the host cannot record. Its `onInfo`
+  and `onError` are posted to the creating thread's Looper (the main one when
+  there is none), as AOSP does.
 - `runtime/java/android/view/Surface.java`: `macapkSetFrameSink` (new, public):
   what a Canvas posts on the Surface goes to the sink, at the sink's size,
   instead of the window. An encoder's input Surface sets it.

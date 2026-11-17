@@ -80,7 +80,8 @@ public class MediaRecorder implements AudioRecordingMonitor, AudioRouting, Micro
     // AOSP's state machine (MediaRecorder's class documentation).
     private static final int STATE_INITIAL = 0, STATE_INITIALIZED = 1, STATE_CONFIGURED = 2, STATE_PREPARED = 3,
             STATE_RECORDING = 4, STATE_RELEASED = 5;
-    private int mState = STATE_INITIAL;
+    // volatile: post()'s events check it on the creating thread after release() on another.
+    private volatile int mState = STATE_INITIAL;
 
     private int mAudioSource = -1, mVideoSource = -1;   // -1: none set
     private int mOutputFormat = OutputFormat.DEFAULT;

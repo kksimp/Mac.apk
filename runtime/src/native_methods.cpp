@@ -38,6 +38,7 @@
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 #include "angle_glue.h"   // AngleMarkFrameWithheld
+#include "macapk/external_texture_compat.h"
 #endif
 
 namespace macapk {
@@ -1066,14 +1067,20 @@ void GLES20_glActiveTexture(JNIEnv*, jclass, jint unit) {
     glActiveTexture(unit);
 #endif
 }
+#ifdef MACAPK_HAS_ANGLE
+static GLenum GLES20_TextureTarget(GLenum target) {
+    return target == GL_TEXTURE_EXTERNAL_OES ? gles::TextureTarget(target,
+            gles::HasExternalTexture(reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS)))) : target;
+}
+#endif
 void GLES20_glBindTexture(JNIEnv*, jclass, jint target, jint tex) {
 #ifdef MACAPK_HAS_ANGLE
-    glBindTexture(target, tex);
+    glBindTexture(GLES20_TextureTarget(target), tex);
 #endif
 }
 void GLES20_glTexParameteri(JNIEnv*, jclass, jint target, jint pname, jint param) {
 #ifdef MACAPK_HAS_ANGLE
-    glTexParameteri(target, pname, param);
+    glTexParameteri(GLES20_TextureTarget(target), pname, param);
 #endif
 }
 void GLES20_glBindBuffer(JNIEnv*, jclass, jint target, jint buf) {
@@ -1247,8 +1254,12 @@ void GLES20_glShaderSource(JNIEnv* env, jclass, jint shader, jstring src) {
 #ifdef MACAPK_HAS_ANGLE
     if (!src) return;
     const char* s = env->GetStringUTFChars(src, nullptr);
-    GLint len = (GLint) std::strlen(s);
-    glShaderSource(shader, 1, &s, &len);
+    if (!s) return;
+    const std::string translated = gles::ExternalTextureShader(s, gles::HasExternalTexture(
+            reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS))));
+    const char* text = translated.c_str();
+    GLint len = (GLint) translated.size();
+    glShaderSource(shader, 1, &text, &len);
     env->ReleaseStringUTFChars(src, s);
 #endif
 }
@@ -1504,6 +1515,9 @@ static jsize GlCopyCount(GLint pname, jsize avail) {
 
 void GLES20_glGetIntegerv(JNIEnv* env, jclass, jint pname, jintArray params, jint offset) {
 #ifdef MACAPK_HAS_ANGLE
+    if (pname == GL_TEXTURE_BINDING_EXTERNAL_OES && !gles::HasExternalTexture(
+            reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS))))
+        pname = GL_TEXTURE_BINDING_2D;
     if (!params || offset < 0) return;
     jsize avail = env->GetArrayLength(params) - offset;
     if (avail <= 0) return;
@@ -2283,7 +2297,7 @@ void GLES20_glTexParameterf(JNIEnv*, jclass, jint t, jint pn, jfloat v) {
             std::fprintf(stderr, "[GLDRAW] glTexParameterf(target=0x%x pname=0x%x value=0x%x/%.1f)\n",
                          t, pn, (unsigned)v, (double)v);
     }
-    glTexParameterf((GLenum)t,(GLenum)pn,v);
+    glTexParameterf(GLES20_TextureTarget(t),(GLenum)pn,v);
 #endif
 }
 void GLES20_glCopyTexImage2D(JNIEnv*, jclass, jint t, jint l, jint fmt, jint x, jint y, jint w, jint h, jint b) {
@@ -2663,7 +2677,7 @@ void GLES20_glGetTexParameteriv(JNIEnv* env, jclass, jint t, jint pn, jintArray 
     // / EXT_texture_border_clamp, which ANGLE exposes) makes the driver write 4.
     // Same sizing the float sibling GLES20_glGetTexParameterfv already uses.
     GLint v[4] = {0, 0, 0, 0};
-    glGetTexParameteriv((GLenum) t, (GLenum) pn, v);
+    glGetTexParameteriv(GLES20_TextureTarget(t), (GLenum) pn, v);
     jsize avail = env->GetArrayLength(params) - off;
     if (avail > 4) avail = 4;
     if (avail > 0) env->SetIntArrayRegion(params, off, avail,
@@ -2812,7 +2826,7 @@ void GLES20_glTexParameterfv_arr(JNIEnv* env, jclass, jint t, jint pn, jfloatArr
     if (avail <= 0) return;
     jsize take = avail > 4 ? 4 : avail;
     env->GetFloatArrayRegion(v, off, take, f);
-    glTexParameterfv((GLenum) t, (GLenum) pn, f);
+    glTexParameterfv(GLES20_TextureTarget(t), (GLenum) pn, f);
 #else
     (void) env; (void) t; (void) pn; (void) v; (void) off;
 #endif
@@ -2825,7 +2839,7 @@ void GLES20_glGetTexParameterfv(JNIEnv* env, jclass, jint t, jint pn, jfloatArra
 #ifdef MACAPK_HAS_ANGLE
     if (!params || off < 0) return;
     GLfloat v[4] = {0, 0, 0, 0};
-    glGetTexParameterfv((GLenum) t, (GLenum) pn, v);
+    glGetTexParameterfv(GLES20_TextureTarget(t), (GLenum) pn, v);
     jsize avail = env->GetArrayLength(params) - off;
     if (avail > 4) avail = 4;
     if (avail > 0) env->SetFloatArrayRegion(params, off, avail, v);

@@ -126,6 +126,12 @@ int run_arm64_pack(const std::string& in_path,
         if (!seen.insert(s.name).second) continue;
         exports.push_back(&s);
     }
+    // Protected libraries can publish their real JNI name/address from a
+    // constructor. The wrapper must still let the JVM look up that lifecycle
+    // hook after the ELF loader has run those constructors.
+    const bool deferred_jni_onload = seen.count("JNI_OnLoad") == 0;
+    const Symbol64 jni_onload{"JNI_OnLoad", 0, 0, 1, STT_FUNC};
+    if (deferred_jni_onload) exports.push_back(&jni_onload);
     if (verbose) {
         std::fprintf(stderr,
             "[translator] %s: native-arm64 pack -- %zu exports\n",
@@ -207,7 +213,7 @@ int run_arm64_pack(const std::string& in_path,
         out.write_path(), exports, img.raw.data(), img.raw.size(),
         embed_blob ? std::string() : so_path_rel,
         img.soname.empty() ? "lib.so" : img.soname,
-        "@rpath/libmacapk-bionic-shim.dylib", shim_dir, verbose);
+        "@rpath/libmacapk-bionic-shim.dylib", shim_dir, verbose, deferred_jni_onload);
     if (rc != 0) return rc;       // the destructor discards the staged copy
     std::string err;
     if (!out.commit(&err)) {

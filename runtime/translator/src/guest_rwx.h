@@ -78,6 +78,56 @@ inline bool protect(void* addr,size_t length,int prot,int& result) {
     }
     return true;
 }
+// Android code can write an authorized RWX range through libc as well as with
+// an inline store. A host memory-operation fault has a host PC, so it cannot use the
+// guest instruction decoder below. Adapt only a fully authorized destination;
+// all other writes retain libc's original behavior, including real faults.
+extern "C++" {
+template<typename Operation>
+inline bool write(void* destination,size_t length,Operation operation,void*& result) {
+    if(!enabled() || !length || !active.load(std::memory_order_acquire)) return false;
+    const uintptr_t lo=(uintptr_t)destination, hi=lo+length;
+    if(hi<=lo || !__macapk_arm64_native_addr_in_image(destination)
+        || !__macapk_arm64_native_addr_in_image((void*)(hi-1))) return false;
+    const uintptr_t firstPage=lo&~(pageSize-1), endPage=(hi+pageSize-1)&~(pageSize-1);
+    if(endPage<hi) return false;
+    const int savedErrno=errno;
+    bool restored=false;
+    {
+        while(writing.test_and_set(std::memory_order_acquire)) {}
+        struct UnlockWrite { ~UnlockWrite() { writing.clear(std::memory_order_release); } } unlock;
+        if(!contains(lo,hi)) return false;
+        if(::mprotect((void*)firstPage,endPage-firstPage,PROT_READ|PROT_WRITE)!=0) {
+            errno=savedErrno;
+            return false;
+        }
+        // A bad source must propagate its real fault, rather than re-entering
+        // our handler while this same thread owns the serialization flag.
+        handling=true;
+        result=operation();
+        sys_icache_invalidate(destination,length);
+        restored=::mprotect((void*)firstPage,endPage-firstPage,PROT_READ|PROT_EXEC)==0;
+        if(!restored) ::mprotect((void*)firstPage,endPage-firstPage,PROT_NONE);
+        writeEpoch.fetch_add(1,std::memory_order_release);
+        handling=false;
+    }
+    // Continuing with an executable page left writable would violate this
+    // mode's contract. Revoke access and terminate instead of reporting success
+    // when RX restoration fails. Process termination also disposes the mapping
+    // if the final protection request itself cannot be applied.
+    if(!restored) std::abort();
+    errno=savedErrno;
+    return true;
+}
+inline bool copy(void* destination,const void* source,size_t length,bool move,void*& result) {
+    return write(destination,length,[=] {
+        return move?std::memmove(destination,source,length):std::memcpy(destination,source,length);
+    },result);
+}
+inline bool fill(void* destination,int value,size_t length,void*& result) {
+    return write(destination,length,[=] { return std::memset(destination,value,length); },result);
+}
+}
 inline bool fault(siginfo_t* info,ucontext_t* uc) {
     if(handling || !info || !uc || !uc->uc_mcontext) return false;
     // Synchronize the first lookup with both permission changes and metadata

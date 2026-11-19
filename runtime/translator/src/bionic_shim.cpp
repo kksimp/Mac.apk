@@ -2739,14 +2739,6 @@ extern "C" void* __macapk_pairip_run_resolver(void* realfn, void* env, void* cls
     return nullptr;
 }
 
-// v1.0.1582: the JVM's JNI String-family functions (jni_GetStringLength,
-// GetStringUTFLength, GetStringChars, ...), by their raw entry address. Captured
-// once from the JNIEnv vtable in __macapk_install_jni_bionic_variadic_bridge so
-// the SEGV handler can recognise a fault inside one WITHOUT a signal-unsafe
-// dladdr. See try_recover_jni_getstring_fault.
-static void* g_jni_string_fns[8] = {0};
-static int   g_jni_string_fn_count = 0;
-
 // ---- SAFE jstring PROBE (v1.0.1595) -- the fix for the fast-JNI GC deadlock ----
 //
 // THE BUG THIS REPLACES. Facebook's fast-JNI (Instagram/Threads/Messenger, via
@@ -2919,48 +2911,12 @@ static bool macapk_jstring_handle_ok(jstring s) {
     return ok;
 }
 
-// Recover a SIGSEGV that faulted INSIDE one of the JVM's JNI GetString* functions
-// on a garbage jstring, by returning 0/null to the guest caller (x0=0, pc=lr)
-// instead of aborting.
-//
-// WHY THIS IS SAFE and WHY IT UNBLOCKS. These functions start by resolving the
-// jstring handle to an oop and reading a field of it; a bad jstring faults on
-// THAT early deref, before any lock is taken or object allocated, so forcing an
-// immediate `return 0` leaves the JVM in a clean state (x0 is the return
-// register, lr the caller's return address; the callee-saved frame is untouched
-// because the fault is in the prologue/first load). The motivating caller is
-// Facebook's crash-reporter fast-JNI SELF-TEST (Instagram): it reads ART object
-// internals via Unsafe -- which HotSpot cannot provide, so MacApkUnsafe answers
-// EMPTY -- builds a bogus jstring, GetStringLengths it to check the fast path,
-// and on ART would get a length; here it faults. Returning 0 makes the self-test
-// see "fast-JNI is broken" and FALL BACK to standard JNI, which works. A genuine
-// GetStringLength on a valid jstring never faults, so this only ever fires on a
-// guest's own bad handle. Kill switch MACAPK_JNI_STRING_RECOVERY_OFF.
-static bool try_recover_jni_getstring_fault(siginfo_t* /*info*/, ucontext_t* uc) {
-    static const bool s_off = std::getenv("MACAPK_JNI_STRING_RECOVERY_OFF") != nullptr;
-    if (s_off || !uc || !uc->uc_mcontext || g_jni_string_fn_count == 0) return false;
-    uintptr_t pc = uc->uc_mcontext->__ss.__pc;
-    for (int i = 0; i < g_jni_string_fn_count; ++i) {
-        uintptr_t fn = reinterpret_cast<uintptr_t>(g_jni_string_fns[i]);
-        // The fault lands in the function's prologue/first oop deref -- measured
-        // at +0x60 for GetStringLength. 0x600 covers the whole small function
-        // while staying far short of the next JNI entry.
-        if (fn && pc >= fn && pc < fn + 0x600) {
-            uc->uc_mcontext->__ss.__x[0] = 0;                 // return 0 / null
-            uc->uc_mcontext->__ss.__pc  = uc->uc_mcontext->__ss.__lr;  // return to caller
-            static std::atomic<int> n{0};
-            if (n.fetch_add(1) < 8) {
-                std::fprintf(stderr,
-                    "[jni-str-recover] fault inside JVM JNI GetString* (fn#%d @%p, "
-                    "pc=%p) on a bad jstring -> returned 0 (guest fast-JNI probe will "
-                    "fall back to standard JNI)\n", i, (void*)fn, (void*)pc);
-                std::fflush(stderr);
-            }
-            return true;
-        }
-    }
-    return false;
-}
+// Never recover by jumping out of a HotSpot JNI entry. Its prologue can have
+// changed SP/LR and transitioned the thread into the VM; bypassing its epilogue
+// strands safepoints. A former +0x600 string-function PC range also matched
+// GetArrayLength and jumped back inside that function, spinning indefinitely.
+// Bad-string probing remains in the native wrappers before they enter the JVM.
+// Faults inside the JVM continue through the normal HotSpot signal chain.
 
 // A guest STORE into one of OUR host executable pages: an inline-hook install.
 // Measured on Instagram, libbreakpad (Google's crash reporter) mprotects a
@@ -3199,6 +3155,22 @@ static void macapk_fatal_reraise(int sig) {
 }
 
 #include "guest_rwx.h"
+
+extern "C" void* __macapk_arm64_memcpy(void* destination,const void* source,size_t length) {
+    void* result=nullptr;
+    if(macapk::rwx::copy(destination,source,length,false,result)) return result;
+    return std::memcpy(destination,source,length);
+}
+extern "C" void* __macapk_arm64_memmove(void* destination,const void* source,size_t length) {
+    void* result=nullptr;
+    if(macapk::rwx::copy(destination,source,length,true,result)) return result;
+    return std::memmove(destination,source,length);
+}
+extern "C" void* __macapk_arm64_memset(void* destination,int value,size_t length) {
+    void* result=nullptr;
+    if(macapk::rwx::fill(destination,value,length,result)) return result;
+    return std::memset(destination,value,length);
+}
 #include "guest_jit_pages.h"
 
 static void macapk_segv_handler(int sig, siginfo_t* info, void* ucontext) {
@@ -3837,12 +3809,6 @@ static void macapk_segv_handler(int sig, siginfo_t* info, void* ucontext) {
         // A guest inline-hook store into our host code pages (breakpad/profilo
         // patching libc): skip it so the hook no-ops and our .text stays intact.
         if (try_recover_guest_host_write(
-                info, static_cast<ucontext_t*>(ucontext))) {
-            return;
-        }
-        // A fault INSIDE a JVM JNI GetString* on a guest's garbage jstring:
-        // return 0 to the caller (turns a fast-JNI probe crash into a fallback).
-        if (try_recover_jni_getstring_fault(
                 info, static_cast<ucontext_t*>(ucontext))) {
             return;
         }
@@ -14186,14 +14152,47 @@ chain:
 // Default ON so Breakpad/Crashpad apps (Minecraft, many games) run out of the
 // box; set MACAPK_TRAP_INLINE_SYSCALLS=0 to disable (kill switch).
 #if defined(__APPLE__) && defined(__aarch64__)
-static long macapk_forward_inline_syscall(uint64_t nr, uint64_t /*a0*/,
-        uint64_t /*a1*/, uint64_t /*a2*/, uint64_t /*a3*/, uint64_t /*a4*/,
-        uint64_t /*a5*/) {
+extern "C" int __macapk_arm64_faccessat(int, const char*, int, int);
+extern "C" int __macapk_arm64_openat(int, const char*, int, mode_t);
+extern "C" int __macapk_errno_mac2lin(int);
+static long macapk_forward_inline_syscall(uint64_t nr, uint64_t a0,
+        uint64_t a1, uint64_t a2, uint64_t a3, uint64_t /*a4*/,
+        uint64_t /*a5*/, bool arguments_intact) {
     // Linux arm64 generic-ABI syscall numbers (verified against
     // include/uapi/asm-generic/unistd.h, 2026-07-02). The Linux syscall return
     // convention is: >=0 on success, or the NEGATED errno on failure. So an
     // error must return -errno (Linux/Bionic numbering), NEVER 0 (0 = success).
     switch (nr) {
+        case 48: // faccessat(dirfd, pathname, mode); no flags in this syscall
+        case 56: { // openat(dirfd, pathname, flags, mode)
+            // An invalid negative Mach selector raises EXC_SYSCALL before
+            // changing the saved registers. A positive BSD selector instead
+            // overwrites return registers. Only the former retains the real
+            // dirfd/path/mode; never guess arguments from a BSD error return.
+            if (!arguments_intact) return -38; // Linux ENOSYS
+            if (nr == 48 && (static_cast<uint32_t>(a2) & ~7u)) return -22; // EINVAL
+            const int saved_errno = errno;
+            if (!a1) { errno = saved_errno; return -14; } // EFAULT
+            char pathname[4096];
+            size_t n = 0;
+            for (; n < sizeof(pathname); ++n) {
+                if (!macapk_diag_safe_read(reinterpret_cast<const void*>(a1 + n),
+                                          pathname + n, 1)) {
+                    errno = saved_errno;
+                    return -14; // Linux EFAULT
+                }
+                if (!pathname[n]) break;
+            }
+            if (n == sizeof(pathname)) { errno = saved_errno; return -36; } // ENAMETOOLONG
+            const int rc = nr == 48
+                ? __macapk_arm64_faccessat(static_cast<int>(a0), pathname,
+                                           static_cast<int>(a2), 0)
+                : __macapk_arm64_openat(static_cast<int>(a0), pathname,
+                                        static_cast<int>(a2), static_cast<mode_t>(a3));
+            const int error = errno;
+            errno = saved_errno;
+            return rc < 0 ? -__macapk_errno_mac2lin(error) : rc;
+        }
         case 132: // sigaltstack   -- neutralize the crash handler's alt stack
         case 134: // rt_sigaction  -- neutralize: keep OUR crash handlers in place
         case 135: // rt_sigprocmask
@@ -14315,7 +14314,8 @@ static void macapk_sigsys_handler(int sig, siginfo_t* info, void* ucontext) {
                         "-> forwarded\n",
                         (unsigned long long)ss.__x[8], (void*)pc, esr);
                 long ret = macapk_forward_inline_syscall(ss.__x[8], ss.__x[0],
-                        ss.__x[1], ss.__x[2], ss.__x[3], ss.__x[4], ss.__x[5]);
+                        ss.__x[1], ss.__x[2], ss.__x[3], ss.__x[4], ss.__x[5],
+                        static_cast<int32_t>(ss.__x[16]) < 0);
                 ss.__x[0] = (uint64_t)ret;   // Linux ABI returns in x0
                 ss.__pc  = resume;
                 return;
@@ -39249,9 +39249,9 @@ extern "C" void* __macapk_arm64_dlvsym(void* handle, const char* symbol, const c
 // snapshot invalid and could not be inferred from settings" before its first
 // frame (Feeel 2.4.1, Ente Auth). So the redirect remembers which library a
 // handle stands for, and a host-dlsym miss on that handle asks the loaded ELF
-// image itself (__macapk_arm64_native_lookup_latest). Function lookups are
-// unchanged: the host dlsym answers them first. =0 restores the host-only
-// answer.
+// image itself (__macapk_arm64_native_lookup_latest). Function lookups
+// keep the wrapper's own exports; inherited dependency functions are adapted
+// below when they require a Bionic ABI. =0 disables only the data fallback.
 extern "C" void* __macapk_arm64_native_lookup_latest(const char* soname,
                                                      const char* sym);
 static bool macapk_wrapper_data_dlsym_on() {
@@ -39270,7 +39270,7 @@ static std::unordered_map<void*, std::string>& macapk_wrapper_handles() {
 // <dir>/lib_native/libX.dylib -> "libX.so", the name the wrapper's
 // constructor registers its ELF image under.
 static void macapk_note_wrapper_handle(void* h, const std::string& dylib_path) {
-    if (!h || !macapk_wrapper_data_dlsym_on()) return;
+    if (!h) return;
     std::string base = dylib_path.substr(dylib_path.rfind('/') + 1);
     static const char kExt[] = ".dylib";
     const size_t n = sizeof(kExt) - 1;
@@ -39511,7 +39511,33 @@ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
             name, p);
         return p;
     }
-    if (void* p = dlsym(handle, name)) return p;
+    if (void* p = dlsym(handle, name)) {
+        std::string wrapper_soname;
+        {
+            std::lock_guard<std::mutex> lk(macapk_wrapper_handles_mu());
+            auto it = macapk_wrapper_handles().find(handle);
+            if (it != macapk_wrapper_handles().end()) wrapper_soname = it->second;
+        }
+        if (!wrapper_soname.empty()) {
+            // dyld searches a translated wrapper's Mach-O dependencies too.
+            // A guest which dlopens itself can therefore receive libSystem's
+            // pthread/stdio/varargs ABI instead of the Bionic adapter used by
+            // its ordinary ELF imports. Preserve guest dependency exports;
+            // adapt only definitions actually owned by the host's libSystem.
+            std::string ours = std::string("__macapk_arm64_") + name;
+            if (void* adapted = dlsym(RTLD_DEFAULT, ours.c_str())) {
+                Dl_info provider{};
+                if (!::dladdr(p, &provider) || !provider.dli_fname) return p;
+                const std::string image = provider.dli_fname;
+                const bool host_libc = image.compare(0, 19, "/usr/lib/system/lib") == 0
+                    || image == "/usr/lib/libSystem.B.dylib";
+                if (!host_libc) return p;
+                if (void* defined = macapk_wrapper_elf_dlsym(handle, name)) return defined;
+                return adapted;
+            }
+        }
+        return p;
+    }
     return macapk_wrapper_elf_dlsym(handle, name);
 }
 
@@ -49180,7 +49206,7 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         case 38:  return (long)__macapk_arm64_renameat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, (const char*)macapk_untag_ptr((void*)a4));  // renameat
         case 43:  return (long)__macapk_arm64_statfs((const char*)macapk_untag_ptr((void*)a1), (void*)macapk_untag_ptr((void*)a2));  // statfs
         case 44:  return (long)__macapk_arm64_fstatfs((int)a1, (void*)macapk_untag_ptr((void*)a2));  // fstatfs
-        case 48:  return (long)__macapk_arm64_faccessat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, (int)a4);  // faccessat
+        case 48:  return (long)__macapk_arm64_faccessat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, 0);  // raw faccessat has three arguments
         case 53:  return (long)__macapk_arm64_fchmodat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (mode_t)a3, (int)a4);  // fchmodat
         case 56:  return (long)__macapk_arm64_openat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, (mode_t)a4);  // openat
         // 36/37/45/49/54/88 added with the S0 path shims (2026-09-26), by this
@@ -63338,18 +63364,6 @@ extern "C" void __macapk_install_jni_bionic_variadic_bridge(JNIEnv* env) {
     // Save originals BEFORE patching. We need both V (for Apple-compiled
     // callers we forward unchanged) and A (for Bionic-compiled callers
     // we repack into).
-    // v1.0.1582: record the JNI String-family entry addresses so the SEGV
-    // handler can recognise (and recover from) a fault inside one on a garbage
-    // jstring without a signal-unsafe dladdr. See try_recover_jni_getstring_fault.
-    {
-        int k = 0;
-        g_jni_string_fns[k++] = reinterpret_cast<void*>(vtable->GetStringLength);
-        g_jni_string_fns[k++] = reinterpret_cast<void*>(vtable->GetStringUTFLength);
-        g_jni_string_fns[k++] = reinterpret_cast<void*>(vtable->GetStringChars);
-        g_jni_string_fns[k++] = reinterpret_cast<void*>(vtable->GetStringUTFChars);
-        g_jni_string_fns[k++] = reinterpret_cast<void*>(vtable->GetStringCritical);
-        g_jni_string_fn_count = k;
-    }
     // v1.0.1595: the same family, saved as callable originals so the handle-probe
     // guards can front them (see macapk_jstring_handle_ok).
     g_orig_GetStringLength         = vtable->GetStringLength;

@@ -501,6 +501,8 @@ public class PackageInstaller {
         long sizeBytes = -1;
         String installerPackageName;
         String installerAttributionTag;
+        android.net.Uri referrerUri;
+        android.net.Uri originatingUri;
         String appLabel;
         android.graphics.Bitmap appIcon;
         boolean multiPackage;
@@ -531,6 +533,8 @@ public class PackageInstaller {
                 m.unarchiveId = params.unarchiveId;
                 m.sizeBytes = params.sizeBytes;
                 m.installerPackageName = params.installerPackageName;
+                m.referrerUri = params.referrerUri;
+                m.originatingUri = params.originatingUri;
                 m.appIcon = params.appIcon;
                 m.appLabel = (params.appLabel != null) ? params.appLabel.toString() : null;
                 m.multiPackage = params.multiPackage;
@@ -755,6 +759,8 @@ public class PackageInstaller {
         public int requireUserAction = USER_ACTION_UNSPECIFIED;
         public int packageSource = PACKAGE_SOURCE_UNSPECIFIED;
         public String installerPackageName;
+        public android.net.Uri referrerUri;
+        public android.net.Uri originatingUri;
         /** AOSP SessionParams fields added in v1.1.0 so the setters below store
          *  what they were given instead of discarding it. Every one is echoed
          *  back through PackageInstaller.getSessionInfo(), which is the whole
@@ -844,8 +850,8 @@ public class PackageInstaller {
         public void setUnarchiveId(int unarchiveId) { this.unarchiveId = unarchiveId; }
         public void setAppLabel(CharSequence label) { this.appLabel = label; }
         public void setInstallLocation(int location) { this.installLocation = location; }
-        public void setReferrerUri(android.net.Uri referrer) {}
-        public void setOriginatingUri(android.net.Uri originating) {}
+        public void setReferrerUri(android.net.Uri referrer) { this.referrerUri = referrer; }
+        public void setOriginatingUri(android.net.Uri originating) { this.originatingUri = originating; }
         // @hide on AOSP; the Play Store probes it reflectively. We never install
         // instant apps, so record nothing -- a regular install is the only mode.
         public void setInstallAsInstantApp(boolean isInstantApp) {}
@@ -1291,8 +1297,12 @@ public class PackageInstaller {
         // frameworks/base/core/java/android/content/pm/PackageInstaller.java
         public float getProgress() { return progress; }
         public CharSequence getAppLabel() { return appLabel; }
-        public android.net.Uri getReferrerUri() { return null; }
-        public android.net.Uri getOriginatingUri() { return null; }
+        public android.net.Uri getReferrerUri() {
+            return (meta != null) ? meta.referrerUri : null;
+        }
+        public android.net.Uri getOriginatingUri() {
+            return (meta != null) ? meta.originatingUri : null;
+        }
         public boolean isActive() { return active; }
         public boolean isSealed() { return sealed; }
         public boolean isStaged() { return false; }

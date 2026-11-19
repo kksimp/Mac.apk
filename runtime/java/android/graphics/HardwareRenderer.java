@@ -32,18 +32,21 @@ public class HardwareRenderer {
     public void setLightSourceGeometry(float lightX, float lightY, float lightZ,
             float lightRadius) {}
     public void setLightSourceAlpha(float ambientShadowAlpha, float spotShadowAlpha) {}
-    public void setOpaque(boolean opaque) {}
-    public boolean isOpaque() { return true; }
+    private boolean mOpaque = true;
+    private int mSpotShadowColor;
+    private int mAmbientShadowColor;
+    public void setOpaque(boolean opaque) { mOpaque = opaque; }
+    public boolean isOpaque() { return mOpaque; }
     public void setName(String name) {}
     public void start() {}
     public void stop() {}
     public void clearContent() { mContent = null; }
     public void setStopped(boolean stopped) {}
     public void notifyFramePending() {}
-    public void setSpotShadowColor(int color) {}
-    public int getSpotShadowColor() { return 0; }
-    public void setAmbientShadowColor(int color) {}
-    public int getAmbientShadowColor() { return 0; }
+    public void setSpotShadowColor(int color) { mSpotShadowColor = color; }
+    public int getSpotShadowColor() { return mSpotShadowColor; }
+    public void setAmbientShadowColor(int color) { mAmbientShadowColor = color; }
+    public int getAmbientShadowColor() { return mAmbientShadowColor; }
 
     public FrameRenderRequest createRenderRequest() {
         mRenderRequest.reset();

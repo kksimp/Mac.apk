@@ -1904,21 +1904,44 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
     private final java.util.concurrent.ConcurrentHashMap<String, Object> soLoadLocks =
         new java.util.concurrent.ConcurrentHashMap<>();
 
-    /** System.load(path) as the guest sees it. An ELF "libX.so" is translated into
-     *  the same lib_native/libX.dylib cache findLibrary and the exposure passes
-     *  use (same stamps, same load bias), then loaded against THIS loader; any
-     *  other path loads as it always did. Throws UnsatisfiedLinkError as
-     *  System.load does. */
+    private static boolean hasElfMagic(File input) {
+        if (input == null || !input.isFile()) return false;
+        byte[] magic = new byte[4];
+        try (java.io.FileInputStream in = new java.io.FileInputStream(input)) {
+            return in.read(magic) == 4
+                    && magic[0] == 0x7f && magic[1] == 'E'
+                    && magic[2] == 'L'  && magic[3] == 'F';
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /** System.load(path) as the guest sees it. Both standard "libX.so" libraries
+     *  and unpacked ELF binaries under non-standard names (e.g. plugin/map SDK
+     *  artifacts with ELF magic 0x7f 'E' 'L' 'F') are translated into
+     *  lib_native/*.dylib using the same stamps and load bias as findLibrary,
+     *  then loaded against THIS loader; non-ELF host libraries load directly.
+     *  Throws UnsatisfiedLinkError as System.load does. */
     public void macapkLoadNative(String path) {
         if (path == null) throw new NullPointerException("path");
         File f = new File(path);
         String n = f.getName();
-        if (!(n.startsWith("lib") && n.endsWith(".so") && f.isFile())) {
+        boolean isStandardSo = n.startsWith("lib") && n.endsWith(".so") && n.length() > 6;
+        if (!f.isFile() || (!isStandardSo && !hasElfMagic(f))) {
             loadIntoThisLoader(path);
             return;
         }
-        String fileBase = n.substring(0, n.length() - 3);   // "libX"
-        String libname = fileBase.substring(3);
+        String fileBase;
+        String libname;
+        if (isStandardSo) {
+            fileBase = n.substring(0, n.length() - 3);   // "libX"
+            libname = fileBase.substring(3);
+        } else {
+            libname = n;
+            String safeName = n.replaceAll("[^A-Za-z0-9._-]", "_");
+            String pathHash = Integer.toHexString(f.getAbsolutePath().hashCode());
+            fileBase = "elf_" + pathHash + "_" + safeName;
+        }
         File cacheDir = new File(appDir, "lib_native");
         cacheDir.mkdirs();
         File cached = new File(cacheDir, fileBase + ".dylib");

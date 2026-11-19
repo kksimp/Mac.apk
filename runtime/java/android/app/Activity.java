@@ -4330,8 +4330,9 @@ public class Activity extends ContextThemeWrapper
      *  would double-dispatch). What is left is AOSP's override point, which is
      *  also what makes Activity a complete ComponentCallbacks2. */
     public void onLowMemory() {}
-    public boolean isImmersive() { return false; }
-    public void setImmersive(boolean i) {}
+    private boolean mImmersive;
+    public boolean isImmersive() { return mImmersive; }
+    public void setImmersive(boolean i) { mImmersive = i; }
     // API 27+: show over the lock screen / wake the screen. No lock
     // screen on Mac.apk; flags are inert (Calculator sets both in
     // onStart).
@@ -4557,8 +4558,12 @@ public class Activity extends ContextThemeWrapper
     }
 
     public android.app.PendingIntent createPendingResult(int requestCode, android.content.Intent data, int flags) { return null; }
-    public android.media.session.MediaController getMediaController() { return null; }
-    public void setMediaController(android.media.session.MediaController controller) { }
+    public android.media.session.MediaController getMediaController() {
+        return windowImpl != null ? windowImpl.getMediaController() : null;
+    }
+    public void setMediaController(android.media.session.MediaController controller) {
+        getWindow().setMediaController(controller);
+    }
     public android.content.SharedPreferences getPreferences(int mode) {
         return getSharedPreferences(getClass().getName(), mode);
     }

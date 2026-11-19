@@ -1327,10 +1327,12 @@ public abstract class Window {
     }
     /** AOSP Window.getContentScene():2352 `return null`. */
     public android.transition.Scene getContentScene() { return null; }
-    /** AOSP Window.getMediaController():2253 `return null` /
-     *  setMediaController:2243 empty on the base class. */
-    public android.media.session.MediaController getMediaController() { return null; }
-    public void setMediaController(android.media.session.MediaController controller) { }
+    /** AOSP Window.getMediaController() / setMediaController(). */
+    private android.media.session.MediaController mMediaController;
+    public android.media.session.MediaController getMediaController() { return mMediaController; }
+    public void setMediaController(android.media.session.MediaController controller) {
+        mMediaController = controller;
+    }
     /** AOSP Window.setUiOptions(int):2261 and (int,int):2269, both empty on the
      *  base class. */
     public void setUiOptions(int uiOptions) { }

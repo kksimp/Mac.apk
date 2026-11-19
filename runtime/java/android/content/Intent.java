@@ -1565,33 +1565,43 @@ public class Intent implements Parcelable, Cloneable {
     public static Intent parseUri(String uri, int uriFlags) throws java.net.URISyntaxException {
         int i = 0;
         try {
-            if ((uriFlags & URI_INTENT_SCHEME) != 0 && !uri.startsWith("intent:")) {
-                Intent intent = new Intent(ACTION_VIEW);
-                try {
-                    intent.setData(Uri.parse(uri));
-                } catch (IllegalArgumentException e) {
-                    throw new java.net.URISyntaxException(uri, e.getMessage());
+            final boolean androidApp = uri.startsWith("android-app:");
+            if ((uriFlags & (URI_INTENT_SCHEME | URI_ANDROID_APP_SCHEME)) != 0) {
+                if (!uri.startsWith("intent:") && !androidApp) {
+                    Intent intent = new Intent(ACTION_VIEW);
+                    try {
+                        intent.setData(Uri.parse(uri));
+                    } catch (IllegalArgumentException e) {
+                        throw new java.net.URISyntaxException(uri, e.getMessage());
+                    }
+                    return intent;
                 }
-                return intent;
             }
 
             i = uri.lastIndexOf('#');
             if (i == -1) {
-                return new Intent(ACTION_VIEW, Uri.parse(uri));
-            }
-            if (!uri.startsWith("#Intent;", i)) {
-                // Legacy pre-1.0 fragment shape; not modeled (see method
-                // doc above). Degrade rather than mis-parse it.
-                return new Intent(ACTION_VIEW, Uri.parse(uri));
+                if (!androidApp) {
+                    return new Intent(ACTION_VIEW, Uri.parse(uri));
+                }
+            } else if (!uri.startsWith("#Intent;", i)) {
+                if (!androidApp) {
+                    // Legacy pre-1.0 fragment shape; not modeled (see method
+                    // doc above). Degrade rather than mis-parse it.
+                    return new Intent(ACTION_VIEW, Uri.parse(uri));
+                }
+                i = -1;
             }
 
             Intent intent = new Intent(ACTION_VIEW);
             Intent baseIntent = intent;
             boolean inSelector = false;
+            boolean explicitAction = false;
 
             String scheme = null;
-            String data = uri.substring(0, i);
-            i += 8; // length of "#Intent;"
+            String data = i >= 0 ? uri.substring(0, i) : uri;
+            if (i >= 0) {
+                i += 8; // length of "#Intent;"
+            }
 
             while (i >= 0 && !uri.startsWith("end", i)) {
                 int eq = uri.indexOf('=', i);
@@ -1604,6 +1614,7 @@ public class Intent implements Parcelable, Cloneable {
 
                 if (uri.startsWith("action=", i)) {
                     intent.setAction(value);
+                    if (!inSelector) explicitAction = true;
                 } else if (uri.startsWith("category=", i)) {
                     intent.addCategory(value);
                 } else if (uri.startsWith("type=", i)) {
@@ -1670,7 +1681,34 @@ public class Intent implements Parcelable, Cloneable {
                 intent = baseIntent;
             }
 
-            if (data.startsWith("intent:")) {
+            if (data.startsWith("android-app:")) {
+                if (data.startsWith("android-app://")) {
+                    String rest = data.substring(14);
+                    int slash = rest.indexOf('/');
+                    String pkg = slash < 0 ? rest : rest.substring(0, slash);
+                    if (!pkg.isEmpty() && intent.getPackage() == null) {
+                        intent.setPackage(pkg);
+                    }
+                    String afterPkg = (slash < 0 || slash + 1 >= rest.length()) ? "" : rest.substring(slash + 1);
+                    if (afterPkg.isEmpty()) {
+                        if (!explicitAction) {
+                            intent.setAction(ACTION_MAIN);
+                        }
+                        data = "";
+                    } else {
+                        int slash2 = afterPkg.indexOf('/');
+                        if (slash2 < 0) {
+                            data = afterPkg + ":";
+                        } else {
+                            String appScheme = afterPkg.substring(0, slash2);
+                            String afterScheme = afterPkg.substring(slash2 + 1);
+                            data = afterScheme.isEmpty() ? (appScheme + "://") : (appScheme + "://" + afterScheme);
+                        }
+                    }
+                } else {
+                    data = "";
+                }
+            } else if (data.startsWith("intent:")) {
                 data = data.substring(7);
                 if (scheme != null) {
                     data = scheme + ':' + data;

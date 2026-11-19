@@ -128,11 +128,43 @@ public final class CameraBridge {
     }
 
     /**
-     * camera2's SENSOR_ORIENTATION, in degrees. Always 0 on a Mac: the sensor
-     * does not rotate with the device, so no preview rotation is implied.
+     * camera2's SENSOR_ORIENTATION / Camera.CameraInfo.orientation, in degrees.
+     *
+     * AOSP defines it relative to the device's NATURAL orientation: the
+     * clockwise rotation that makes the sensor image upright on the screen in
+     * that orientation. Apps then combine it with Display.getRotation():
+     * front-facing (sensor + displayDegrees) % 360, back-facing
+     * (sensor - displayDegrees + 360) % 360 (Camera.setDisplayOrientation's
+     * documented formula; WebRTC's Camera1Session/Camera2Session use the same).
+     *
+     * A Mac's camera image is upright on the Mac's screen whatever shape the
+     * Mac.apk window has, because the window's orientation is virtual. But
+     * Display.getRotation() reports ROTATION_90 for a landscape-shaped window
+     * (the natural orientation it models is portrait). Reporting 0 here, as
+     * this used to, therefore made every app rotate an already-upright image
+     * by 90 degrees in landscape -- measured 2026-11-12 on OurFamilyWizard's
+     * Twilio camera preview. The answer that is true for this device is the
+     * one that cancels the reported display rotation, so the combined
+     * rotation is 0 in both window shapes. For the front camera in a
+     * landscape window that is 270, a phone's usual front-camera value.
+     * camera2's transform does not yet match it; see CameraBackend.
+     *
+     * ⚠ AOSP treats this value as fixed per camera; here it follows the
+     * window shape, read when asked. An app that caches it and then sees the
+     * window rotate (Cmd+R) keeps the stale value -- the same limitation as
+     * an app that caches Display.getRotation().
      */
     public static int getSensorOrientation(int index) {
-        return isAvailable() ? nativeDeviceSensorOrientation(index) : 0;
+        if (!isAvailable()) return 0;
+        int base = nativeDeviceSensorOrientation(index);
+        int displayDegrees = 0;
+        try {
+            // Surface.ROTATION_0..270 are 0..3, so x90 gives degrees.
+            displayDegrees = android.view.Display.macapkRotation() * 90;
+        } catch (Throwable ignored) { }
+        boolean front = nativeDeviceFacing(index) == FACING_FRONT;
+        int compensation = front ? (360 - displayDegrees) % 360 : displayDegrees;
+        return (base + compensation) % 360;
     }
 
     /** Number of (resolution, frame-rate range) entries the device advertises. */

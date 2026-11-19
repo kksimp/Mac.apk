@@ -23,10 +23,22 @@ public final class MediaExtractor {
     public MediaExtractor() {}
 
     public void setDataSource(String path) throws java.io.IOException {
+        if (path == null) {
+            throw new IllegalArgumentException("path == null");
+        }
+        if (path.isEmpty()) {
+            throw new java.io.IOException("MediaExtractor: path cannot be empty");
+        }
         release();
         // Strip a file:// scheme; the native opener wants a filesystem path.
         String p = path;
-        if (p != null && p.startsWith("file://")) p = p.substring(7);
+        if (p.startsWith("file://localhost/")) {
+            p = p.substring(16);
+        } else if (p.startsWith("file://")) {
+            p = p.substring(7);
+        } else if (p.startsWith("file:/")) {
+            p = p.substring(5);
+        }
         mHandle = com.macapk.loader.NativeMedia.nativeDemuxOpen(p);
         if (mHandle == 0)
             throw new java.io.IOException("MediaExtractor: cannot open " + path);
@@ -100,10 +112,40 @@ public final class MediaExtractor {
         refreshCurrent();
     }
     public void setDataSource(MediaDataSource source) {}
+    public void setDataSource(android.content.Context context, android.net.Uri uri) throws java.io.IOException {
+        setDataSource(context, uri, null);
+    }
     public void setDataSource(android.content.Context context, android.net.Uri uri,
                               Map<String, String> headers) throws java.io.IOException {
-        if (uri != null && ("file".equals(uri.getScheme()) || uri.getScheme() == null))
-            setDataSource(uri.getPath());
+        if (uri == null) {
+            throw new IllegalArgumentException("uri == null");
+        }
+        String scheme = uri.getScheme();
+        if ("content".equalsIgnoreCase(scheme)) {
+            android.content.res.AssetFileDescriptor afd = null;
+            try {
+                if (context != null && context.getContentResolver() != null) {
+                    afd = context.getContentResolver().openAssetFileDescriptor(uri, "r");
+                }
+            } catch (Exception ignored) {}
+            if (afd != null) {
+                try {
+                    setDataSource(afd);
+                    return;
+                } finally {
+                    try { afd.close(); } catch (Exception ignored) {}
+                }
+            }
+            throw new java.io.IOException("MediaExtractor: cannot open content URI " + uri);
+        }
+        if (scheme != null && !"file".equalsIgnoreCase(scheme)) {
+            throw new java.io.IOException("MediaExtractor: unsupported scheme " + scheme);
+        }
+        String path = uri.getPath();
+        if (path == null) {
+            throw new java.io.IOException("MediaExtractor: missing path in uri " + uri);
+        }
+        setDataSource(path);
     }
     // AOSP: a declared length below 0 means "the whole file", so it drops the
     // slice bounds entirely rather than passing a negative length down.
@@ -125,8 +167,12 @@ public final class MediaExtractor {
     }
 
     public MediaFormat getTrackFormat(int index) {
+        if (mHandle == 0)
+            throw new IllegalStateException("MediaExtractor has no data source");
+        int trackCount = getTrackCount();
+        if (index < 0 || index >= trackCount)
+            throw new IllegalArgumentException("Invalid track index: " + index + ", trackCount: " + trackCount);
         MediaFormat f = new MediaFormat();
-        if (mHandle == 0) return f;
         int fmt = com.macapk.loader.NativeMedia.nativeDemuxFormatId(mHandle);
         String mime = (fmt == 1) ? MediaFormat.MIMETYPE_AUDIO_AAC
                     : (fmt == 2) ? MediaFormat.MIMETYPE_AUDIO_MPEG
@@ -142,8 +188,17 @@ public final class MediaExtractor {
         return f;
     }
 
-    public void selectTrack(int index)   { mSelected = true; }
-    public void unselectTrack(int index) { mSelected = false; }
+    public void selectTrack(int index) {
+        if (index < 0 || index >= getTrackCount())
+            throw new IllegalArgumentException("Invalid track index: " + index);
+        mSelected = true;
+    }
+
+    public void unselectTrack(int index) {
+        if (index < 0 || index >= getTrackCount())
+            throw new IllegalArgumentException("Invalid track index: " + index);
+        mSelected = false;
+    }
 
     public boolean advance() {
         if (mHandle == 0) return false;

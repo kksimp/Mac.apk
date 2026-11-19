@@ -683,13 +683,22 @@ public final class Looper {
             // Java side. =0 restores the fall-through (A/B only).
             if (MAIN_LOOP_REENTRY_RETURNS && MACAPK_REAL_LOOPER
                     && macapkIsActivityThread() && realMainLoopStarted.get()) {
+                // ActivityHost.start/startAll (our launcher) call loop() right
+                // after posting LAUNCH_ACTIVITY and rely on the return. An APP's
+                // own nested main-thread loop() (the modal-loop idiom) must NOT
+                // return: AOSP drains the SAME queue until it quits. Returning
+                // turns an app's "post a runnable that calls loop()" into a
+                // 100%-CPU spin -- measured on Binance 2026-11-05 (CrashHunter
+                // posted such a runnable: ~190 s of CPU in 200 s and 150 MB of
+                // deviation log). Nest the drain for app callers only.
+                boolean launcherCaller = callerIsLauncher();
                 if (reentrantLoopCalls.incrementAndGet() <= 3) {
                     android.util.Log.i("Looper", "loop() re-entered on the running"
-                        + " main thread: returning to the outer loop -- a DEVIATION:"
-                        + " AOSP nests a drain here (\"Loop again would have the queued"
-                        + " messages be executed before this one completed.\"),"
-                        + " ActivityHost relies on the return");
+                        + " main thread: " + (launcherCaller
+                            ? "launcher caller -- returning to the outer loop"
+                            : "app caller -- nesting a drain like AOSP"));
                 }
+                if (!launcherCaller) runNestedMainLoop();
                 return;
             }
             // Main / no per-thread looper: the Cocoa runloop + Handler.drainGlobal
@@ -801,6 +810,44 @@ public final class Looper {
     private static boolean isMainThread() {
         Thread cur = Thread.currentThread();
         return mainThreads.isEmpty() || mainThreads.contains(cur);
+    }
+
+    /** True when the immediate caller of loop() is Mac.apk's own launcher
+     *  (ActivityHost/Boot), which posts LAUNCH_ACTIVITY and expects loop() to
+     *  return so the outer real main loop can dispatch it. Any other caller is
+     *  app code and gets AOSP's nested-drain behaviour instead. */
+    private static boolean callerIsLauncher() {
+        Class<?> c = StackWalker.getInstance(StackWalker.Option.RETAIN_CLASS_REFERENCE)
+            .walk(s -> s.map(StackWalker.StackFrame::getDeclaringClass)
+                        .filter(k -> k != Looper.class)
+                        .findFirst().orElse(null));
+        if (c == null) return false;
+        String n = c.getName();
+        return n.equals("com.macapk.loader.ActivityHost")
+            || n.equals("com.macapk.loader.Boot");
+    }
+
+    /** AOSP Looper.loop()'s nested branch: keep taking messages from the SAME
+     *  queue and dispatching them until it quits. Runs on the thread already
+     *  inside the real main loop's dispatch, so it is single-threaded with
+     *  respect to the queue. */
+    private static void runNestedMainLoop() {
+        final MessageQueue q = MAIN.queue;
+        long n = 0;
+        for (;;) {
+            Message msg = q.next();   // blocks
+            if (msg == null) break;   // quit()
+            n++;
+            try {
+                if (msg.target != null) msg.target.dispatchMessage(msg);
+                else if (msg.callback != null) msg.callback.run();
+            } catch (Throwable t) {
+                android.util.Log.e("Looper",
+                    "exception dispatching nested main message", t);
+            }
+            msg.recycleUnchecked();
+        }
+        android.util.Log.i("Looper", "nested main loop EXIT (dispatched " + n + ")");
     }
 
     /** Tier 2 real main loop. Mirrors AOSP Looper.loop()/loopOnce():

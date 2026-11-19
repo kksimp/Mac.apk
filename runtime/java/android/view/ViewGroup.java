@@ -728,13 +728,16 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
     public void setOnHierarchyChangeListener(OnHierarchyChangeListener l) { this.hierarchyListener = l; }
     public OnHierarchyChangeListener getOnHierarchyChangeListener() { return hierarchyListener; }
 
-    // Animation cache flags (deprecated AOSP API; some libs still set).
-    public boolean isAnimationCacheEnabled() { return false; }
-    public void setAnimationCacheEnabled(boolean enabled) {}
-    public boolean isAlwaysDrawnWithCacheEnabled() { return false; }
-    public void setAlwaysDrawnWithCacheEnabled(boolean enabled) {}
-    public int getPersistentDrawingCache() { return 0; }
-    public void setPersistentDrawingCache(int drawingCacheToKeep) {}
+    // Animation cache flags (deprecated AOSP API; some libs still set and read back).
+    private boolean mAnimationCacheEnabled;
+    private boolean mAlwaysDrawnWithCacheEnabled;
+    private int mPersistentDrawingCache;
+    public boolean isAnimationCacheEnabled() { return mAnimationCacheEnabled; }
+    public void setAnimationCacheEnabled(boolean enabled) { mAnimationCacheEnabled = enabled; }
+    public boolean isAlwaysDrawnWithCacheEnabled() { return mAlwaysDrawnWithCacheEnabled; }
+    public void setAlwaysDrawnWithCacheEnabled(boolean enabled) { mAlwaysDrawnWithCacheEnabled = enabled; }
+    public int getPersistentDrawingCache() { return mPersistentDrawingCache; }
+    public void setPersistentDrawingCache(int drawingCacheToKeep) { mPersistentDrawingCache = drawingCacheToKeep; }
     /** AOSP FLAG_SPLIT_MOTION_EVENTS (ViewGroup.java:392), set in
      *  initViewGroup() (ViewGroup.java:714-716):
      *

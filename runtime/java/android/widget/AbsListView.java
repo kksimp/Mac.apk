@@ -1079,22 +1079,32 @@ public abstract class AbsListView extends AdapterView<ListAdapter>
         if (position >= 0 && mAdapter != null) return mAdapter.getItemId(position);
         return INVALID_ROW_ID;
     }
-    public android.graphics.drawable.Drawable getSelector() { return null; }
+    private android.graphics.drawable.Drawable mSelector;
+    public android.graphics.drawable.Drawable getSelector() { return mSelector; }
     // AOSP AbsListView.getListPaddingLeft/Right/Top/Bottom return mListPadding,
     // which AOSP computes as the max of the View's own padding and the
-    // selector drawable's padding. We never paint a selector (getSelector()
-    // is always null, setSelector() is a no-op below), so that max always
-    // reduces to the plain View padding -- the same reduction
-    // getListPaddingTop/Bottom already use just below.
+    // selector drawable's padding. Keep existing padding behavior when no
+    // selector padding is measured.
     public int getListPaddingTop() { return getPaddingTop(); }
     public int getListPaddingBottom() { return getPaddingBottom(); }
     public int getListPaddingLeft() { return getPaddingLeft(); }
     public int getListPaddingRight() { return getPaddingRight(); }
 
-    public void setSelector(int resID) { }
+    public void setSelector(int resID) {
+        if (resID == 0) {
+            setSelector((android.graphics.drawable.Drawable) null);
+            return;
+        }
+        Context ctx = getContext();
+        if (ctx != null) {
+            setSelector(ctx.getDrawable(resID));
+        }
+    }
     public boolean canScrollList(int direction) { return false; }
 
-    public void setSelector(android.graphics.drawable.Drawable sel) { }
+    public void setSelector(android.graphics.drawable.Drawable sel) {
+        mSelector = sel;
+    }
 
     public void setDrawSelectorOnTop(boolean onTop) { mDrawSelectorOnTop = onTop; }
     public void setLayoutAnimation(android.view.animation.LayoutAnimationController controller) { }

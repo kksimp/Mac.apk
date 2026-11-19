@@ -53,8 +53,14 @@ public class AudioManager {
     // (real AOSP forwards to IAudioService.isMusicActive(false), which is
     // the same kind of live-engine query), and that file is native code this
     // class does not own. See followups.
+    private volatile boolean mSpeakerphoneOn = true;
+    private volatile boolean mBluetoothScoOn;
+    private volatile boolean mBluetoothA2dpOn;
+    private volatile boolean mMicrophoneMute;
+    private final java.util.concurrent.ConcurrentHashMap<String, String> mParameters =
+            new java.util.concurrent.ConcurrentHashMap<>();
     public boolean isMusicActive() { return false; }
-    public void setSpeakerphoneOn(boolean on) {}
+    public void setSpeakerphoneOn(boolean on) { mSpeakerphoneOn = on; }
     public boolean isWiredHeadsetOn() { return false; }
 
     // Unity registers a bitter.jnibridge java.lang.reflect.Proxy implementing
@@ -255,8 +261,8 @@ public class AudioManager {
     public int getMode() { return mMode; }
     public int getRingerMode() { return RINGER_MODE_NORMAL; }
     public void setRingerMode(int ringerMode) {}
-    public boolean isSpeakerphoneOn() { return true; }
-    public boolean isBluetoothScoOn() { return false; }
+    public boolean isSpeakerphoneOn() { return mSpeakerphoneOn; }
+    public boolean isBluetoothScoOn() { return mBluetoothScoOn; }
     /** AOSP: whether the platform supports off-call Bluetooth SCO (a device
      *  capability read from config_bluetooth_sco_off_call). We declare no
      *  FEATURE_BLUETOOTH and route audio through CoreAudio, so there is no SCO
@@ -290,13 +296,13 @@ public class AudioManager {
         java.util.Objects.requireNonNull(attributes);
         return DIRECT_PLAYBACK_NOT_SUPPORTED;
     }
-    public void setBluetoothScoOn(boolean on) {}
+    public void setBluetoothScoOn(boolean on) { mBluetoothScoOn = on; }
     public void startBluetoothSco() {}
     public void stopBluetoothSco() {}
-    public boolean isBluetoothA2dpOn() { return false; }
-    public void setBluetoothA2dpOn(boolean on) {}
-    public boolean isMicrophoneMute() { return false; }
-    public void setMicrophoneMute(boolean on) {}
+    public boolean isBluetoothA2dpOn() { return mBluetoothA2dpOn; }
+    public void setBluetoothA2dpOn(boolean on) { mBluetoothA2dpOn = on; }
+    public boolean isMicrophoneMute() { return mMicrophoneMute; }
+    public void setMicrophoneMute(boolean on) { mMicrophoneMute = on; }
     public boolean isVolumeFixed() { return false; }
 
     // AOSP: an opaque, monotonically increasing audio-session id. cocos2d-x and
@@ -474,8 +480,29 @@ public class AudioManager {
         return AudioRecordingActivityMonitor.getActiveRecordingConfigurations();
     }
 
-    public String getParameters(String keys) { return ""; }
-    public void setParameters(String keyValuePairs) {}
+    public String getParameters(String keys) {
+        if (keys == null || keys.isEmpty()) return "";
+        StringBuilder out = new StringBuilder();
+        for (String key : keys.split(";")) {
+            if (key.isEmpty()) continue;
+            String val = mParameters.get(key);
+            if (val != null) {
+                if (out.length() > 0) out.append(';');
+                out.append(key).append('=').append(val);
+            }
+        }
+        return out.toString();
+    }
+    public void setParameters(String keyValuePairs) {
+        if (keyValuePairs == null || keyValuePairs.isEmpty()) return;
+        for (String pair : keyValuePairs.split(";")) {
+            if (pair.isEmpty()) continue;
+            int eq = pair.indexOf('=');
+            if (eq > 0) {
+                mParameters.put(pair.substring(0, eq), pair.substring(eq + 1));
+            }
+        }
+    }
 
     // Modern audio-focus API (API 26+). We always grant, mirroring the legacy
     // overload, and never deliver loss (one app, one output).

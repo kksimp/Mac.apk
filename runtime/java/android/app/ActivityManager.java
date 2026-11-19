@@ -845,8 +845,14 @@ public class ActivityManager {
     }
 
     public static boolean isLowMemoryKillReportSupported() { return false; }
-    public void setProcessStateSummary(byte[] state) { }
-    public byte[] getProcessStateSummary() { return null; }
+    private static volatile byte[] sProcessStateSummary;
+    public void setProcessStateSummary(byte[] state) {
+        sProcessStateSummary = state == null ? null : java.util.Arrays.copyOf(state, state.length);
+    }
+    public byte[] getProcessStateSummary() {
+        byte[] s = sProcessStateSummary;
+        return s == null ? null : java.util.Arrays.copyOf(s, s.length);
+    }
 
     // ================================================================
     // AOSP API-36 surface completion (android.app.ActivityManager).

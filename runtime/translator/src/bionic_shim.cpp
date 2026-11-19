@@ -28163,6 +28163,41 @@ static inline bool macapk_arm64_mutex_ensure_valid(int32_t* m) {
             == kMacApkMutexMagic) {
         return true;
     }
+    // Bionic NON-ZERO static initializers (LP64, libc/include/pthread.h):
+    //   PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP  { { ((1 & 3) << 14) } } == 0x4000
+    //   PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP { { ((2 & 3) << 14) } } == 0x8000
+    // GNU libstdc++'s std::recursive_mutex is statically initialised this way
+    // (__GTHREAD_RECURSIVE_MUTEX_INIT), so the guest hands us word0 = 0x4000 and
+    // nine zero words. The all-zero lazy stamp below rejects that shape -> EINVAL
+    // -> std::system_error("Invalid argument") -> std::terminate (measured:
+    // Honor of Kings 12.1.1.1, libMSDKPIXCore during MSDK OnCreate). The ARM32
+    // path already honours the pattern (bionic_static_mutex_type). Translate it
+    // into this layout: the type slot is the claim (CAS 0 -> type), then the
+    // futex word becomes free (0), then the magic is stamped. A racing first
+    // locker that loses the claim waits for the magic.
+    {
+        const uint32_t w0 = uint32_t(__atomic_load_n(&m[0], __ATOMIC_ACQUIRE));
+        const int32_t stype = int32_t((w0 >> 14) & 3u);
+        if (w0 != 0u && (w0 & ~0xc000u) == 0u && (stype == 1 || stype == 2)) {
+            bool rest_zero = true;
+            for (int i = 1; i < 10; ++i)
+                if (__atomic_load_n(&m[i], __ATOMIC_RELAXED) != 0) { rest_zero = false; break; }
+            if (rest_zero) {
+                int32_t e = 0;
+                if (__atomic_compare_exchange_n(&m[kMutexTypeSlot], &e, stype, false,
+                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                    int32_t ew = int32_t(w0);
+                    __atomic_compare_exchange_n(&m[0], &ew, 0, false,
+                                                __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+                    int32_t em = 0;
+                    __atomic_compare_exchange_n(&m[kMutexMagicSlot], &em,
+                                                int32_t(kMacApkMutexMagic), false,
+                                                __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+                    return true;
+                }
+            }
+        }
+    }
     if (!macapk_arm64_mutex_all_zero(m)) {
         // CONCURRENT-FIRST-LOCK RACE (v1.0.590): two threads lock a fresh
         // (all-zero) std::mutex for the FIRST time at once. The winner lazy-stamps
@@ -28177,8 +28212,25 @@ static inline bool macapk_arm64_mutex_ensure_valid(int32_t* m) {
         // the magic with ACQUIRE ordering before giving up: if a concurrent
         // stamper set it, the mutex IS ours and valid. (The CAS-stamp path below
         // already handles the symmetric race via its `expected` readback.)
-        return uint32_t(__atomic_load_n(&m[kMutexMagicSlot], __ATOMIC_ACQUIRE))
-                   == kMacApkMutexMagic;
+        if (uint32_t(__atomic_load_n(&m[kMutexMagicSlot], __ATOMIC_ACQUIRE))
+                == kMacApkMutexMagic)
+            return true;
+        // A static-initializer conversion (above) claimed by another thread is
+        // in flight: type slot set, futex word still the initializer or already
+        // 0. Wait for its magic instead of reporting EINVAL.
+        {
+            const int32_t t = __atomic_load_n(&m[kMutexTypeSlot], __ATOMIC_ACQUIRE);
+            const uint32_t w = uint32_t(__atomic_load_n(&m[0], __ATOMIC_RELAXED));
+            if ((t == 1 || t == 2) && (w & ~0xc000u) == 0u) {
+                for (int spin = 0; spin < 200000; ++spin) {
+                    if (uint32_t(__atomic_load_n(&m[kMutexMagicSlot], __ATOMIC_ACQUIRE))
+                            == kMacApkMutexMagic)
+                        return true;
+                    sched_yield();
+                }
+            }
+        }
+        return false;
     }
     // Try once to claim this slot via CAS so concurrent lazy-stampers
     // don't race.

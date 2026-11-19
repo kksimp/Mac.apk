@@ -174,3 +174,14 @@ java -Djava.awt.headless=true -cp runtime/build/lib/android-framework.jar debug/
 MACAPK_FRAMESPEED_LAYER=0 java -Djava.awt.headless=true -cp runtime/build/lib/android-framework.jar debug/LayerColorFilterTest.java
 ```
 
+## Large assets
+
+`AssetManager.open()` streams assets larger than 16 MiB instead of reading them
+onto the Java heap, keeping AOSP's `available()` and `mark`/`reset` behaviour.
+GameMaker games open a `game.droid` of up to a gigabyte during `onCreate`. The
+regression test runs with a heap smaller than the asset it opens:
+
+```bash
+java -Xmx64m -cp runtime/build/lib/android-framework.jar:runtime/build/lib/macapk-loader.jar debug/AssetManagerLargeAssetTest.java
+```
+

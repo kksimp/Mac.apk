@@ -151,6 +151,26 @@ struct MacApkLauncherApp: App {
         DispatchQueue.main.async { HelpMenuRemover.install() }
     }
 
+    /// Come forward once the first window exists, if launching left Mac.apk
+    /// behind. AppKit asks to make the app frontmost while it finishes
+    /// launching, before SwiftUI has made the window, and the window server
+    /// refuses an app that "presents 0 windows" (system log, 2026-11-14:
+    /// "CPS: The requested process (pid = 6873) presents 0 windows, is not a
+    /// UI element and is frontable"). Normally the window follows within the
+    /// same moment; on the first launch after an install or update, while
+    /// macOS checks the new program, it came two seconds later, and Mac.apk
+    /// opened behind the app the user launched it from, last in Command-Tab,
+    /// until a second launch (owner, 2026-11-14). Only within ten seconds of
+    /// launch and only when nothing else became active by the user's hand:
+    /// NSApp.activate() is a request under cooperative activation, which
+    /// macOS declines once the user has moved to another app.
+    private func activateWhenFirstWindowAppears() {
+        guard !NSApp.isActive,
+              let launched = NSRunningApplication.current.launchDate,
+              Date().timeIntervalSince(launched) < 10 else { return }
+        NSApp.activate()
+    }
+
     var body: some Scene {
         WindowGroup("Mac.apk") {
             LauncherView()
@@ -168,7 +188,10 @@ struct MacApkLauncherApp: App {
                 // none exists (Mac.apk running with its window closed), and
                 // onOpenURL below hides that one.
                 .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
-                .onAppear { model.windowAppearedAt = Date() }
+                .onAppear {
+                    model.windowAppearedAt = Date()
+                    activateWhenFirstWindowAppears()
+                }
                 // onOpenURL fires when the user opens an .apk via Finder's
                 // "Open With > Mac.apk" or by dropping it on the Dock icon.
                 // The URL is a file://, so we extract the path and stash it.

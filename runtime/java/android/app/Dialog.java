@@ -834,10 +834,8 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
             try { dispatchWindowAttributesChanged(attrs); } catch (Throwable ignored) {}
         }
 
-        /** PhoneWindow.getElevation: mElevation. (No @Override: this tree's
-         *  android.view.Window does not declare getElevation yet; AOSP's base
-         *  answers 0.0f. Once it does, this overrides it.) */
-        public float getElevation() {
+        /** PhoneWindow.getElevation: mElevation. */
+        @Override public float getElevation() {
             return MACAPK_WINDOW_ELEVATION_ACTIVE ? mMacapkElevation : 0f;
         }
 
@@ -1013,6 +1011,14 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
             if (!MACAPK_WINDOW_BAR_COLORS) return;
             mMacapkNavigationBarColor = color;
             mMacapkForcedNavigationBarColor = true;
+        }
+        @Override public void setNavigationBarDividerColor(int dividerColor) {
+            if (MACAPK_WINDOW_BAR_COLORS && mMacapkEdgeToEdgeEnforced) return;
+            super.setNavigationBarDividerColor(dividerColor);
+        }
+        @Override public int getNavigationBarDividerColor() {
+            return (MACAPK_WINDOW_BAR_COLORS && mMacapkEdgeToEdgeEnforced)
+                    ? 0 : super.getNavigationBarDividerColor();
         }
 
         @Override public android.view.View getDecorView() { ensureDecor(); return decor; }

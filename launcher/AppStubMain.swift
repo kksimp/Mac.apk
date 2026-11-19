@@ -28,6 +28,7 @@
 import AppKit
 import CryptoKit
 import Darwin
+import LocalAuthentication
 
 // MARK: - Small helpers
 
@@ -44,6 +45,91 @@ private func stubLog(_ msg: String) {
     let line = "[MacApkAppStub] " + msg + "\n"
     stubLogBuffer.append(line)
     FileHandle.standardError.write(Data(line.utf8))
+}
+
+// MARK: - Touch ID prompts on the runtime's behalf
+
+/// Shows one Touch ID or Mac password prompt for the runtime, then exits with
+/// the result. The runtime starts this executable with `flag` as its first
+/// argument (runtime/src/user_verification_bridge.mm, `RunHelper`); nothing
+/// else in this file runs in that mode.
+///
+/// WHY THE STUB SHOWS IT. macOS names a LocalAuthentication prompt after the
+/// program that asks: the CFBundleName embedded in that program, else its
+/// file name. Only a bundle's own executable gets the bundle's name (and
+/// icon). Every app runs the one shared macapk-runtime, whose embedded name is
+/// "Mac.apk", so every app's prompt read "Mac.apk is trying to ...", and the
+/// user could not tell which app wanted their fingerprint. This stub IS the
+/// app's bundle executable, so its prompt names the app that is asking, as
+/// Android's does. Measured 2026-11-13 with five probe bundles: a program run
+/// through a bundle's symlink showed its embedded name, or with none its file
+/// name, never the bundle's; a bundle's own executable showed the bundle's
+/// name. A helper rather than a renamed copy of the runtime: tools that find
+/// running apps by the runtime's file name keep working, and it costs no disk.
+///
+/// Arguments after the flag: policy ("biometric" or "password"), reason,
+/// fallback-button title ("" hides it), cancel-button title ("" keeps the
+/// system's). The result is one line on stdout, and the exit status: 0
+/// allowed; 100 + n for LAError code -n; 98 for any other failure; 99 for
+/// unusable arguments. Nothing is ever written to stdin: when it reaches end
+/// of file (the runtime cancelled, timed out, quit or crashed) this process
+/// exits, and its prompt closes with it.
+enum UserVerificationHelper {
+    static let flag = "--macapk-verify-user=1"
+
+    static func run(_ args: [String]) -> Never {
+        guard args.count == 4 else { finish(99) }
+        let lifeline = DispatchSource.makeReadSource(fileDescriptor: 0, queue: .global())
+        lifeline.setEventHandler {
+            var byte: UInt8 = 0
+            if read(0, &byte, 1) <= 0 { finish(98) }
+        }
+        lifeline.resume()
+        let (policy, reason, fallback, cancel) = (args[0], args[1], args[2], args[3])
+        let context = LAContext()
+        context.touchIDAuthenticationAllowableReuseDuration = 0
+        context.localizedFallbackTitle = fallback
+        if !cancel.isEmpty { context.localizedCancelTitle = cancel }
+        let done = DispatchSemaphore(value: 0)
+        var status: Int32 = 98
+        let reply: (Bool, Error?) -> Void = { ok, error in
+            status = ok ? 0 : exitStatus(error)
+            done.signal()
+        }
+        switch policy {
+        case "biometric":
+            context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics,
+                                   localizedReason: reason, reply: reply)
+        case "password":
+            // Password only, as the runtime's own path does: the broader owner
+            // policy can be satisfied by Touch ID, which is not a password result.
+            guard let control = SecAccessControlCreateWithFlags(
+                nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, .devicePasscode, nil)
+            else { finish(98) }
+            context.evaluateAccessControl(control, operation: .useItem,
+                                          localizedReason: reason, reply: reply)
+        default:
+            finish(99)
+        }
+        done.wait()
+        finish(status)
+    }
+
+    /// Held by the first caller and never released: the reply and the stdin
+    /// handler can both get here, and only one line and one exit may happen.
+    private static let finishing = NSLock()
+
+    private static func finish(_ status: Int32) -> Never {
+        finishing.lock()
+        FileHandle.standardOutput.write(Data("\(status)\n".utf8))
+        exit(status)
+    }
+
+    private static func exitStatus(_ error: Error?) -> Int32 {
+        guard let e = error as NSError?, e.domain == LAErrorDomain,
+              e.code < 0, e.code > -98 else { return 98 }
+        return Int32(100 - e.code)
+    }
 }
 
 // MARK: - The run log
@@ -536,6 +622,12 @@ struct AppStubMain {
     }
 
     static func main() {
+        // Not a launch: a Touch ID prompt the runtime asked for. Before anything
+        // else, so it touches no log, registry or staged runtime.
+        let args = CommandLine.arguments
+        if args.count >= 2, args[1] == UserVerificationHelper.flag {
+            UserVerificationHelper.run(Array(args.dropFirst(2)))
+        }
         let fm = FileManager.default
 
         // 1. Resolve our own bundle from the executable location:

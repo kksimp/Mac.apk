@@ -3461,8 +3461,13 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     public android.content.res.ColorStateList getBackgroundTintList() {
         return macapkBackgroundTintList;
     }
-    public void setBackgroundTintMode(android.graphics.PorterDuff.Mode mode) {}
-    public android.graphics.PorterDuff.Mode getBackgroundTintMode() { return null; }
+    private android.graphics.PorterDuff.Mode macapkBackgroundTintMode;
+    public void setBackgroundTintMode(android.graphics.PorterDuff.Mode mode) {
+        this.macapkBackgroundTintMode = mode;
+    }
+    public android.graphics.PorterDuff.Mode getBackgroundTintMode() {
+        return macapkBackgroundTintMode;
+    }
 
     // (setElevation / getElevation already defined elsewhere)
     // AOSP signature takes android.animation.StateListAnimator -- the APK's
@@ -9885,11 +9890,9 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     // ---- tint blend modes (API 29) -------------------------------------------
     // AOSP keeps ONE tint mode per drawable slot: setBackgroundTintMode(
     // PorterDuff.Mode) converts to a BlendMode and writes the same
-    // TintInfo.mBlendMode this pair reads. Mac.apk's PorterDuff pair predates
-    // this and is a documented no-op/null (see setBackgroundTintMode above); the
-    // two are deliberately NOT wired together here, because making the
-    // PorterDuff getter start answering would change behaviour every Canvas-tier
-    // app already depends on. See the lane report.
+    // TintInfo.mBlendMode this pair reads. Mac.apk keeps mBackgroundTintBlendMode
+    // separate from macapkBackgroundTintMode so Canvas-tier callers setting
+    // only BlendMode do not see the PorterDuff getter change underneath them.
     private android.graphics.BlendMode mBackgroundTintBlendMode;
     private android.graphics.BlendMode mForegroundTintBlendMode;
     public void setBackgroundTintBlendMode(android.graphics.BlendMode blendMode) {

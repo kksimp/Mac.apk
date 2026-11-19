@@ -2094,6 +2094,16 @@ public class Activity extends ContextThemeWrapper
             mNavigationBarColor = color;
             mForcedNavigationBarColor = true;
         }
+        /** android15 PhoneWindow.setNavigationBarDividerColor / getter:
+         *  ignored/TRANSPARENT when edge-to-edge is enforced. */
+        @Override public void setNavigationBarDividerColor(int dividerColor) {
+            if (MACAPK_WINDOW_BAR_COLORS && mEdgeToEdgeEnforced) return;
+            super.setNavigationBarDividerColor(dividerColor);
+        }
+        @Override public int getNavigationBarDividerColor() {
+            return (MACAPK_WINDOW_BAR_COLORS && mEdgeToEdgeEnforced)
+                    ? 0 : super.getNavigationBarDividerColor();
+        }
 
         @Override public android.view.View getDecorView() {
             ensureDecor();

@@ -112,6 +112,7 @@ set(MACAPK_RUNTIME_SOURCES
     # NativeCocoa.hostFontFile: CoreText names the Mac's CJK font files for the
     # native-stack fonts.xml (android.graphics.MacApkHostFonts).
     src/host_fonts.cpp
+    src/native_reflection.cpp
     src/native_sqlite.cpp
     src/native_os.cpp
     # com.macapk.loader.NativeLinker: dlopen WITHOUT JNI_OnLoad, the Android

@@ -2783,7 +2783,12 @@ public final class ActivityHost {
         if (intent.hasFileDescriptors()) {
             throw new IllegalArgumentException("File descriptors passed in Intent");
         }
-        final String own = app != null ? app.getPackageName() : null;
+        // An attached Application may represent a plugin package. Keep that
+        // identity routable alongside Boot's installed manifest package.
+        final String installedPackage = Boot.packageName();
+        final String reportedPackage = app != null ? app.getPackageName() : null;
+        final String own = reportedPackage != null && !reportedPackage.isEmpty()
+                ? reportedPackage : installedPackage;
         final ComponentName cn = intent.getComponent();
         if (cn != null) {
             final String pkg = cn.getPackageName();
@@ -2791,7 +2796,7 @@ public final class ActivityHost {
             // resolver. It performs the same real host check as the implicit
             // Keyguard intent, before cross-app resolution is considered.
             if (DeviceCredentialHandler.isCredentialIntent(intent) && resolveImplicitToHost(intent)) return null;
-            if (own == null || own.equals(pkg)) return intent;
+            if (own == null || own.equals(pkg) || pkg.equals(installedPackage)) return intent;
             // The platform package installer, pinned by the caller (a store
             // picks InstallStart out of queryIntentActivities and setClassName()s
             // it): performed by the installer surface, as the implicit start is.
@@ -2833,7 +2838,8 @@ public final class ActivityHost {
         android.content.pm.ResolveInfo pick = null;
         for (android.content.pm.ResolveInfo ri : rows) {
             if (ri == null || ri.activityInfo == null) continue;
-            final boolean mine = own != null && own.equals(ri.activityInfo.packageName);
+            final boolean mine = own != null && own.equals(ri.activityInfo.packageName)
+                    || installedPackage != null && installedPackage.equals(ri.activityInfo.packageName);
             if (mine && web) continue;
             if (exportedOnly && !ri.activityInfo.exported) continue;
             pick = ri;
@@ -2848,9 +2854,10 @@ public final class ActivityHost {
                     + intent.getAction() + " data=" + intent.getDataString() + ") -- ignored");
             return null;
         }
-        if (own != null && own.equals(pick.activityInfo.packageName)) {
+        if (own != null && own.equals(pick.activityInfo.packageName)
+                || installedPackage != null && installedPackage.equals(pick.activityInfo.packageName)) {
             Intent copy = new Intent(intent);
-            copy.setComponent(new ComponentName(own, pick.activityInfo.name));
+            copy.setComponent(new ComponentName(pick.activityInfo.packageName, pick.activityInfo.name));
             NativeLog.i(TAG, "startActivity implicit (action=" + intent.getAction()
                     + ") -> own " + pick.activityInfo.name);
             return copy;

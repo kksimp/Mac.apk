@@ -48,6 +48,7 @@
 #include <cstring>         // std::strcmp / std::memcpy
 #include <map>             // window policy phase 3: remembered boxes by activity token
 #include "macapk/self_capture.h"
+#include "macapk/screen_camera.h"      // View > Show Screen in Camera
 #include "macapk/app_process_group.h"   // AOSP killProcessGroup on app death (macapk_terminate_now)
 #include <libproc.h>        // proc_pidpath -- the app-owned fork test in macapk_terminate_now
 #include <signal.h>         // SIGKILL
@@ -9758,6 +9759,13 @@ static MacApkAppearanceObserver* g_appearance_observer = nil;
     macapk::arrowpad_call("toggle", "()Z");
     [self macapkRefreshArrowItems:[item menu]];
 }
+// View > Show Screen in Camera (screen_camera.h): switches the camera between
+// the plain image and the screen picture, from the next frame on.
+- (void)macapkToggleScreenCamera:(NSMenuItem*)item {
+    const bool showing = !macapk_screencam_showing();
+    macapk_screencam_set_showing(showing);
+    [item setState:showing ? NSControlStateValueOn : NSControlStateValueOff];
+}
 - (void)macapkToggleSpaceTap:(NSMenuItem*)item {
     macapk::spacetap_call("toggle", "()Z");
     [self macapkRefreshArrowItems:[item menu]];
@@ -10089,6 +10097,24 @@ static void install_menu_bar(NSString* appTitle) {
     [rotate setKeyEquivalentModifierMask:NSEventModifierFlagCommand];
     [rotate setTarget:nil];   // responder chain -> MacApkMetalView
     [viewMenu addItem:rotate];
+    // The optional screen + camera picture (screen_camera.h), only in an app
+    // whose MACAPK_SCREEN_CAMERA override makes it available.
+    if (macapk_screencam_enabled()) {
+        [viewMenu addItem:[NSMenuItem separatorItem]];
+        NSMenuItem* screenCamera =
+            [[NSMenuItem alloc] initWithTitle:@"Show Screen in Camera"
+                                       action:@selector(macapkToggleScreenCamera:)
+                                keyEquivalent:@"s"];
+        [screenCamera setKeyEquivalentModifierMask:
+            NSEventModifierFlagCommand | NSEventModifierFlagShift];
+        [screenCamera setTarget:g_controls_target];
+        [screenCamera setToolTip:@"Send your screen, with your camera in a corner, in place "
+                                  "of the camera image. Changes at once."];
+        [screenCamera setState:macapk_screencam_showing() ? NSControlStateValueOn
+                                                          : NSControlStateValueOff];
+        [viewMenu addItem:screenCamera];
+        [screenCamera release];
+    }
     [viewItem setSubmenu:viewMenu];
 
     // Controls menu: pick the keyboard-binding profile.

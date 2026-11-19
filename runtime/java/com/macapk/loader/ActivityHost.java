@@ -71,6 +71,12 @@ public final class ActivityHost {
     private static Application app;
     private static ClassLoader appCl;
     private static final Deque<Activity> stack = new ArrayDeque<>();
+    /** Bottom-to-top snapshot for framework APIs that need a coherent view of
+     *  the app task. ActivityManager.getAppTasks() is synchronous and may be
+     *  called while ordinary Activity bookkeeping is changing, so readers must
+     *  not walk the mutable Deque directly. publishTaskSnapshot() runs at the
+     *  only two mutation points (push and finish). */
+    private static volatile Activity[] sTaskActivities = new Activity[0];
 
     public static void init(Application application, ClassLoader cl) {
         app = application;
@@ -87,10 +93,50 @@ public final class ActivityHost {
 
     public static Activity push(Activity a) {
         stack.push(a);
+        publishTaskSnapshot();
         return a;
     }
 
     public static Activity peek() { return stack.peek(); }
+
+    private static void publishTaskSnapshot() {
+        java.util.ArrayList<Activity> bottomToTop = new java.util.ArrayList<>(stack);
+        java.util.Collections.reverse(bottomToTop);
+        sTaskActivities = bottomToTop.toArray(new Activity[0]);
+    }
+
+    /** A coherent bottom-to-top snapshot of the one task hosted by this process.
+     *  AOSP exposes the same task through ActivityManager.getAppTasks(); keeping
+     *  the snapshot behind the ActivityHost avoids leaking stack internals to the
+     *  framework jar and gives background callers an immutable view. */
+    public static Activity[] macapkTaskActivitySnapshot() {
+        return sTaskActivities.clone();
+    }
+
+    /** AppTask.finishAndRemoveTask(): remove the whole task, regardless of which
+     *  member is currently on top. */
+    public static void macapkRemoveCurrentTask() {
+        if (android.os.Looper.getMainLooper() != null && !macapkOnMainThread()) {
+            ownerHandler().post(new Runnable() {
+                @Override public void run() { macapkRemoveCurrentTask(); }
+            });
+            return;
+        }
+        Activity root = taskRoot();
+        if (root != null) macapkFinishTask(root, true);
+    }
+
+    /** AppTask.moveToFront(): this process owns the only hosted task, so its
+     *  task handle always means the current macOS application window. */
+    public static void macapkMoveCurrentTaskToFront() {
+        if (android.os.Looper.getMainLooper() != null && !macapkOnMainThread()) {
+            ownerHandler().post(new Runnable() {
+                @Override public void run() { macapkMoveCurrentTaskToFront(); }
+            });
+            return;
+        }
+        try { NativeCocoa.moveTaskToFront(); } catch (Throwable ignored) {}
+    }
 
     /** True while `a` is STOPPED because another activity covers it
      *  (stopForNewTop). Read by GLSurfaceView's GL-BEHIND-TOP detector. */
@@ -487,6 +533,7 @@ public final class ActivityHost {
         }
         boolean wasTop = !stack.isEmpty() && stack.peek() == a;
         stack.remove(a);
+        publishTaskSnapshot();
         // Whatever we recorded about `a` being backgrounded is meaningless once
         // it is destroyed, and holding the entry would let a later restore of a
         // recycled instance believe it owes onRestart(). Read it first, though:

@@ -1197,19 +1197,26 @@ struct AppStubMain {
         // assessment then fails with "a sealed resource is missing or
         // invalid" -- an app that launches once and is refused afterwards.
         // BundleGenerator pre-creates it, so the common path is a no-op.
-        let have = try? FileManager.default
-            .destinationOfSymbolicLink(atPath: execLink.path)
-        if have == runtime.path {
-            execPath = execLink.path
-        } else {
-            unlink(execLink.path)
-            if symlink(runtime.path, execLink.path) == 0 {
+        // A headless secondary process must not register as this launchable
+        // app. If it executes the same bundle-relative link, LaunchServices
+        // can keep treating the background worker as the running app after
+        // the UI process exits; Finder then activates that worker instead of
+        // starting a new window. Only the primary needs the bundle identity.
+        if !secondaryProcess {
+            let have = try? FileManager.default
+                .destinationOfSymbolicLink(atPath: execLink.path)
+            if have == runtime.path {
                 execPath = execLink.path
-                stubLog("exec link repointed -> \(runtime.path) (was \(have ?? "absent")); "
-                        + "the bundle seal is now stale until the next install")
             } else {
-                stubLog("WARN: could not create \(execLink.path) (errno \(errno)); "
-                        + "exec'ing the runtime directly (Dock will show its own name)")
+                unlink(execLink.path)
+                if symlink(runtime.path, execLink.path) == 0 {
+                    execPath = execLink.path
+                    stubLog("exec link repointed -> \(runtime.path) (was \(have ?? "absent")); "
+                            + "the bundle seal is now stale until the next install")
+                } else {
+                    stubLog("WARN: could not create \(execLink.path) (errno \(errno)); "
+                            + "exec'ing the runtime directly (Dock will show its own name)")
+                }
             }
         }
         // Last line of defence before handing control to the runtime. The

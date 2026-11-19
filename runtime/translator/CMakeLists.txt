@@ -79,6 +79,7 @@ endif()
 set(SHIM_JAVA_HOME "$ENV{JAVA_HOME}")
 add_library(macapk-bionic-shim SHARED
     src/bionic_shim.cpp
+    src/bionic_shim_strings.cpp
     # Android's system CA store (/system/etc/security/cacerts) built from the
     # macOS trust store; the path remap in bionic_shim.cpp serves it. Gate
     # MACAPK_SYSTEM_CACERTS.

@@ -750,7 +750,7 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         // so its first lookup of the already-running GameActivity killed the
         // engine (Rocket League Sideswipe, 2026-10-02).
         Class<?> alreadyDefined = findLoadedClass(classDotted);
-        if (alreadyDefined != null) return alreadyDefined;
+        if (alreadyDefined != null) return definedElsewhere(alreadyDefined, classDotted, null);
 
         // Shout if this class is known NOT to pass HotSpot's verifier. It loads
         // anyway because -Xverify:none is set, which is exactly why the fact has
@@ -777,10 +777,12 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         byte[] direct = BOOTSPEED_JARREAD ? readClassJarEntry(resourcePath) : null;
         java.net.URL u = direct != null ? null : findResource(resourcePath);
         if (direct != null || u != null) {
+            byte[] defineBytes = null;
             try (java.io.InputStream in = direct != null ? null : u.openStream()) {
                 byte[] raw = remapRewrite(direct != null ? direct : in.readAllBytes());
                 ClassFileRewriter.Result r =
                     ClassFileRewriter.maybeRewrite(raw, classDotted);
+                defineBytes = r.bytes;
                 if (r.rewritten && !QUIET_CLASSLOAD) {
                     // Quiet too: WhatsApp rewrites ~1,400 classes per boot, one
                     // INFO line each.
@@ -805,7 +807,7 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
                 // thread that lost gets the winner's class. Anything else
                 // (a real format/verify error) the JVM surfaces itself.
                 Class<?> winner = findLoadedClass(classDotted);
-                if (winner != null) return winner;
+                if (winner != null) return definedElsewhere(winner, classDotted, defineBytes);
                 throw le;
             } catch (Throwable t) {
                 NativeLog.w(TAG, "findClass(" + classDotted
@@ -830,9 +832,11 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         if (lazy != null) {
             byte[] raw = remapRewrite(lazy.classBytes(srcDotted.replace('.', '/')));
             if (raw != null) {
+                byte[] defineBytes = null;
                 try {
                     ClassFileRewriter.Result r =
                         ClassFileRewriter.maybeRewrite(raw, classDotted);
+                    defineBytes = r.bytes;
                     Class<?> defined =
                         defineClass(classDotted, r.bytes, 0, r.bytes.length);
                     maybePopulateRClassFields(defined, classDotted);
@@ -842,6 +846,9 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
                     }
                     return defined;
                 } catch (LinkageError le) {
+                    // Same define race as the jar path above.
+                    Class<?> winner = findLoadedClass(classDotted);
+                    if (winner != null) return definedElsewhere(winner, classDotted, defineBytes);
                     throw le;
                 } catch (Throwable t) {
                     NativeLog.w(TAG, "findClass(" + classDotted
@@ -878,10 +885,32 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         binaryName = remapDefinedName(binaryName);
         bytes = remapRewrite(bytes);
         ClassFileRewriter.Result r = ClassFileRewriter.maybeRewrite(bytes, binaryName);
-        Class<?> defined = defineClass(binaryName, r.bytes, 0, r.bytes.length);
+        Class<?> defined;
+        try {
+            defined = defineClass(binaryName, r.bytes, 0, r.bytes.length);
+        } catch (LinkageError le) {
+            Class<?> winner = findLoadedClass(binaryName);
+            if (winner != null) return definedElsewhere(winner, binaryName, r.bytes);
+            throw le;
+        }
         maybePopulateRClassFields(defined, binaryName);
         wirePairipRegistry(defined, r.bytes, binaryName);
         return defined;
+    }
+
+    /** A class this loader already holds, returned by findClass to a thread
+     *  that found it defined or lost the race to define it. Loading takes no
+     *  per-class lock (BaseDexClassLoader.loadClass), so the thread that did
+     *  define it may still be filling in R fields and pairip registry fields
+     *  after defineClass. Both steps only fill fields that are still unset,
+     *  with the values the definer writes, so running them again here means
+     *  this caller sees them filled. They cannot recurse into this path for
+     *  the same class. {@code bytes} is null when this thread has not read
+     *  the class file; pairip wiring needs it. */
+    private Class<?> definedElsewhere(Class<?> c, String dotted, byte[] bytes) {
+        maybePopulateRClassFields(c, dotted);
+        if (bytes != null) wirePairipRegistry(c, bytes, dotted);
+        return c;
     }
 
     // Pure pass-through, matching java.lang.ClassLoader's own shape
@@ -1137,13 +1166,15 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         // names reproduces that for every load through this loader. Default ON:
         // hidden() returns false at once, one boolean test per load.
         // debug/fwgap_gate.sh strips this block to build its positive control.
+        // These branches take no per-class lock, for the reason
+        // BaseDexClassLoader.loadClass gives: defineClass resolves supertypes
+        // through the parent, so a lock held here can close the same cycle.
+        // findClass returns the winner of a define race.
         if (FwGapNewClasses.hidden(normalised)) {
-            synchronized (getClassLoadingLock(normalised)) {
-                Class<?> c = findLoadedClass(normalised);
-                if (c == null) c = findClass(normalised);
-                if (resolve) resolveClass(c);
-                return c;
-            }
+            Class<?> c = findLoadedClass(normalised);
+            if (c == null) c = findClass(normalised);
+            if (resolve) resolveClass(c);
+            return c;
         }
 
         // v1.0.477: child-first for the GMS/Firebase/Play/Billing families.
@@ -1153,26 +1184,26 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         // entry point because the one-arg loadClass(String) and the JVM's own
         // resolution both route through this two-arg form via virtual dispatch.
         if (GMS_CHILD_FIRST && isGmsChildFirstFamily(normalised)) {
-            synchronized (getClassLoadingLock(normalised)) {
-                Class<?> c = findLoadedClass(normalised);
-                if (c == null) {
-                    try {
-                        // App's bundled copy first (our classpath is the app jar
-                        // only; the framework shadow lives in the PARENT loader).
-                        c = findClass(normalised);
-                        if (!QUIET_CLASSLOAD) NativeLog.i(TAG, "loadClass("
-                            + normalised + ") child-first -> app's bundled copy");
-                    } catch (ClassNotFoundException notInApp) {
-                        // App didn't bundle it: fall back to our shadow via the
-                        // normal parent-first delegation.
-                        c = super.loadClass(normalised, false);
-                        if (!QUIET_CLASSLOAD) NativeLog.i(TAG, "loadClass("
-                            + normalised + ") child-first miss -> shadow fallback");
-                    }
+            Class<?> c = findLoadedClass(normalised);
+            if (c == null) {
+                try {
+                    // App's bundled copy first (our classpath is the app jar
+                    // only; the framework shadow lives in the PARENT loader).
+                    c = findClass(normalised);
+                    if (!QUIET_CLASSLOAD) NativeLog.i(TAG, "loadClass("
+                        + normalised + ") child-first -> app's bundled copy");
+                } catch (ClassNotFoundException notInApp) {
+                    // App didn't bundle it: fall back to our shadow below.
                 }
-                if (resolve) resolveClass(c);
-                return c;
             }
+            if (c == null) {
+                // The normal parent-first delegation.
+                c = super.loadClass(normalised, false);
+                if (!QUIET_CLASSLOAD) NativeLog.i(TAG, "loadClass("
+                    + normalised + ") child-first miss -> shadow fallback");
+            }
+            if (resolve) resolveClass(c);
+            return c;
         }
 
         Class<?> c = super.loadClass(normalised, resolve);
@@ -1233,20 +1264,19 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
     }
 
     private Class<?> appCopyOfRetiredShadow(String name, Class<?> shadow, boolean resolve) {
-        synchronized (getClassLoadingLock(name)) {
-            Class<?> own = findLoadedClass(name);
-            if (own == null) {
-                try {
-                    own = findClass(name);
-                } catch (ClassNotFoundException notInApp) {
-                    return shadow;   // the app does not bundle it: keep the shadow
-                }
-                NativeLog.i(TAG, "loadClass(" + name + ") retired shadow -> app's own copy"
-                    + " (MACAPK_RETIRE_ENGINE_SHADOWS=0 restores the shadow)");
+        // No per-class lock, as in loadClass above.
+        Class<?> own = findLoadedClass(name);
+        if (own == null) {
+            try {
+                own = findClass(name);
+            } catch (ClassNotFoundException notInApp) {
+                return shadow;   // the app does not bundle it: keep the shadow
             }
-            if (resolve) resolveClass(own);
-            return own;
+            NativeLog.i(TAG, "loadClass(" + name + ") retired shadow -> app's own copy"
+                + " (MACAPK_RETIRE_ENGINE_SHADOWS=0 restores the shadow)");
         }
+        if (resolve) resolveClass(own);
+        return own;
     }
 
     /** v1.0.152: tracks whether we've already triggered the bulk

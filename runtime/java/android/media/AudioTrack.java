@@ -446,6 +446,19 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
     }
 
     public static int getMinBufferSize(int sampleRateInHz, int channelConfig, int audioFormat) {
+        if (sampleRateInHz < 4000 || sampleRateInHz > 192000) {
+            return ERROR_BAD_VALUE;
+        }
+        if (channelConfig != 2 && channelConfig != 3 && channelConfig != 1
+                && (channelConfig <= 0 || (channelConfig & ~0x3FFFFC) != 0)) {
+            return ERROR_BAD_VALUE;
+        }
+        if (audioFormat != AudioFormat.ENCODING_PCM_16BIT
+                && audioFormat != AudioFormat.ENCODING_PCM_8BIT
+                && audioFormat != AudioFormat.ENCODING_PCM_FLOAT
+                && audioFormat != 1 /* ENCODING_DEFAULT */) {
+            return ERROR_BAD_VALUE;
+        }
         int ch  = channelsFromConfig(channelConfig);
         int bps = bytesPerSample(normalizeEncoding(audioFormat));
         // ~ minimum sane buffer: 25 ms, floored so callers that multiply it

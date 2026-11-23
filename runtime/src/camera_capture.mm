@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "macapk/camera_capture.h"
+#include "macapk/screen_camera.h"
 
 // ===========================================================================
 // PIXEL FORMAT: Android YUV_420_888  <->  CoreVideo NV12
@@ -256,6 +257,9 @@ struct MacapkCamSession {
     int              width  = 0;
     int              height = 0;
     bool             running = false;
+    // MACAPK_SCREEN_CAMERA (screen_camera.h): this session's frames are
+    // replaced by the screen + camera picture. Only the built-in camera.
+    bool             screenCamera = false;
 };
 
 // Delegate: runs on the session's private serial queue.
@@ -283,8 +287,15 @@ struct MacapkCamSession {
     int64_t ns = CMTIME_IS_VALID(pts)
         ? (int64_t)(CMTimeGetSeconds(pts) * 1.0e9) : 0;
 
-    CVPixelBufferRef pb = (CVPixelBufferRef)CFRetain(img);
-    CVPixelBufferRef pbLatest = (CVPixelBufferRef)CFRetain(img);
+    // With the screen camera on, every consumer gets the composite instead,
+    // at the same size and format; until the screen is captured (or if it is
+    // refused) the camera frame itself goes through.
+    CVPixelBufferRef composite = s->screenCamera
+        ? macapk_screencam_compose((CVPixelBufferRef)img) : nullptr;
+    CVImageBufferRef frame = composite ? composite : img;
+    CVPixelBufferRef pb = (CVPixelBufferRef)CFRetain(frame);
+    CVPixelBufferRef pbLatest = (CVPixelBufferRef)CFRetain(frame);
+    if (composite) CFRelease(composite);
 
     CVPixelBufferRef displaced = nullptr;
     CVPixelBufferRef displacedLatest = nullptr;
@@ -454,6 +465,7 @@ MacapkCamSession* macapk_cam_open(int index) {
         }
 
         MacapkCamSession* s = new MacapkCamSession();
+        s->screenCamera = macapk_screencam_enabled() && facing_for(dev) == MACAPK_CAM_FACING_FRONT;
         s->device  = [dev retain];
         s->input   = [in retain];
         s->session = [[AVCaptureSession alloc] init];
@@ -566,6 +578,7 @@ bool macapk_cam_start(MacapkCamSession* s) {
         // our frame lock. It does not need the main thread.
         [s->session startRunning];
         s->running = s->session.isRunning;
+        if (s->running && s->screenCamera) macapk_screencam_session_started();
         if (trace_on())
             std::fprintf(stderr, "[camera] start -> %s\n", s->running ? "running" : "FAILED");
         return s->running;
@@ -578,6 +591,7 @@ void macapk_cam_stop(MacapkCamSession* s) {
         if (!s->running) return;
         [s->session stopRunning];
         s->running = false;
+        if (s->screenCamera) macapk_screencam_session_stopped();
         // Drop any undrained frame so a restart does not hand out a stale one.
         // The latest-frame ref goes too: a stopped camera must not keep
         // serving its final frame to a SurfaceTexture latch as if live.

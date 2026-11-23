@@ -5633,6 +5633,11 @@ public enum RuntimeInstall {
     /// guards the flag with `fs::exists()` so nothing said a word. A hardcoded
     /// list here would reproduce that exactly the day a third patch dir lands.
     /// Matching `*_patch` means a new one is staged the moment it is bundled.
+    /// The whole folders `payloadDirs` stages when the control panel has them.
+    /// One list, because NamedProcess.fileName also reserves the Resources
+    /// ones as names an app's runtime copy may not take.
+    static let payloadFolders = ["Resources/jre", "Resources/tools", "Frameworks", "lib/pairip-refs"]
+
     static func payloadDirs(in contentsRoot: URL) -> [String] {
         var out: [String] = []
 
@@ -5701,7 +5706,7 @@ public enum RuntimeInstall {
         // A/B-confirmed 2026-09-18: staged, MC boots and renders; not staged, it
         // aborts. build_launcher.sh already bundles it into Contents/lib; this is
         // what carries it the rest of the way into the staged shared runtime.
-        for dir in ["Resources/jre", "Resources/tools", "Frameworks", "lib/pairip-refs"] {
+        for dir in payloadFolders {
             let u = contentsRoot.appendingPathComponent(dir, isDirectory: true)
             if (try? u.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
                 out.append(dir)
@@ -6355,8 +6360,10 @@ public enum RuntimeInstall {
             else { continue }
             var buf = [CChar](repeating: 0, count: 4096)
             guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { continue }
-            let exe = URL(fileURLWithPath: String(cString: buf)).lastPathComponent
-            if exe == "macapk-runtime" || exe.hasPrefix("MacApkAppStub") {
+            let path = String(cString: buf)
+            let exe = URL(fileURLWithPath: path).lastPathComponent
+            // The runtime, under its own name or an app's (NamedProcess).
+            if NamedProcess.isRuntime(path: path) || exe.hasPrefix("MacApkAppStub") {
                 live.append(f.deletingPathExtension().lastPathComponent)
             }
         }
@@ -6385,7 +6392,8 @@ public enum RuntimeInstall {
 // MARK: - Stale background processes
 
 /// Terminates the app processes a previous build left running when the shared
-/// runtime is replaced: every `macapk-runtime` (service hosts the broker
+/// runtime is replaced: every runtime process (`macapk-runtime`, or an app's
+/// named copy of it, NamedProcess; service hosts the broker
 /// started, Play services, the Services Framework, and apps the user opened)
 /// and then the system broker itself (`macapk-system`, restarted afterwards).
 /// They keep running the old build's code and binder protocol, so a new app
@@ -6433,16 +6441,17 @@ enum StaleBackground {
         return env
     }
 
-    /// Live processes: (pid, executable file name).
-    static func processes() -> [(pid: pid_t, exe: String)] {
+    /// Live processes: (pid, executable file name, resolved executable path).
+    static func processes() -> [(pid: pid_t, exe: String, path: String)] {
         var pids = [pid_t](repeating: 0, count: 4096)
         let n = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size))
         guard n > 0 else { return [] }
-        var out: [(pid_t, String)] = []
+        var out: [(pid_t, String, String)] = []
         for pid in pids.prefix(Int(n)) where pid > 0 {
             var buf = [CChar](repeating: 0, count: 4096)
             guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { continue }
-            out.append((pid, URL(fileURLWithPath: String(cString: buf)).lastPathComponent))
+            let path = String(cString: buf)
+            out.append((pid, URL(fileURLWithPath: path).lastPathComponent, path))
         }
         return out
     }
@@ -6471,7 +6480,8 @@ enum StaleBackground {
         let procs = processes()
         outcome.brokerWasRunning = procs.contains { $0.exe == "macapk-system" }
         var victims: [pid_t] = []
-        for p in procs where p.pid != getpid() && (p.exe == "macapk-runtime" || p.exe.hasPrefix("MacApkAppStub")) {
+        for p in procs where p.pid != getpid()
+                && (NamedProcess.isRuntime(path: p.path) || p.exe.hasPrefix("MacApkAppStub")) {
             // Every app of the previous build: the service hosts, and (owner,
             // 2026-11-02: it only matters when Mac.apk is updated) the apps the
             // user opened. A mixed old-runtime/new-helper app is worse than a
@@ -6690,6 +6700,228 @@ public enum StubRefresh {
         if done { return }
         guard let src = RuntimeInstall.sourceContents(extra: extraSources) else { return }
         refreshAll(template: template(in: src), log: log)
+    }
+}
+
+// MARK: - Named process (MACAPK_NAMED_PROCESS)
+
+/// Gives a running app its own name where macOS names the PROGRAM FILE a
+/// process runs, rather than its bundle: Control Center's Video and Mic
+/// panels, shown while an app uses the camera or microphone, title the app by
+/// that file. Every app runs the one shared runtime, so every app appears
+/// there as "macapk-runtime". (The Dock, the app switcher and the menu title
+/// are already right: they come from the bundle, through the exec link the
+/// stub creates in Contents/MacOS; see AppStubMain.swift step 10.)
+///
+/// MEASURED 2026-11-22 (macOS 26.6.2) with a probe launched exactly as a stub
+/// launches the runtime (the bundle's executable execv's a link in
+/// Contents/MacOS to a program outside the bundle that embeds an Info.plist
+/// with CFBundleName "Mac.apk"): with the camera on, Control Center titled it
+/// with the program's file name -- not the bundle's name, not the embedded
+/// CFBundleName. Its icon stays the generic one: neither a custom Finder icon
+/// on the file nor the icon of an .app wrapped around it is used, even with
+/// that .app signed as a whole and registered with LaunchServices; an
+/// ad-hoc-signed test app opened directly showed the generic icon too, so
+/// the limit is not specific to how Mac.apk launches apps (all measured the
+/// same day).
+///
+/// HOW. Each app has one fixed path beside macapk-runtime in the staged
+/// Resources/, named after the app (`path(label:runtime:)`), and its exec link
+/// points there. The stub makes that path, on every launch, either
+///   * a COPY of the runtime (switch on): an APFS clone (copyfile
+///     COPYFILE_CLONE), so it takes almost no space, with the runtime's code
+///     signature byte for byte; or
+///   * a SYMLINK to macapk-runtime (switch off): the process then resolves to
+///     macapk-runtime exactly as before.
+/// So switching never touches the bundle: the link sits in Contents/MacOS,
+/// which is sealed (BundleGenerator.adHocSign), and rewriting it after the seal
+/// gets the app refused at a later launch. The copy must sit in that folder
+/// because the runtime finds its JRE, jars and dylibs from its own resolved
+/// location (main.cpp BinaryDir, the @executable_path rpaths). A runtime
+/// install replaces the staged tree, copies included; the next launch makes a
+/// new one. A copy is refreshed whenever its size or modification time
+/// differs from macapk-runtime's (to the second, as staging's staleFiles
+/// compares). A label with no usable file name or a runtime outside the
+/// staged tree (a MACAPK_RUNTIME_ROOT run) uses the shared runtime. If the
+/// app's path cannot be made what it should be (a failed copy, say), the stub
+/// makes it a link instead, and failing that execs the shared runtime
+/// directly for that launch: the app starts either way, and a link already
+/// pointing at the app's path is never rewritten. Labels that differ only in
+/// case share one path on a case-insensitive volume; the name shown is then
+/// whichever was written last, and the install helper refuses a running app
+/// whose copy another launch has since replaced, until it restarts.
+///
+/// WHO ELSE MUST KNOW. Code that recognises a running app by its program file
+/// being named macapk-runtime also accepts a copy (`isRuntime(path:)`); the
+/// install helper's caller check additionally requires the copy to be the one
+/// its own bundle execs (InstallHelperMain CallerIdentity).
+///
+/// MAKING IT PERMANENT, for every app and without the flag:
+///   1. set `enabledByDefault` below to true. That is the whole change: every
+///      bundle generated since this code shipped already points its link at
+///      its own path, and the stub makes that a copy instead of a link. No
+///      sealed bundle is touched. MACAPK_NAMED_PROCESS=0 still turns it off
+///      for one app.
+///   2. bundles generated BEFORE this code point their link at macapk-runtime
+///      itself and keep the shared name until they are generated again, which
+///      any in-place update, rename or reinstall does (finalizeIdentity asks
+///      `linkTarget`), with no seal touched. The stub repoints such a link
+///      only when MACAPK_NAMED_PROCESS=1 is set for that app explicitly,
+///      which leaves its seal stale (see above). A pass converting them all
+///      at once would follow refreshStalePurposeStrings (the same
+///      finalizeBundle hook, the same skip of a running app) and, as that
+///      warns, would cost each app its TCC grants, camera and microphone
+///      included.
+///   3. document the default in BUILDING.md ("Named process").
+public enum NamedProcess {
+    /// The per-app environment override: "1" on, "0" off, absent: the default.
+    public static let flag = "MACAPK_NAMED_PROCESS"
+
+    /// The one switch that makes this the default for every app. See above.
+    public static let enabledByDefault = false
+
+    /// Whether an app whose environment is `env` runs as a named copy.
+    public static func isEnabled(_ env: [String: String]) -> Bool {
+        switch env[flag] {
+        case "1": return true
+        case "0": return false
+        default: return enabledByDefault
+        }
+    }
+
+    /// The file name for an app labelled `label`, or nil when there is none:
+    /// an empty label, one too long for the exec link (".<label>") to be made,
+    /// or the name of one of the runtime's own files or folders in Resources
+    /// (compared without case, as APFS does by default). "/" is folded out as
+    /// for the exec link. Decided from the lists, not from disk, because
+    /// BundleGenerator asks before anything is staged.
+    public static func fileName(label: String) -> String? {
+        let name = label.replacingOccurrences(of: "/", with: "-")
+        guard !name.isEmpty, name != ".", name != "..",
+              name.utf8.count <= 254 else { return nil }
+        let reserved = (RuntimeInstall.payload + RuntimeInstall.payloadFolders)
+            .filter { $0.hasPrefix("Resources/") }
+            .map { ($0 as NSString).lastPathComponent.lowercased() }
+        return reserved.contains(name.lowercased()) ? nil : name
+    }
+
+    /// The app's own path for the runtime the stub resolved, or nil: no usable
+    /// name, or a runtime outside the staged tree (a MACAPK_RUNTIME_ROOT run is
+    /// the caller's tree, which may even be Mac.apk.app's signed Contents/;
+    /// nothing is written there).
+    public static func path(label: String, runtime: URL) -> URL? {
+        guard let name = fileName(label: label) else { return nil }
+        let staged = RuntimeInstall.stagedRoot.appendingPathComponent("Resources/macapk-runtime")
+        guard realPath(runtime.path) == realPath(staged.path) else { return nil }
+        return runtime.deletingLastPathComponent().appendingPathComponent(name)
+    }
+
+    /// Where the exec link of a NEWLY GENERATED bundle points: the app's own
+    /// path (whatever the switch says; the stub makes it a copy or a symlink),
+    /// else the shared runtime.
+    public static func linkTarget(label: String, sharedRuntime: URL) -> URL {
+        path(label: label, runtime: sharedRuntime) ?? sharedRuntime
+    }
+
+    /// Make `dest` (from `path`) a copy of `runtime` (`named`) or a symlink to
+    /// it, and say whether it is now usable. Never touches anything at `dest`
+    /// that is not a copy or link it made. Safe while the app runs: the new
+    /// entry is made beside `dest` and renamed over it, and a running process
+    /// keeps the file it started from.
+    public static func prepare(_ dest: URL, runtime: URL, named: Bool,
+                               log: ((String) -> Void)? = nil) -> Bool {
+        let source = runtime.lastPathComponent   // the link's target: a sibling
+        var have = stat(), want = stat()
+        guard lstat(runtime.path, &want) == 0, (want.st_mode & S_IFMT) == S_IFREG else {
+            log?("named process: \(runtime.path) is not a plain file; using it directly")
+            return false
+        }
+        if lstat(dest.path, &have) == 0 {
+            switch have.st_mode & S_IFMT {
+            case S_IFREG:
+                if named && have.st_size == want.st_size
+                    && abs(have.st_mtimespec.tv_sec - want.st_mtimespec.tv_sec) <= 1 {
+                    return true
+                }
+            case S_IFLNK:
+                let target = (try? FileManager.default.destinationOfSymbolicLink(atPath: dest.path))
+                guard target == source else {
+                    log?("named process: \(dest.path) is a link that is not ours; "
+                         + "using the shared runtime")
+                    return false
+                }
+                if !named { return true }
+            default:
+                log?("named process: \(dest.path) is taken by the runtime; "
+                     + "using the shared runtime")
+                return false
+            }
+        }
+        let tmp = dest.deletingLastPathComponent()
+            .appendingPathComponent(".named-\(getpid())-\(UInt32.random(in: 0...UInt32.max))")
+        if named {
+            // COPYFILE_ALL keeps the mode and the times, so the size + time
+            // test above holds for a fresh copy; COPYFILE_CLONE makes it an
+            // APFS clone where the volume allows, else a plain copy.
+            guard copyfile(runtime.path, tmp.path, nil,
+                           copyfile_flags_t(COPYFILE_ALL | COPYFILE_CLONE)) == 0 else {
+                log?("named process: could not copy the runtime (errno \(errno)); "
+                     + "using the shared runtime")
+                unlink(tmp.path)
+                return false
+            }
+        } else if symlink(source, tmp.path) != 0 {
+            log?("named process: could not link \(dest.path) (errno \(errno))")
+            return false
+        }
+        guard rename(tmp.path, dest.path) == 0 else {
+            log?("named process: could not rename \(tmp.path) (errno \(errno))")
+            unlink(tmp.path)
+            return false
+        }
+        log?("named process: \(dest.path) is now "
+             + (named ? "a copy of" : "a link to") + " \(runtime.path)")
+        return true
+    }
+
+    /// Whether `path`, a process's resolved program file (proc_pidpath), is
+    /// the runtime: macapk-runtime itself, or an app's copy of it.
+    public static func isRuntime(path: String) -> Bool {
+        URL(fileURLWithPath: path).lastPathComponent == "macapk-runtime" || isNamedCopy(path: path)
+    }
+
+    /// Whether `path` is an app's copy: directly in the STAGED runtime's
+    /// Resources folder, under a name that is not one of the runtime's files.
+    /// The staged tree only, never an environment override: the install
+    /// helper asks this about its caller, and a caller sets the helper's
+    /// environment.
+    public static func isNamedCopy(path: String) -> Bool {
+        let url = URL(fileURLWithPath: path)
+        guard fileName(label: url.lastPathComponent) == url.lastPathComponent else { return false }
+        return realPath(url.deletingLastPathComponent().path)
+            == realPath(RuntimeInstall.stagedRoot.appendingPathComponent("Resources").path)
+    }
+
+    /// Whether the bundle at `bundlePath` execs `exe`: one of the links in its
+    /// Contents/MacOS resolves to that file. Ties a copy to its own app.
+    public static func bundle(_ bundlePath: String, execs exe: String) -> Bool {
+        let macos = URL(fileURLWithPath: bundlePath).appendingPathComponent("Contents/MacOS")
+        guard let kids = try? FileManager.default.contentsOfDirectory(atPath: macos.path)
+        else { return false }
+        let target = realPath(exe)
+        for k in kids {
+            let p = macos.appendingPathComponent(k).path
+            var st = stat()
+            guard lstat(p, &st) == 0, (st.st_mode & S_IFMT) == S_IFLNK else { continue }
+            if realPath(p) == target { return true }
+        }
+        return false
+    }
+
+    private static func realPath(_ p: String) -> String {
+        guard let r = Darwin.realpath(p, nil) else { return p }
+        defer { free(r) }
+        return String(cString: r)
     }
 }
 
@@ -7086,7 +7318,8 @@ public enum AppOpsStore {
     /// SIGKILL the app's runtime, the way killUid does -- but only a process we
     /// can positively identify: its run/<dirName>.pid (or the pre-dirName
     /// package spelling) must be LOCKED (the stub's flock is the aliveness
-    /// signal) and name a live macapk-runtime, so a recycled pid is never hit.
+    /// signal) and name a live runtime (macapk-runtime, or the app's named
+    /// copy: NamedProcess), so a recycled pid is never hit.
     static func killRunning(dirName: String, package: String) -> Bool {
         for name in [dirName, package] where !name.isEmpty {
             let path = Paths.runDir.appendingPathComponent("\(name).pid").path
@@ -7101,7 +7334,7 @@ public enum AppOpsStore {
                   pid > 1 else { continue }
             var buf = [CChar](repeating: 0, count: 4096)
             guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0,
-                  URL(fileURLWithPath: String(cString: buf)).lastPathComponent == "macapk-runtime"
+                  NamedProcess.isRuntime(path: String(cString: buf))
             else { continue }
             if kill(pid, SIGKILL) == 0 { return true }
         }

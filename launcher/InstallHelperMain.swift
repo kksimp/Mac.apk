@@ -706,7 +706,8 @@ struct InstallHelperMain {
         (android:manage_external_storage) or "Media management"
         (android:manage_media). It is run BY the Mac.apk runtime, and it takes
         no app identity from its arguments: the asking app is its PARENT
-        process, which must be a macapk-runtime whose --android-root is an
+        process, which must be the Mac.apk runtime (macapk-runtime, or that
+        app's named copy of it) whose --android-root is an
         installed app's bundle and which holds that app's run/<dirName>.pid
         lock. The question is a macOS system alert whose default button
         leaves the current state alone ("Don't Allow" while not allowed,
@@ -1038,7 +1039,10 @@ enum SpecialAccess {
 ///
 ///  1. the parent (getppid) is alive and its executable is `macapk-runtime`
 ///     (proc_pidpath resolves the stub's exec link to the real binary, the same
-///     test RuntimeInstall.runningGuests uses);
+///     test RuntimeInstall.runningGuests uses), or an app's named copy of it
+///     (NamedProcess, MACAPK_NAMED_PROCESS) -- and then only the copy the
+///     resolved app's own bundle execs (checked after step 3), so one app's
+///     copy cannot speak for another;
 ///  2. its argv (sysctl KERN_PROCARGS2) carries `--android-root <path>` -- the
 ///     per-app stub always execs the runtime with it;
 ///  3. exactly one INSTALLED registry row has a bundle whose Contents/android
@@ -1079,7 +1083,7 @@ enum CallerIdentity {
             return .failure(Refusal(message: "parent \(pid) is gone"))
         }
         let exe = String(cString: pbuf)
-        guard URL(fileURLWithPath: exe).lastPathComponent == "macapk-runtime" else {
+        guard NamedProcess.isRuntime(path: exe) else {
             return .failure(Refusal(message: "parent \(pid) (\(exe)) is not a Mac.apk runtime"))
         }
         guard let argv = procArgs(pid) else {
@@ -1105,6 +1109,11 @@ enum CallerIdentity {
             return .failure(Refusal(message: matches.isEmpty
                 ? "no installed app's bundle holds android root \(rootArg)"
                 : "android root \(rootArg) is claimed by \(matches.count) registry rows"))
+        }
+        if URL(fileURLWithPath: exe).lastPathComponent != "macapk-runtime",
+           !NamedProcess.bundle(row.bundlePath, execs: exe) {
+            return .failure(Refusal(message: "parent \(pid) runs \(exe), which is not the named "
+                                  + "runtime of \(row.label)'s bundle"))
         }
         let open = Set(openVnodePaths(pid).map(realPath))
         var held: String?

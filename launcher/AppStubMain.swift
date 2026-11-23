@@ -1199,13 +1199,51 @@ struct AppStubMain {
         // BundleGenerator pre-creates it, so the common path is a no-op.
         let have = try? FileManager.default
             .destinationOfSymbolicLink(atPath: execLink.path)
-        if have == runtime.path {
+        //    What the link points at: the shared runtime, or the app's own
+        //    path beside it (NamedProcess, InstallCore), which this launch
+        //    makes a copy of the runtime named after the app when
+        //    MACAPK_NAMED_PROCESS is on for it (its overrides are in the
+        //    environment since step 8) -- so macOS's camera and microphone
+        //    panels, which name the resolved program file, say the app's name
+        //    -- and a link to macapk-runtime when it is off. Switching therefore
+        //    changes only that path, never this sealed link. A bundle generated
+        //    since NamedProcess points here already, and its link is never
+        //    rewritten: if the path cannot be made a copy it is made a link,
+        //    and failing that this launch execs the runtime directly. An older
+        //    bundle (link at macapk-runtime) is repointed only when the app's
+        //    overrides say MACAPK_NAMED_PROCESS=1 explicitly, not by the
+        //    default -- see NamedProcess's MAKING IT PERMANENT.
+        var linkTarget = runtime
+        var direct = false   // exec the runtime itself; leave the sealed link alone
+        if let own = NamedProcess.path(label: label, runtime: runtime) {
+            let env = ProcessInfo.processInfo.environment
+            let named = NamedProcess.isEnabled(env)
+            if have == own.path {
+                if NamedProcess.prepare(own, runtime: runtime, named: named, log: stubLog)
+                    || (named && NamedProcess.prepare(own, runtime: runtime, named: false,
+                                                      log: stubLog)) {
+                    linkTarget = own
+                } else {
+                    direct = true
+                }
+            } else if (env[NamedProcess.flag] == "1" || have != runtime.path)
+                        && NamedProcess.prepare(own, runtime: runtime, named: named, log: stubLog) {
+                // An older bundle the user switched on explicitly, or a link
+                // that must be rewritten anyway (missing, or left by another
+                // runtime tree): point it at the app's own path.
+                linkTarget = own
+            }
+        }
+        if direct {
+            stubLog("named process: \(label)'s runtime path is unusable; exec'ing the runtime "
+                    + "directly for this launch (Dock will show its own name)")
+        } else if have == linkTarget.path {
             execPath = execLink.path
         } else {
             unlink(execLink.path)
-            if symlink(runtime.path, execLink.path) == 0 {
+            if symlink(linkTarget.path, execLink.path) == 0 {
                 execPath = execLink.path
-                stubLog("exec link repointed -> \(runtime.path) (was \(have ?? "absent")); "
+                stubLog("exec link repointed -> \(linkTarget.path) (was \(have ?? "absent")); "
                         + "the bundle seal is now stale until the next install")
             } else {
                 stubLog("WARN: could not create \(execLink.path) (errno \(errno)); "
@@ -1232,6 +1270,17 @@ struct AppStubMain {
             nil,
         ]
         execv(execPath, &argv)
+        // The app's own path can vanish between here and above: a runtime
+        // install replaces the whole staged tree, copies included. The shared
+        // runtime is in every tree, so start that rather than fail the launch.
+        let firstErrno = errno
+        if execPath != runtime.path {
+            stubLog("exec \(execPath) failed (errno \(firstErrno)); exec \(runtime.path)")
+            argv[0] = strdup(runtime.path)
+            execv(runtime.path, &argv)
+            stubLog("exec \(runtime.path) failed too (errno \(errno))")
+        }
+        errno = firstErrno
         let err = String(cString: strerror(errno))
         fatalAlert("Could not start \(label)",
                    "exec of \(execPath) failed: \(err) (errno \(errno)). "

@@ -57,12 +57,18 @@ void CocoaRestoreUserOrientation();
 // at MacapkPanelHz -- this is the SINGLE source of the rate for the present cadence, the guest
 // drive cadence, and android.view.Display.getRefreshRate(); they must not diverge (v1.0.568).
 float CocoaBackingScale();   // real window backing scale; input mapping used a hardcoded 2.0f
-// The process's display density (v1.0.2187): the launch screen's backing scale in
-// dpi -- 320 on Retina, 160 on a 1x monitor -- or MACAPK_DISPLAY_DENSITY. Decided
-// once, on first call (main.cpp makes that call on the main thread before the
-// JVM starts); every later call returns the same value. See cocoa_bridge.mm.
+// The process's display density (v1.0.2187): the backing scale of the screen the
+// window opens on, in dpi -- 320 on Retina, 160 on a 1x monitor -- or
+// MACAPK_DISPLAY_DENSITY. Decided once: by the authoritative window decision
+// (CocoaSettleDisplayDensity), else on first call; every later call returns the
+// same value. See cocoa_bridge.mm.
 int   CocoaDisplayDensityDpi();
 float CocoaDisplayDensity();     // CocoaDisplayDensityDpi() / 160
+// Decide the density from the screen the AUTHORITATIVE window decision measured
+// (its backing scale), unless it is already decided or pinned. main.cpp calls
+// it from SizeWindowByPolicy, so the density is the window's screen's, not the
+// menu-bar screen's the early decision saw.
+void  CocoaSettleDisplayDensity(float backing_scale);
 // Harness only: post a real left-mouse NSEvent into our own queue at a fraction of the
 // window content (top-left origin); 0 down, 1 up, 2 dragged. See cocoa_bridge.mm.
 bool CocoaPostHostMouse(int action, float fx, float fy);

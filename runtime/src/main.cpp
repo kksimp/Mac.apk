@@ -1845,6 +1845,13 @@ static bool SizeWindowByPolicy(const std::string& apk, const std::string& cli_ro
         g_window_policy.decision.reason = !traits.ok ? "manifest unreadable" : budget_desc;
         return false;
     }
+    // The authoritative decision settles the process's density from the
+    // screen it measured (CocoaSettleDisplayDensity): the early one ran before
+    // the window existed and may have measured another screen.
+    if (std::strcmp(phase, "authoritative") == 0) {
+        CocoaSettleDisplayDensity(budget.backing_scale);
+        budget.density = CocoaDisplayDensity();
+    }
     std::string warnings;
     const winpolicy::DeviceSettings settings = winpolicy::SettingsFromEnv(&warnings);
     if (!warnings.empty())
@@ -3558,8 +3565,8 @@ int main(int argc, char** argv) {
     // on: the input recorder's header (InputRecorder), so a replay on another
     // build says so instead of silently diverging.
     jvm_cfg.extra_options.push_back(std::string("-Dmacapk.runtime.version=") + MACAPK_VERSION_STR);
-    // v1.0.2187: the display density, decided once from the launch screen (320 on
-    // Retina, 160 on a 1x monitor; CocoaDisplayDensityDpi). SystemProperties
+    // v1.0.2187: the display density, decided once from the screen the window
+    // opens on (320 on Retina, 160 on a 1x monitor; CocoaDisplayDensityDpi). SystemProperties
     // answers ro.sf.lcd_density with it, which is where DisplayMetrics'
     // DENSITY_DEVICE / DENSITY_DEVICE_STABLE and every default metrics come from.
     jvm_cfg.extra_options.push_back(std::string("-Dmacapk.display.density=")

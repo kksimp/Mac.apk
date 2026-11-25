@@ -4964,40 +4964,81 @@ int CocoaPhoneHeight() { SFTRACE("CocoaPhoneHeight -> %d", g_phone_h); return g_
 // surface's pixels, not the density (docs/display-density-follows-screen_2026-10-15.md).
 //
 // MACAPK_DISPLAY_DENSITY=<dpi> pins it; 320 is the pre-v1.0.2187 fixed model.
-int CocoaDisplayDensityDpi() {
-    static int s_dpi = 0;
+//
+// WHICH screen. "The screen the app opens on" is the screen its WINDOW opens
+// on, and at the early window decision there is no window yet: mainScreen is
+// then the menu-bar screen, while the window can open on another one (AppKit
+// restores it where it was last). With a 1x monitor as the main display and a
+// Retina laptop panel the window came up on the panel with density 1: the
+// authoritative decision measured the panel (1710x960pt @2x) and the app was
+// told 3420x1920dp, so every view and every text was drawn at half size. So the
+// density is SETTLED by the authoritative decision, from the very screen it
+// measures (CocoaSettleDisplayDensity, main.cpp SizeWindowByPolicy); a decision
+// made before that reads the density of the screen it measures without
+// deciding anything (CocoaPolicyDisplayBudget). A run that never makes the
+// authoritative decision settles it on first call, from the window's screen
+// when there is a window, else mainScreen, as before. Still decided once.
+static std::atomic<int> g_density_dpi{0};
+
+static int pinned_density_dpi() {
+    static int s_pin = 0;
     static dispatch_once_t s_once;
     dispatch_once(&s_once, ^{
-        const char* why = "screen";
-        float scale = 0.0f;
         if (const char* e = std::getenv("MACAPK_DISPLAY_DENSITY"); e && *e) {
             char* end = nullptr;
             const long v = std::strtol(e, &end, 10);
             if (end && *end == '\0' && v >= 120 && v <= 640) {
-                s_dpi = (int) v;
-                why = "MACAPK_DISPLAY_DENSITY";
+                s_pin = (int) v;
             } else {
                 std::fprintf(stderr, "[macapk] MACAPK_DISPLAY_DENSITY=%s not understood "
                              "(a dpi, 120..640); following the screen\n", e);
             }
         }
-        if (s_dpi == 0) {
-            @autoreleasepool {
-                NSScreen* screen = [NSScreen mainScreen];
-                scale = screen ? (float) screen.backingScaleFactor : 0.0f;
-            }
-            if (scale >= 0.5f && scale <= 8.0f) {
-                s_dpi = (int) std::lround(160.0f * scale);
-            } else {
-                s_dpi = 320;
-                why = "no screen";
-            }
-        }
-        std::fprintf(stderr, "[macapk] display density: %d dpi (density %g) from %s"
-                     " (screen backing scale %g)\n",
-                     s_dpi, s_dpi / 160.0, why, (double) scale);
     });
-    return s_dpi;
+    return s_pin;
+}
+
+static int dpi_for_backing_scale(float scale) {
+    return (scale >= 0.5f && scale <= 8.0f) ? (int) std::lround(160.0f * scale) : 0;
+}
+
+// Decide the density once: the pin, else `scale` (0 = no screen). Returns the
+// decided value, which is the first caller's if another one got there first.
+static int settle_density_dpi(float scale, const char* from) {
+    if (const int v = g_density_dpi.load(); v) return v;
+    int dpi = pinned_density_dpi();
+    const char* why = "MACAPK_DISPLAY_DENSITY";
+    if (dpi == 0) {
+        dpi = dpi_for_backing_scale(scale);
+        why = from;
+    }
+    if (dpi == 0) {
+        dpi = 320;
+        why = "no screen";
+    }
+    int expect = 0;
+    if (!g_density_dpi.compare_exchange_strong(expect, dpi)) return expect;
+    std::fprintf(stderr, "[macapk] display density: %d dpi (density %g) from %s"
+                 " (screen backing scale %g)\n",
+                 dpi, dpi / 160.0, why, (double) scale);
+    return dpi;
+}
+
+void CocoaSettleDisplayDensity(float backing_scale) {
+    settle_density_dpi(backing_scale, "the window decision's screen");
+}
+
+int CocoaDisplayDensityDpi() {
+    if (const int v = g_density_dpi.load(); v) return v;
+    float scale = 0.0f;
+    const char* from = "screen";
+    @autoreleasepool {
+        NSScreen* screen = g_placeholder_window ? [g_placeholder_window screen] : nil;
+        if (screen) from = "the window's screen";
+        else screen = [NSScreen mainScreen];
+        scale = screen ? (float) screen.backingScaleFactor : 0.0f;
+    }
+    return settle_density_dpi(scale, from);
 }
 float CocoaDisplayDensity() { return (float) CocoaDisplayDensityDpi() / 160.0f; }
 
@@ -5044,7 +5085,11 @@ bool CocoaPolicyDisplayBudget(winpolicy::DisplayBudget* out, std::string* desc) 
     out->width_px = (int)std::lround(w_pt * scale);
     out->height_px = (int)std::lround(h_pt * scale);
     out->backing_scale = scale;
-    out->density = CocoaDisplayDensity();      // the launch screen's (v1.0.2187)
+    // Before the density is decided (CocoaSettleDisplayDensity), the density
+    // of the screen measured here, so box and density describe one screen.
+    if (const int dpi = g_density_dpi.load(); dpi) out->density = dpi / 160.0f;
+    else if (const int pin = pinned_density_dpi(); pin) out->density = pin / 160.0f;
+    else out->density = scale;
     out->display_sw_dp = sw_dp;
     if (desc) *desc = buf;
     return true;

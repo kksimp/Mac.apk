@@ -6327,6 +6327,119 @@ struct AppDetailSheet: View {
                 }
             ))
             .help("Presents this app with an Android TV instead of a phone: UI mode television plus the Leanback and television device features. For apps that ship a TV (Leanback) interface alongside the phone one.")
+            launchSizeRows
+        }
+    }
+
+    // MARK: Window size at launch (issue #133)
+    //
+    // Saved as MACAPK_WINDOW_SIZE=<W>x<H> in the app's environment overrides,
+    // like the TV toggle, so the stub applies it on a Dock or Finder launch
+    // too. The runtime decides the window on a display of that size
+    // (cocoa_bridge.mm CocoaLaunchSize): a resizable app opens at exactly that
+    // size, a fixed-orientation one gets its usual box inside it.
+
+    private static let launchSizeKey = "MACAPK_WINDOW_SIZE"
+    private static let launchSizePresets: [(value: String, label: String)] = [
+        ("1280x720", "1280 × 720"),
+        ("1280x800", "1280 × 800"),
+        ("1024x768", "1024 × 768"),
+        ("800x1280", "800 × 1280 (portrait tablet)"),
+        ("412x915", "412 × 915 (phone)"),
+    ]
+    private static let launchSizeCustomTag = "custom"
+
+    /// Set when the user picks "Custom…", so a custom value that happens to
+    /// equal a preset keeps its fields on screen.
+    @State private var launchSizeCustom = false
+
+    private var launchSizeValue: String? {
+        library.current(app).env[Self.launchSizeKey]
+    }
+
+    private func setLaunchSize(_ value: String?) {
+        var env = library.current(app).env
+        if let value { env[Self.launchSizeKey] = value } else { env.removeValue(forKey: Self.launchSizeKey) }
+        library.setEnv(env, for: library.current(app))
+    }
+
+    /// (width, height) of the saved value, nil when unset or not WxH.
+    private var launchSizeParts: (Int, Int)? {
+        guard let v = launchSizeValue else { return nil }
+        let p = v.lowercased().split(separator: "x")
+        guard p.count == 2, let w = Int(p[0]), let h = Int(p[1]), w > 0, h > 0 else { return nil }
+        return (w, h)
+    }
+
+    private var launchSizeChoice: Binding<String> {
+        Binding(
+            get: {
+                guard let v = launchSizeValue else { return "" }
+                if !launchSizeCustom, Self.launchSizePresets.contains(where: { $0.value == v }) {
+                    return v
+                }
+                return Self.launchSizeCustomTag
+            },
+            set: { choice in
+                switch choice {
+                case "":
+                    launchSizeCustom = false
+                    setLaunchSize(nil)
+                case Self.launchSizeCustomTag:
+                    launchSizeCustom = true
+                    if launchSizeParts == nil { setLaunchSize("1280x720") }
+                default:
+                    launchSizeCustom = false
+                    setLaunchSize(choice)
+                }
+            })
+    }
+
+    private func launchSizeSide(_ index: Int) -> Binding<Int> {
+        Binding(
+            get: {
+                let parts = launchSizeParts ?? (1280, 720)
+                return index == 0 ? parts.0 : parts.1
+            },
+            set: { side in
+                var parts = launchSizeParts ?? (1280, 720)
+                let clamped = max(1, side)
+                if index == 0 { parts.0 = clamped } else { parts.1 = clamped }
+                setLaunchSize("\(parts.0)x\(parts.1)")
+            })
+    }
+
+    @ViewBuilder
+    private var launchSizeRows: some View {
+        Picker("Window size at launch", selection: launchSizeChoice) {
+            Text("Automatic").tag("")
+            ForEach(Self.launchSizePresets, id: \.value) { p in
+                Text(p.label).tag(p.value)
+            }
+            Text("Custom…").tag(Self.launchSizeCustomTag)
+        }
+        .help("The size this app's window opens at, in points: the units macOS "
+            + "uses for window sizes, which the app sees as dp. Automatic lets "
+            + "Mac.apk decide, as Android would on a tablet the size of this screen.")
+        if launchSizeChoice.wrappedValue == Self.launchSizeCustomTag {
+            HStack {
+                TextField("Width", value: launchSizeSide(0), format: .number)
+                    .multilineTextAlignment(.trailing)
+                Text("×")
+                TextField("Height", value: launchSizeSide(1), format: .number)
+                    .multilineTextAlignment(.trailing)
+                Text("pt").foregroundColor(.secondary)
+            }
+        }
+        if launchSizeValue != nil {
+            Text("Used from the next launch. A size bigger than the screen is shrunk "
+                + "to fit, keeping its shape, and the window can still be resized. "
+                + "A size under 600 on its short side opens as a phone, turned to "
+                + "the app's orientation; an app locked to one orientation gets its "
+                + "usual box inside the size.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

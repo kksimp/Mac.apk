@@ -954,6 +954,28 @@ bool ParseBudgetOverride(const std::string& value, int* w_pt, int* h_pt, int* sw
     return true;
 }
 
+bool ParseLaunchSize(const std::string& value, int* w_pt, int* h_pt) {
+    int w = 0, h = 0, sw = 0;
+    // The budget grammar without the diagnostic "~sw" pin.
+    if (!ParseBudgetOverride(value, &w, &h, &sw) || sw != 0) return false;
+    *w_pt = w; *h_pt = h;
+    return true;
+}
+
+void FitLaunchSize(int want_w, int want_h, int screen_w, int screen_h, int* w_pt, int* h_pt) {
+    double w = want_w, h = want_h;
+    if (screen_w > 0 && screen_h > 0 && (w > screen_w || h > screen_h)) {
+        const double k = std::min(screen_w / w, screen_h / h);
+        w = std::floor(w * k);
+        h = std::floor(h * k);
+    }
+    int fw = std::max(static_cast<int>(w), kMinLaunchSidePt);
+    int fh = std::max(static_cast<int>(h), kMinLaunchSidePt);
+    if (screen_w > 0) fw = std::min(fw, screen_w);
+    if (screen_h > 0) fh = std::min(fh, screen_h);
+    *w_pt = fw; *h_pt = fh;
+}
+
 std::string FormatSettings(const DeviceSettings& s) {
     char buf[384];
     char fo[32], ur[32];

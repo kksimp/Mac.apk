@@ -1827,6 +1827,24 @@ static winpolicy::WindowTraits LoadWindowTraits(const std::string& apk,
     return t;
 }
 
+// The legacy rule's answer to a per-app launch size (MACAPK_WINDOW_SIZE, issue
+// #133): no policy, or a size whose short side is under sw600dp, where Android
+// ROTATES the display for the app (see Resolve). So the window keeps the two
+// sides asked for and turns its long side to the app's orientation: 915x412
+// opens 412x915 for a portrait app. False when no launch size is set.
+static bool SetLegacyLaunchSize(bool landscape, const char* phase) {
+    int w = 0, h = 0, want_w = 0, want_h = 0;
+    if (!CocoaLaunchSize(&w, &h, &want_w, &want_h)) return false;
+    const int long_side = std::max(w, h), short_side = std::min(w, h);
+    const int win_w = landscape ? long_side : short_side;
+    const int win_h = landscape ? short_side : long_side;
+    CocoaSetPhoneSize(win_w, win_h);
+    std::fprintf(stderr, "[macapk] window size at launch (%s, legacy rule): %dx%d pt "
+                 "(MACAPK_WINDOW_SIZE=%dx%d, %s)\n", phase, win_w, win_h, want_w, want_h,
+                 landscape ? "landscape" : "portrait");
+    return true;
+}
+
 // Decide the window for `apk` on the main screen and, when the policy applies,
 // install it (session + boxes). Returns false when the caller must use the
 // legacy rule: no launcher, no screen, or a display that is not large (a 1x
@@ -2693,7 +2711,8 @@ int main(int argc, char** argv) {
                 early = (hint == Orient::AUTO) ? Orient::PORTRAIT : hint;
             }
             if (cli.width > 0 && cli.height > 0) CocoaSetPhoneSize(cli.width, cli.height);
-            else                                 CocoaSetPhoneSizeMax(early == Orient::LANDSCAPE);
+            else if (!SetLegacyLaunchSize(early == Orient::LANDSCAPE, "early"))
+                CocoaSetPhoneSizeMax(early == Orient::LANDSCAPE);
         }
         CocoaInit();
         BootClock("placeholder window shown (T0)");
@@ -3393,7 +3412,10 @@ int main(int argc, char** argv) {
         // -- it must live HERE, after the manifest read above, so that
         // --orientation auto still honors a landscape manifest (an
         // explicit size from the launcher would pin the shape).
-        CocoaSetPhoneSizeMax(resolved == Orient::LANDSCAPE);
+        // A per-app launch size (MACAPK_WINDOW_SIZE) replaces the biggest
+        // canvas, turned the same way.
+        if (!SetLegacyLaunchSize(resolved == Orient::LANDSCAPE, "authoritative"))
+            CocoaSetPhoneSizeMax(resolved == Orient::LANDSCAPE);
     }
     // Window-first boot (see "0c. WINDOW FIRST" above) already opened a window
     // from a best-effort orientation read of the APK zip. THIS block is the

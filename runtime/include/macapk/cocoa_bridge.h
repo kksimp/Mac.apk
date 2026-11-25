@@ -84,9 +84,18 @@ CocoaContentBudget CocoaQueryContentBudget();
 // pixels at the process's display density (CocoaDisplayDensity), or, when
 // MACAPK_WINDOW_BUDGET=<W>x<H>[~<swDp>] is set, that many POINTS at the
 // screen's scale (the tablet A/B uses it to sit on the emulator's 1680x818dp,
-// sw850 app area). `desc` says which, for the log. False when there is no
+// sw850 app area). Under no override, MACAPK_WINDOW_SIZE
+// (below) replaces the screen's budget the same way. `desc` says which, for the log. False when there is no
 // screen (or the override does not parse -- then desc says so).
 bool CocoaPolicyDisplayBudget(winpolicy::DisplayBudget* out, std::string* desc);
+// MACAPK_WINDOW_SIZE=<W>x<H> (points; the launcher's per-app "Window size at
+// launch", issue #133), fitted into the content budget above
+// (winpolicy::FitLaunchSize). CocoaPolicyDisplayBudget decides on it in place
+// of the screen; main.cpp's legacy rule (no policy, or a size under sw600dp,
+// where Android would rotate the display) opens the window at it, its long
+// side turned to the app's orientation. `want_*` get the size as written.
+// False when unset or not WxH (logged once). Main thread, before CocoaInit too.
+bool CocoaLaunchSize(int* w_pt, int* h_pt, int* want_w = nullptr, int* want_h = nullptr);
 // Install the policy SESSION: the launcher's traits, the device settings and
 // the per-app Cmd+R preference file. While a session is active, Cmd+R toggles
 // that preference (and persists it unless `persist_pref` is false, i.e. the

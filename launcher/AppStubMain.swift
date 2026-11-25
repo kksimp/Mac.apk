@@ -999,12 +999,17 @@ struct AppStubMain {
         // The app's saved environment overrides (the info sheet's "Environment
         // overrides" and its toggles such as "Run in Android TV mode") apply to
         // THIS app on every launch path. They used to reach it only from the
-        // launcher window, so a Dock or Finder launch ignored them.
-        if let dirName,
-           let reg = try? RegistryStore.shared.loadReadOnly(),
-           let row = reg.apps.first(where: { $0.dirName == dirName }) {
-            for (k, v) in row.env {
+        // launcher window, so a Dock or Finder launch ignored them. The
+        // registry-wide window shape (Settings > Windows) goes first, so an
+        // app's own override wins over it.
+        if let reg = try? RegistryStore.shared.loadReadOnly() {
+            for (k, v) in OrientedAppsShape.environment(in: reg.settings) {
                 setenv(k, v, 1)
+            }
+            if let dirName, let row = reg.apps.first(where: { $0.dirName == dirName }) {
+                for (k, v) in row.env {
+                    setenv(k, v, 1)
+                }
             }
         }
         //

@@ -503,6 +503,17 @@ final class LaunchModel: ObservableObject {
         }
     }
 
+    /// Settings > Windows: single-orientation apps open like a phone
+    /// (OrientedAppsShape). In the registry so the stub sees it on a Dock
+    /// launch, like bundleNameShowsVersion above.
+    @Published var orientedAppsAsPhone: Bool =
+        RegistryStore.shared.setting(OrientedAppsShape.settingKey) == "1" {
+        didSet {
+            try? RegistryStore.shared.setSetting(
+                OrientedAppsShape.settingKey, orientedAppsAsPhone ? "1" : nil)
+        }
+    }
+
     /// The selected app's own .app bundle, when it has one.
     ///
     /// ⚠ LOAD-BEARING. A bundle-installed app keeps ALL its data inside its
@@ -2765,6 +2776,22 @@ struct LauncherView: View {
                 // re-render), orientation comes from the app's manifest, and
                 // View > Rotate (Cmd+R) turns a window, so neither is a user
                 // setting.
+                // Issue #133. Off = Android 16 on a tablet (the default the
+                // window policy ports); on = a phone (OrientedAppsShape).
+                Section("Windows") {
+                    Toggle("Open single-orientation apps like a phone",
+                           isOn: $model.orientedAppsAsPhone)
+                    Text("For apps made to be used one way up, such as a reading app "
+                       + "that only works upright: the window opens in the app's own "
+                       + "orientation with a phone's shape, instead of the wide window "
+                       + "Android 16 gives them on a tablet. Apps that work either way "
+                       + "up still open wide. Takes effect the next time each app "
+                       + "opens. Each app's Get Info sheet can also set the size its "
+                       + "window opens at.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 Section("File types") {
                     HStack(alignment: .firstTextBaseline) {
                         VStack(alignment: .leading, spacing: 3) {
@@ -4485,6 +4512,9 @@ struct LauncherView: View {
         // what the runtime actually sees. Global first, per-app over it:
         // the more specific setting wins, which is the only ordering that
         // makes a per-app override meaningful.
+        if model.orientedAppsAsPhone {
+            for (k, v) in OrientedAppsShape.phoneEnvironment { env[k] = v }
+        }
         for (k, v) in model.defaultEnv { env[k] = v }
         if let app = library.apps.first(where: { $0.id == model.selectedAppId }) {
             for (k, v) in app.env { env[k] = v }
@@ -4692,6 +4722,9 @@ struct LauncherView: View {
                 env["MACAPK_TRACE_BL"] = "1"
                 env["MACAPK_TRACE_JNI_HANDLES"] = "1"
             }
+        }
+        if model.orientedAppsAsPhone {
+            for (k, v) in OrientedAppsShape.phoneEnvironment { env[k] = v }
         }
         for (k, v) in model.defaultEnv { env[k] = v }
         if let app {
@@ -6511,7 +6544,9 @@ struct AppDetailSheet: View {
     private func copyLaunchCommand() {
         guard let runtime = model.runtimePath() else { return }
         var parts: [String] = []
-        let env = model.defaultEnv.merging(current.env) { _, perApp in perApp }
+        let shape = model.orientedAppsAsPhone ? OrientedAppsShape.phoneEnvironment : [:]
+        let env = shape.merging(model.defaultEnv) { _, global in global }
+            .merging(current.env) { _, perApp in perApp }
         for k in env.keys.sorted() {
             parts.append("\(k)=\(Self.shellQuote(env[k] ?? ""))")
         }

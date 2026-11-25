@@ -133,6 +133,20 @@ That pulls about 25 GB and takes 30 to 60 minutes the first time.
 identity and notary settings from an untracked `scripts/.release.env` (start from
 `scripts/.release.env.example`). Never commit that file.
 
+## Named process
+
+`MACAPK_NAMED_PROCESS=1` in an app's environment overrides makes macOS's camera and
+microphone panels in Control Center show the app's own name instead of `macapk-runtime`.
+Those panels name the program file a process runs, so the app's launcher runs a copy of
+the runtime named after the app (an APFS clone, so it takes almost no space), beside
+`macapk-runtime` in the staged runtime; with the switch off, that path is a link to
+`macapk-runtime`. Known issue: the icon there stays generic. Test apps showed the same
+generic icon with a custom file icon, inside a signed and registered `.app`, and even as an
+ordinary ad-hoc-signed app opened directly, so it is not fixable from the launcher. For an app installed before this change,
+the first launch with the switch on rewrites a link inside its signed bundle; reinstalling
+or updating the app avoids that. See `NamedProcess` in `launcher/InstallCore.swift`, which
+also says how to make it the default for every app.
+
 ## What's not in this repository
 
 - **Private test tools and the app corpus.** The project's full regression gates

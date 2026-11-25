@@ -398,8 +398,14 @@ enum BundleGenerator {
         // resolves by the time anything execs it.
         let linkName = "." + raw.replacingOccurrences(of: "/", with: "-")
         let execLink = macos.appendingPathComponent(linkName)
-        let linkTarget = RuntimeInstall.stagedRoot
-            .appendingPathComponent("Resources/macapk-runtime").path
+        // The app's own path beside macapk-runtime (NamedProcess, InstallCore),
+        // which the stub makes a copy of the runtime or a link to it at each
+        // launch, so switching MACAPK_NAMED_PROCESS never touches this sealed
+        // link; the shared runtime itself for a label with no usable name.
+        let linkTarget = NamedProcess.linkTarget(
+            label: raw,
+            sharedRuntime: RuntimeInstall.stagedRoot
+                .appendingPathComponent("Resources/macapk-runtime")).path
         try? fm.removeItem(at: execLink)
         if symlink(linkTarget, execLink.path) != 0 {
             InstallLog.write("[sign] could not pre-create \(execLink.path) "

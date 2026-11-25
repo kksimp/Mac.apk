@@ -344,6 +344,7 @@ static NSRect render_frame_in_container(NSSize cs, bool* bars);
 // Install the runtime window's menu bar (app menu + a View menu whose Rotate item
 // shows its Cmd+R shortcut). Forward-declared here for CocoaInit; defined below.
 static void install_menu_bar(NSString* appTitle);
+static NSScreen* launch_screen();   // MACAPK_LAUNCH_SCREEN, else mainScreen (see its definition)
 
 // Install a native "back" chevron in the window's title bar (leading edge, after
 // the traffic lights -- like Safari / Finder), routed to the same KEYCODE_BACK ->
@@ -3807,49 +3808,56 @@ void CocoaDebugQuitGesture(const char* kind) {
 // The bundle is derived from argv[0]: the stub execs the runtime through a link
 // inside <App>.app/Contents/MacOS/ precisely so that path identifies the app.
 // A bare (harness) run has no bundle; it re-executes its own argv instead.
-void CocoaExitProcess(int code, const char* relaunch_intents_file) {
-    if (relaunch_intents_file && relaunch_intents_file[0]) {
-        std::string argv0;
-        char*** argvp = _NSGetArgv();
-        int* argcp = _NSGetArgc();
-        int argc = argcp ? *argcp : 0;
-        char** argv = argvp ? *argvp : nullptr;
-        if (argv && argc > 0 && argv[0]) argv0 = argv[0];
-        std::string script;
-        std::string wait = "while /bin/kill -0 " + std::to_string((int) getpid())
-                         + " 2>/dev/null; do /bin/sleep 0.1; done; ";
-        auto shq = [](const std::string& in) {           // single-quote for sh
-            std::string o = "'";
-            for (char c : in) { if (c == '\'') o += "'\\''"; else o += c; }
-            return o + "'";
-        };
-        std::string env = "MACAPK_RESTART_INTENTS=" + std::string(relaunch_intents_file);
-        size_t k = argv0.find("/Contents/MacOS/");
-        if (k != std::string::npos) {
-            std::string bundle = argv0.substr(0, k);
-            script = wait + "exec /usr/bin/open -n -a " + shq(bundle) + " --env " + shq(env);
-        } else if (argv && argc > 0) {
-            script = wait + "export " + shq(env) + "; exec";
-            for (int i = 0; i < argc; i++) script += " " + shq(argv[i] ? argv[i] : "");
-        }
-        if (!script.empty()) {
-            std::fprintf(stderr, "[macapk] exit(%d): relaunching after this process ends: %s\n",
-                         code, script.c_str());
-            const char* sh_argv[] = { "/bin/sh", "-c", script.c_str(), nullptr };
-            posix_spawnattr_t attr;
-            posix_spawnattr_init(&attr);
-            // Our own session, so the helper is not torn down with our process
-            // group and does not inherit the app's foreground/Dock identity.
-            posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
-            pid_t child = 0;
-            int rc = posix_spawn(&child, "/bin/sh", nullptr, &attr,
-                                 const_cast<char* const*>(sh_argv), *_NSGetEnviron());
-            posix_spawnattr_destroy(&attr);
-            if (rc != 0) std::fprintf(stderr, "[macapk] relaunch helper spawn failed: %d\n", rc);
-        } else {
-            std::fprintf(stderr, "[macapk] exit(%d): no argv to relaunch from; exiting only\n", code);
-        }
+// Spawn the detached helper that reopens this app, with `envs` (NAME=value)
+// in its environment, once this process has ended. Does not exit.
+static void spawn_relaunch_helper(const std::vector<std::string>& envs, int code) {
+    std::string argv0;
+    char*** argvp = _NSGetArgv();
+    int* argcp = _NSGetArgc();
+    int argc = argcp ? *argcp : 0;
+    char** argv = argvp ? *argvp : nullptr;
+    if (argv && argc > 0 && argv[0]) argv0 = argv[0];
+    std::string script;
+    std::string wait = "while /bin/kill -0 " + std::to_string((int) getpid())
+                     + " 2>/dev/null; do /bin/sleep 0.1; done; ";
+    auto shq = [](const std::string& in) {           // single-quote for sh
+        std::string o = "'";
+        for (char c : in) { if (c == '\'') o += "'\\''"; else o += c; }
+        return o + "'";
+    };
+    size_t k = argv0.find("/Contents/MacOS/");
+    if (k != std::string::npos) {
+        std::string bundle = argv0.substr(0, k);
+        script = wait + "exec /usr/bin/open -n -a " + shq(bundle);
+        for (const std::string& e : envs) script += " --env " + shq(e);
+    } else if (argv && argc > 0) {
+        script = wait;
+        for (const std::string& e : envs) script += "export " + shq(e) + "; ";
+        script += "exec";
+        for (int i = 0; i < argc; i++) script += " " + shq(argv[i] ? argv[i] : "");
     }
+    if (!script.empty()) {
+        std::fprintf(stderr, "[macapk] exit(%d): relaunching after this process ends: %s\n",
+                     code, script.c_str());
+        const char* sh_argv[] = { "/bin/sh", "-c", script.c_str(), nullptr };
+        posix_spawnattr_t attr;
+        posix_spawnattr_init(&attr);
+        // Our own session, so the helper is not torn down with our process
+        // group and does not inherit the app's foreground/Dock identity.
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+        pid_t child = 0;
+        int rc = posix_spawn(&child, "/bin/sh", nullptr, &attr,
+                             const_cast<char* const*>(sh_argv), *_NSGetEnviron());
+        posix_spawnattr_destroy(&attr);
+        if (rc != 0) std::fprintf(stderr, "[macapk] relaunch helper spawn failed: %d\n", rc);
+    } else {
+        std::fprintf(stderr, "[macapk] exit(%d): no argv to relaunch from; exiting only\n", code);
+    }
+}
+
+void CocoaExitProcess(int code, const char* relaunch_intents_file) {
+    if (relaunch_intents_file && relaunch_intents_file[0])
+        spawn_relaunch_helper({"MACAPK_RESTART_INTENTS=" + std::string(relaunch_intents_file)}, code);
     macapk_terminate_now(code);
 }
 
@@ -4099,7 +4107,7 @@ bool CocoaInit() {
         // doesn't clip the title bar / Dock area. Visible frame
         // excludes the menu bar / Dock so the resulting window fits
         // entirely on-screen.
-        NSRect screenVis = [[NSScreen mainScreen] visibleFrame];
+        NSRect screenVis = [launch_screen() visibleFrame];
         // v1.0.503: ASPECT-PRESERVING clamp (was per-dimension, which could
         // square an over-tall request). Shrink the app's w:h to fit the visible
         // frame, never enlarge (scale capped at 1.0). For the --orientation auto
@@ -4945,6 +4953,34 @@ bool CocoaPostHostMouse(int action, float fx, float fy) {
 int CocoaPhoneWidth()  { SFTRACE("CocoaPhoneWidth -> %d",  g_phone_w); return g_phone_w; }
 int CocoaPhoneHeight() { SFTRACE("CocoaPhoneHeight -> %d", g_phone_h); return g_phone_h; }
 
+// ---- the launch screen ------------------------------------------------------
+// MACAPK_LAUNCH_SCREEN=<NSScreenNumber>: the screen to open on. View > Adapt to
+// This Display relaunches the app with the screen its window is on, so the new
+// process opens there and decides its density from it (the density is decided
+// once per process; see below). Before the window exists the decisions and the
+// placeholder read this screen instead of mainScreen, which is then the
+// menu-bar screen or wherever the user is working; afterwards mainScreen is the
+// window's own screen, as before. Unset or not connected: mainScreen.
+static NSScreen* launch_screen() {
+    static NSNumber* s_wanted = nil;
+    static dispatch_once_t s_once;
+    dispatch_once(&s_once, ^{
+        if (const char* e = std::getenv("MACAPK_LAUNCH_SCREEN"); e && *e) {
+            char* end = nullptr;
+            const unsigned long v = std::strtoul(e, &end, 10);
+            if (end && *end == '\0' && v > 0) s_wanted = @(v);
+            else std::fprintf(stderr, "[macapk] MACAPK_LAUNCH_SCREEN=%s not understood "
+                              "(an NSScreenNumber); using the main screen\n", e);
+        }
+    });
+    if (s_wanted && !g_placeholder_window) {
+        for (NSScreen* scr in [NSScreen screens]) {
+            if ([scr.deviceDescription[@"NSScreenNumber"] isEqual:s_wanted]) return scr;
+        }
+    }
+    return [NSScreen mainScreen];
+}
+
 // ---- the display density (v1.0.2187) -----------------------------------------
 // Mac.apk's Android display is measured in POINTS: one dp is one point on every
 // Mac screen, so the density is the backing scale of the screen the app opens
@@ -5035,7 +5071,7 @@ int CocoaDisplayDensityDpi() {
     @autoreleasepool {
         NSScreen* screen = g_placeholder_window ? [g_placeholder_window screen] : nil;
         if (screen) from = "the window's screen";
-        else screen = [NSScreen mainScreen];
+        else screen = launch_screen();
         scale = screen ? (float) screen.backingScaleFactor : 0.0f;
     }
     return settle_density_dpi(scale, from);
@@ -5049,7 +5085,7 @@ float CocoaDisplayDensity() { return (float) CocoaDisplayDensityDpi() / 160.0f; 
 CocoaContentBudget CocoaQueryContentBudget() {
     CocoaContentBudget b;
     @autoreleasepool {
-        NSScreen* screen = [NSScreen mainScreen];
+        NSScreen* screen = launch_screen();
         if (!screen) return b;
         const NSRect vis = [screen visibleFrame];
         if (vis.size.width < 64 || vis.size.height < 64) return b;
@@ -9855,6 +9891,42 @@ static MacApkAppearanceObserver* g_appearance_observer = nil;
     std::fflush(stderr);
     macapk::macapk_terminate_now(0);
 }
+// View > Adapt to This Display. The density is decided once per process, from
+// the screen the window opens on; a window dragged to a screen of another
+// backing scale keeps it, so its views come out at half or double size there.
+// This reopens the app on the window's current screen (MACAPK_LAUNCH_SCREEN),
+// which decides the density afresh. It is a quit and a launch: the app restarts
+// as after Cmd-Q. Enabled only when the window's screen differs in scale.
+static NSScreen* macapk_window_screen() {
+    NSScreen* scr = macapk::g_placeholder_window ? [macapk::g_placeholder_window screen] : nil;
+    return scr ? scr : [NSScreen mainScreen];
+}
+static bool macapk_screen_density_differs() {
+    NSScreen* scr = macapk_window_screen();
+    if (!scr) return false;
+    const int dpi = (int) std::lround(160.0 * scr.backingScaleFactor);
+    return dpi != macapk::CocoaDisplayDensityDpi() && std::getenv("MACAPK_DISPLAY_DENSITY") == nullptr;
+}
+- (void)macapkAdaptToDisplay:(id)sender {
+    (void)sender;
+    NSScreen* scr = macapk_window_screen();
+    NSNumber* num = scr ? scr.deviceDescription[@"NSScreenNumber"] : nil;
+    if (!num) {
+        std::fprintf(stderr, "[macapk] Adapt to This Display: no screen; nothing done\n");
+        return;
+    }
+    std::fprintf(stderr, "[macapk] Adapt to This Display: density %d dpi, this screen %g x; "
+                 "reopening on screen %lu\n", macapk::CocoaDisplayDensityDpi(),
+                 (double) scr.backingScaleFactor, (unsigned long) num.unsignedLongValue);
+    std::fflush(stderr);
+    macapk::spawn_relaunch_helper(
+        {"MACAPK_LAUNCH_SCREEN=" + std::to_string(num.unsignedLongValue)}, 0);
+    macapk::macapk_terminate_now(0);
+}
+- (BOOL)validateMenuItem:(NSMenuItem*)item {
+    if ([item action] == @selector(macapkAdaptToDisplay:)) return macapk_screen_density_differs();
+    return YES;
+}
 - (void)menuNeedsUpdate:(NSMenu*)menu {
     [self macapkRefreshArrowItems:menu];
 }
@@ -10134,6 +10206,11 @@ static void install_menu_bar(NSString* appTitle) {
     [rotate setKeyEquivalentModifierMask:NSEventModifierFlagCommand];
     [rotate setTarget:nil];   // responder chain -> MacApkMetalView
     [viewMenu addItem:rotate];
+    // Reopen on the window's screen when its scale is not the density's
+    // (-[MacApkControlsTarget macapkAdaptToDisplay:]).
+    NSMenuItem* adapt = [viewMenu addItemWithTitle:@"Adapt to This Display"
+        action:@selector(macapkAdaptToDisplay:) keyEquivalent:@""];
+    [adapt setTarget:g_controls_target];
     [viewItem setSubmenu:viewMenu];
 
     // Controls menu: pick the keyboard-binding profile.

@@ -448,6 +448,13 @@ struct XlatHooks {
     // being translated. Returning false means "not in this function",
     // which turns the branch into a tail branch to a translated target.
     std::function<bool(uint32_t vaddr, Label* out)> label_for_guest;
+    // MACAPK_ARM32RC_FRAME_JUMP: true when a guest vaddr OUTSIDE this function
+    // is a target the driver can reach with a direct, frame-keeping branch
+    // (another translated extent's start or planned interior entry). A
+    // TBB/TBH case that lands there is then a direct tail branch instead of a
+    // trip through the guest-vaddr dispatcher, which would enter the target
+    // with zeroed callee-saved registers.
+    std::function<bool(uint32_t vaddr)> extern_tail_target;
 
     // Report a branch/call target that left the current function.
     // `is_bl` distinguishes an authoritative BL/BLX #imm (a function

@@ -316,16 +316,22 @@ bool BuildFormatDescriptionH264(const uint8_t* csd0, int csd0Len,
                                 CMVideoFormatDescriptionRef* outDesc) {
     auto spsNals = SplitAnnexB(csd0, csd0Len > 0 ? (size_t)csd0Len : 0);
     auto ppsNals = SplitAnnexB(csd1, csd1Len > 0 ? (size_t)csd1Len : 0);
+    spsNals.insert(spsNals.end(), ppsNals.begin(), ppsNals.end());
     std::vector<const uint8_t*> ptrs;
     std::vector<size_t> sizes;
+    bool haveSps = false, havePps = false;
     for (const auto& n : spsNals) {
         int t = H264NalType(n);
-        if (t == 7 || t == 13) { ptrs.push_back(n.ptr); sizes.push_back(n.len); }
+        // Native players may concatenate SPS and PPS into one CSD buffer.
+        // Classify every NAL by type, rather than discarding PPS from csd-0
+        // (or SPS from csd-1) based on its buffer of origin.
+        if (t == 7 || t == 8 || t == 13) {
+            ptrs.push_back(n.ptr); sizes.push_back(n.len);
+            haveSps |= t == 7;
+            havePps |= t == 8;
+        }
     }
-    for (const auto& n : ppsNals) {
-        if (H264NalType(n) == 8) { ptrs.push_back(n.ptr); sizes.push_back(n.len); }
-    }
-    if (ptrs.size() < 2) {
+    if (!haveSps || !havePps) {
         std::fprintf(stderr,
             "[video-toolbox] H264: csd-0/csd-1 did not yield SPS+PPS (found %zu "
             "usable parameter-set NALs; csd0Len=%d csd1Len=%d)\n",

@@ -3710,6 +3710,30 @@ bool XlatCore::do_table_branch(const cs_insn* in, bool is_tbh,
             } else {
                 auto ai = addr_index_.find(target);
                 if (ai == addr_index_.end() || ai->second <= idx_) {
+                    if (ai == addr_index_.end() && hooks_.extern_tail_target &&
+                        hooks_.extern_tail_target(target)) {
+                        // The case lives in ANOTHER translated extent (one
+                        // real function that discovery cut in pieces: a
+                        // bytecode interpreter's opcode switch is the usual
+                        // shape). Branch there directly; the driver keeps the
+                        // frame and every register (MACAPK_ARM32RC_FRAME_JUMP).
+                        const Label skip = sink_.new_label();
+                        if (v == 0) {
+                            sink_.cbnz(hw, skip, false);
+                        } else if (a64_encodable_add_imm(v)) {
+                            sink_.alu_imm(AluOp::SUB, cmpt, hw, v, false, false);
+                            sink_.cbnz(cmpt, skip, false);
+                        } else {
+                            materialise_u32(cmpt, v);
+                            sink_.alu_reg(AluOp::SUB, cmpt, hw, cmpt, Sh::LSL, 0,
+                                          false, false);
+                            sink_.cbnz(cmpt, skip, false);
+                        }
+                        sink_.tail_branch_direct(target);
+                        sink_.bind(skip);
+                        ++tb_.cases_labelled;
+                        continue;
+                    }
                     // Not a decoded instruction we are still going to
                     // visit, so a label here could never be bound and
                     // would make A64Buf::resolve() drop the whole

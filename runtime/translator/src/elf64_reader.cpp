@@ -106,6 +106,75 @@ std::string read_cstr(const std::vector<uint8_t>& buf, size_t off,
     return std::string(p, len);
 }
 
+// ---- PT_DYNAMIC symbol fallback (2026-11-05) -------------------------
+//
+// A shared object is allowed to ship with its section headers stripped
+// (e_shnum == 0): bionic's linker never reads them, only PT_DYNAMIC. Some
+// hardened libraries are built exactly that way (Tencent's libmmkv.so in
+// Binance, for example), and the section-only SHT_DYNSYM scan below then
+// finds zero exports. The wrapper is still emitted, but with no
+// JNI_OnLoad / Java_* trampolines -- so the JVM never calls JNI_OnLoad,
+// the library's natives are never registered, and the app dies with
+// UnsatisfiedLinkError on its first native call. The dynamic table
+// carries everything needed, so read it when SHT_DYNSYM is absent.
+constexpr int64_t DT_NULL     = 0;
+constexpr int64_t DT_HASH     = 4;
+constexpr int64_t DT_STRTAB   = 5;
+constexpr int64_t DT_SYMTAB   = 6;
+constexpr int64_t DT_STRSZ    = 10;
+constexpr int64_t DT_GNU_HASH = 0x6ffffef5;
+
+struct Elf64Dyn {
+    int64_t  d_tag;
+    uint64_t d_val;
+};
+
+// Map an ELF virtual address to a file offset through PT_LOAD. False when
+// the address is not backed by file bytes (bss, or past EOF).
+bool vaddr_to_file_off(const std::vector<Elf64Phdr>& phdrs, uint64_t vaddr,
+                       uint64_t* off) {
+    for (const auto& ph : phdrs) {
+        if (ph.p_type != PT_LOAD || vaddr < ph.p_vaddr) continue;
+        uint64_t delta = vaddr - ph.p_vaddr;
+        if (delta >= ph.p_filesz) continue;
+        *off = ph.p_offset + delta;
+        return true;
+    }
+    return false;
+}
+
+// Symbol count implied by a DT_GNU_HASH table: one past the highest chain
+// end, not nbuckets. Same walk as bionic_shim_arm32_link.cpp's lookup,
+// with Elf64_WORD = 8 bytes for the bloom filter.
+bool gnu_hash_symbol_count(const std::vector<uint8_t>& raw, uint64_t off,
+                           uint32_t* count) {
+    uint32_t nbuckets = 0, symoffset = 0, bloom_size = 0;
+    if (!read_at(raw, off, &nbuckets) || !read_at(raw, off + 4, &symoffset)
+        || !read_at(raw, off + 8, &bloom_size))
+        return false;
+    if (nbuckets == 0 || nbuckets > (1u << 20) || bloom_size > (1u << 20))
+        return false;
+    const uint64_t buckets_off = off + 16 + static_cast<uint64_t>(bloom_size) * 8;
+    const uint64_t chains_off  = buckets_off + static_cast<uint64_t>(nbuckets) * 4;
+    uint64_t max_index = symoffset;
+    for (uint32_t i = 0; i < nbuckets; ++i) {
+        uint32_t b = 0;
+        if (!read_at(raw, buckets_off + i * 4, &b)) return false;
+        if (b < symoffset) continue;
+        uint64_t j = b;
+        for (;; ++j) {
+            uint32_t c = 0;
+            if (!read_at(raw, chains_off + (j - symoffset) * 4, &c)) break;
+            if (c & 1u) break;                       // last symbol in chain
+            if (j - b > (1u << 24)) return false;    // malformed
+        }
+        if (j + 1 > max_index) max_index = j + 1;
+    }
+    if (max_index > (1u << 24)) return false;
+    *count = static_cast<uint32_t>(max_index);
+    return true;
+}
+
 }  // namespace
 
 std::span<const uint8_t> Elf64Image::code_for(const Symbol64& sym,
@@ -260,6 +329,95 @@ std::string read_elf64(const std::string& path, Elf64Image* out,
             s.bind     = bind;
             s.type     = type;
             out->symbols.push_back(std::move(s));
+        }
+    } else {
+        // No SHT_DYNSYM: section-stripped image. Recover the same symbol
+        // list from PT_DYNAMIC / DT_SYMTAB (see the constants above).
+        const Elf64Phdr* dynph = nullptr;
+        for (const auto& ph : out->phdrs)
+            if (ph.p_type == PT_DYNAMIC) { dynph = &ph; break; }
+        if (dynph) {
+            uint64_t symtab_v = 0, strtab_v = 0, strsz = 0;
+            uint64_t hash_v = 0, gnu_v = 0;
+            bool have_sym = false, have_str = false, have_hash = false, have_gnu = false;
+            const uint64_t ndyn = dynph->p_filesz / sizeof(Elf64Dyn);
+            for (uint64_t i = 0; i < ndyn; ++i) {
+                Elf64Dyn d{};
+                if (!read_at(out->raw, dynph->p_offset + i * sizeof(Elf64Dyn), &d))
+                    break;
+                if (d.d_tag == DT_NULL) break;
+                switch (d.d_tag) {
+                    case DT_SYMTAB:   symtab_v = d.d_val; have_sym  = true; break;
+                    case DT_STRTAB:   strtab_v = d.d_val; have_str  = true; break;
+                    case DT_STRSZ:    strsz    = d.d_val; break;
+                    case DT_HASH:     hash_v   = d.d_val; have_hash = true; break;
+                    case DT_GNU_HASH: gnu_v    = d.d_val; have_gnu  = true; break;
+                    default: break;
+                }
+            }
+            uint64_t symtab_off = 0, strtab_off = 0, hash_off = 0, gnu_off = 0;
+            bool ok = have_sym && have_str && strsz > 0
+                      && vaddr_to_file_off(out->phdrs, symtab_v, &symtab_off)
+                      && vaddr_to_file_off(out->phdrs, strtab_v, &strtab_off)
+                      && strtab_off <= out->raw.size()
+                      && strsz <= out->raw.size() - strtab_off;
+            uint32_t entries = 0;
+            if (ok && have_hash
+                && vaddr_to_file_off(out->phdrs, hash_v, &hash_off)) {
+                // DT_HASH: { nbucket, nchain }; nchain is the symbol count.
+                uint32_t nbucket = 0;
+                ok = read_at(out->raw, hash_off, &nbucket)
+                     && read_at(out->raw, hash_off + 4, &entries);
+            } else if (ok && have_gnu
+                       && vaddr_to_file_off(out->phdrs, gnu_v, &gnu_off)) {
+                ok = gnu_hash_symbol_count(out->raw, gnu_off, &entries);
+            } else if (ok && strtab_off > symtab_off
+                       && (strtab_off - symtab_off) % sizeof(Elf64Sym) == 0) {
+                // No hash at all: the usual layout puts .dynstr right after
+                // .dynsym. Only trust that when the gap is a whole number of
+                // symbols.
+                entries = static_cast<uint32_t>(
+                    (strtab_off - symtab_off) / sizeof(Elf64Sym));
+            } else {
+                ok = false;
+            }
+            if (ok && entries > 0 && symtab_off <= out->raw.size()
+                && static_cast<uint64_t>(entries) * sizeof(Elf64Sym)
+                       <= out->raw.size() - symtab_off) {
+                for (uint32_t i = 0; i < entries; ++i) {
+                    Elf64Sym es{};
+                    if (!read_at(out->raw,
+                                 symtab_off + static_cast<uint64_t>(i) * sizeof(Elf64Sym),
+                                 &es))
+                        break;
+                    if (es.st_name == 0 || es.st_name >= strsz) continue;
+                    uint8_t bind = es.st_info >> 4;
+                    uint8_t type = es.st_info & 0xf;
+                    std::string name = read_cstr(out->raw,
+                        static_cast<size_t>(strtab_off) + es.st_name,
+                        static_cast<size_t>(strsz) - es.st_name);
+                    if (name.empty()) continue;
+
+                    if (es.st_shndx == 0) {
+                        ImportedSymbol64 is{};
+                        is.name     = std::move(name);
+                        is.bind     = bind;
+                        is.type     = type;
+                        is.plt_addr = 0;
+                        out->imports.push_back(std::move(is));
+                        continue;
+                    }
+                    if (es.st_value == 0 && es.st_size == 0) continue;
+
+                    Symbol64 s{};
+                    s.name    = std::move(name);
+                    s.address = es.st_value;
+                    s.size    = es.st_size;
+                    s.bind    = bind;
+                    s.type    = type;
+                    out->symbols.push_back(std::move(s));
+                }
+            }
         }
     }
 

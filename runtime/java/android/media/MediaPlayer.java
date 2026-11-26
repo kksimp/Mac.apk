@@ -457,8 +457,9 @@ public class MediaPlayer implements AudioRouting, VolumeAutomation {
     public void setSyncParams(SyncParams params) {}
     public void attachAuxEffect(int effectId) {}
     public void setAuxEffectSendLevel(float level) {}
-    public int getAudioSessionId() { return 0; }
-    public void setAudioSessionId(int sessionId) {}
+    private int mAudioSessionId;
+    public int getAudioSessionId() { return mAudioSessionId; }
+    public void setAudioSessionId(int sessionId) { mAudioSessionId = sessionId; }
     public TrackInfo[] getTrackInfo() { return new TrackInfo[0]; }
     public void selectTrack(int index) {}
     public void deselectTrack(int index) {}

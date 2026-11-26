@@ -329,13 +329,16 @@ public final class ViewTextDump {
                     }
                     break;
                 }
-                // UNDEFINED_ITEM_ID (Integer.MAX_VALUE): AOSP's addChild(View)
-                // records a REAL child view that way (makeNodeId(viewId,
-                // UNDEFINED_ITEM_ID)) -- e.g. Compose's AndroidViewHolder
-                // interop children. It is not a provider node, so asking the
-                // provider for it is not an AOSP client pattern (uiautomator
-                // resolves it as a view); walk() already visits it as a view.
-                if (vid == Integer.MAX_VALUE) continue;
+                // HOST_VIEW_ID (-1): AOSP's addChild(View) records a REAL child
+                // view that way (makeNodeId(viewId, AccessibilityNodeProvider
+                // .HOST_VIEW_ID)) -- e.g. Compose's AndroidViewHolder interop
+                // children. It is not a provider node, so asking the provider
+                // for it is not an AOSP client pattern (uiautomator resolves it
+                // as a view, and createAccessibilityNodeInfo(HOST_VIEW_ID) would
+                // just return the host again); walk() already visits it as a
+                // view. UNDEFINED_ITEM_ID (Integer.MAX_VALUE) is skipped too: it
+                // is never a provider node either.
+                if (vid == -1 || vid == Integer.MAX_VALUE) continue;
                 if (!seen.add(vid)) continue;
                 AccessibilityNodeInfo c = null;
                 try { c = p.createAccessibilityNodeInfo(vid); } catch (Throwable ignored) { }

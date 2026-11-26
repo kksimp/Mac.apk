@@ -13,9 +13,10 @@
 // out as the desktop JDK's "Java/21.x".
 //
 // The VM version is ART's "2.1.0", not System.getProperty("java.vm.version"):
-// that property is still the host JDK's ("21.0.x"), and "Dalvik/21.0.x" is not
-// an agent any Android release has sent. The Build values are our own
-// android.os.Build, so the agent and Build cannot disagree.
+// Boot sets that property to the same value, but MACAPK_VM_VERSION_ART=0 leaves
+// it at the host JDK's ("21.0.x"), and "Dalvik/21.0.x" is not an agent any
+// Android release has sent. The Build values are our own android.os.Build, so
+// the agent and Build cannot disagree.
 //
 // Caveat (JDK, not AOSP): sun.net.www.protocol.http.HttpURLConnection appends
 // " Java/<version>" to a set http.agent, so its default header reads

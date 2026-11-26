@@ -1126,6 +1126,13 @@ public class Intent implements Parcelable, Cloneable {
      *  here, which is the safe half of that branch. */
     @Deprecated
     public static Intent getIntentOld(String uri) throws java.net.URISyntaxException {
+        return getIntentOld(uri, 0);
+    }
+
+    /** AOSP's private getIntentOld(String, int): the flags let parseUri's
+     *  URI_ALLOW_UNSAFE keep the grant flags from a legacy fragment. */
+    private static Intent getIntentOld(String uri, int uriFlags)
+            throws java.net.URISyntaxException {
         Intent intent;
         int i = uri.lastIndexOf('#');
         if (i >= 0) {
@@ -1177,7 +1184,9 @@ public class Intent implements Parcelable, Cloneable {
                 // | FLAG_GRANT_PERSISTABLE_URI_PERMISSION (0x40)
                 // | FLAG_GRANT_PREFIX_URI_PERMISSION (0x80) == 0xC3. Same
                 // inlining (and same reason) as parseUri above.
-                f &= ~0xC3;
+                if ((uriFlags & URI_ALLOW_UNSAFE) == 0) {
+                    f &= ~0xC3;
+                }
                 intent.flags = f;
                 i = j + 1;
             }
@@ -1547,13 +1556,10 @@ public class Intent implements Parcelable, Cloneable {
      * frameworks/base/core/java/android/content/Intent.java's
      * parseUri/parseUriInternal.
      *
-     * Scoped the same way toUri is: the "android-app://" scheme and the
-     * pre-1.0 legacy "#action(...)" fragment format (AOSP's getIntentOld)
-     * are not modeled -- neither is used by any modern app, and both are
-     * effectively extinct in the app ecosystem this audit's corpus draws
-     * from. A URI containing either degrades to a plain ACTION_VIEW intent
-     * with the whole string as data, the same fallback AOSP itself uses
-     * when it finds no "#Intent;" fragment at all.
+     * All three documented formats are parsed, including the pre-1.0
+     * "#action(...)" legacy fragment (getIntentOld). The android-app: branch
+     * is AOSP's own control flow, quirks included: the authority is only
+     * recognised when another '/' follows it.
      */
     /** AOSP Intent.getIntent: parseUri with 0 flags. Deprecated on AOSP but
      *  still linked by older SDK code and by WebView URL-handling shims. */
@@ -1565,33 +1571,42 @@ public class Intent implements Parcelable, Cloneable {
     public static Intent parseUri(String uri, int uriFlags) throws java.net.URISyntaxException {
         int i = 0;
         try {
-            if ((uriFlags & URI_INTENT_SCHEME) != 0 && !uri.startsWith("intent:")) {
-                Intent intent = new Intent(ACTION_VIEW);
-                try {
-                    intent.setData(Uri.parse(uri));
-                } catch (IllegalArgumentException e) {
-                    throw new java.net.URISyntaxException(uri, e.getMessage());
+            final boolean androidApp = uri.startsWith("android-app:");
+            if ((uriFlags & (URI_INTENT_SCHEME | URI_ANDROID_APP_SCHEME)) != 0) {
+                if (!uri.startsWith("intent:") && !androidApp) {
+                    Intent intent = new Intent(ACTION_VIEW);
+                    try {
+                        intent.setData(Uri.parse(uri));
+                    } catch (IllegalArgumentException e) {
+                        throw new java.net.URISyntaxException(uri, e.getMessage());
+                    }
+                    return intent;
                 }
-                return intent;
             }
 
             i = uri.lastIndexOf('#');
             if (i == -1) {
-                return new Intent(ACTION_VIEW, Uri.parse(uri));
-            }
-            if (!uri.startsWith("#Intent;", i)) {
-                // Legacy pre-1.0 fragment shape; not modeled (see method
-                // doc above). Degrade rather than mis-parse it.
-                return new Intent(ACTION_VIEW, Uri.parse(uri));
+                if (!androidApp) {
+                    return new Intent(ACTION_VIEW, Uri.parse(uri));
+                }
+            } else if (!uri.startsWith("#Intent;", i)) {
+                if (!androidApp) {
+                    // Legacy pre-1.0 "#action(...)" fragment, as AOSP does.
+                    return getIntentOld(uri, uriFlags);
+                }
+                i = -1;
             }
 
             Intent intent = new Intent(ACTION_VIEW);
             Intent baseIntent = intent;
             boolean inSelector = false;
+            boolean explicitAction = false;
 
             String scheme = null;
-            String data = uri.substring(0, i);
-            i += 8; // length of "#Intent;"
+            String data = i >= 0 ? uri.substring(0, i) : uri;
+            if (i >= 0) {
+                i += 8; // length of "#Intent;"
+            }
 
             while (i >= 0 && !uri.startsWith("end", i)) {
                 int eq = uri.indexOf('=', i);
@@ -1604,6 +1619,7 @@ public class Intent implements Parcelable, Cloneable {
 
                 if (uri.startsWith("action=", i)) {
                     intent.setAction(value);
+                    if (!inSelector) explicitAction = true;
                 } else if (uri.startsWith("category=", i)) {
                     intent.addCategory(value);
                 } else if (uri.startsWith("type=", i)) {
@@ -1670,7 +1686,57 @@ public class Intent implements Parcelable, Cloneable {
                 intent = baseIntent;
             }
 
-            if (data.startsWith("intent:")) {
+            if (data.startsWith("android-app:")) {
+                if (data.charAt(12) == '/' && data.charAt(13) == '/') {
+                    // Correctly formed android-app, first part is package name.
+                    // (AOSP wraps the pieces in Uri.decodeIfNeeded, which only
+                    // decodes under its encode_app_intent aconfig flag; with the
+                    // flag off it returns its argument, so we do the same.)
+                    int end = data.indexOf('/', 14);
+                    if (end < 0) {
+                        // All we have is a package name.
+                        intent.targetPackage = data.substring(14);
+                        if (!explicitAction) {
+                            intent.setAction(ACTION_MAIN);
+                        }
+                        data = "";
+                    } else {
+                        // Target the Intent at the given package name always.
+                        String authority = null;
+                        intent.targetPackage = data.substring(14, end);
+                        int newEnd;
+                        if ((end + 1) < data.length()) {
+                            if ((newEnd = data.indexOf('/', end + 1)) >= 0) {
+                                // Found a scheme, remember it.
+                                scheme = data.substring(end + 1, newEnd);
+                                end = newEnd;
+                                if (end < data.length()
+                                        && (newEnd = data.indexOf('/', end + 1)) >= 0) {
+                                    // Found an authority, remember it.
+                                    authority = data.substring(end + 1, newEnd);
+                                    end = newEnd;
+                                }
+                            } else {
+                                // All we have is a scheme.
+                                scheme = data.substring(end + 1);
+                            }
+                        }
+                        if (scheme == null) {
+                            // If there was no scheme, then this just targets the package.
+                            if (!explicitAction) {
+                                intent.setAction(ACTION_MAIN);
+                            }
+                            data = "";
+                        } else if (authority == null) {
+                            data = scheme + ":";
+                        } else {
+                            data = scheme + "://" + authority + data.substring(end);
+                        }
+                    }
+                } else {
+                    data = "";
+                }
+            } else if (data.startsWith("intent:")) {
                 data = data.substring(7);
                 if (scheme != null) {
                     data = scheme + ':' + data;

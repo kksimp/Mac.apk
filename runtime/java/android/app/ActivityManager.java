@@ -143,7 +143,25 @@ public class ActivityManager {
         outInfo.lowMemory     = outInfo.availMem <= outInfo.threshold;
     }
 
-    public List<RunningTaskInfo>          getRunningTasks(int maxNum)  { return Collections.emptyList(); }
+    /** AOSP (API 21+, deprecated): "returns only a small subset of the task
+     *  data: the caller's own tasks". Mac.apk hosts one task, described from the
+     *  same ActivityHost snapshot as getAppTasks(). */
+    public List<RunningTaskInfo> getRunningTasks(int maxNum) {
+        if (maxNum <= 0) return Collections.emptyList();
+        RecentTaskInfo t = macapkOwnTaskInfo();
+        if (t == null) return Collections.emptyList();
+        RunningTaskInfo r = new RunningTaskInfo();
+        r.id = t.id;
+        r.taskId = t.taskId;
+        r.baseActivity = t.baseActivity;
+        r.topActivity = t.topActivity;
+        r.baseIntent = t.baseIntent;
+        r.numActivities = t.numActivities;
+        r.numRunning = t.numActivities;
+        r.isRunning = t.isRunning;
+        r.taskDescription = t.taskDescription;
+        return Collections.singletonList(r);
+    }
     public List<RunningServiceInfo>       getRunningServices(int maxNum) { return Collections.emptyList(); }
 
     /** AOSP: "or null if there are no running processes (it will not
@@ -170,9 +188,53 @@ public class ActivityManager {
      *  reported" is the honest, contract-faithful answer. */
     public List<ProcessErrorStateInfo> getProcessesInErrorState() { return null; }
 
-    public List<RecentTaskInfo>           getRecentTasks(int maxNum, int flags) { return Collections.emptyList(); }
+    /** AOSP (API 21+, deprecated): only the caller's own tasks are returned. */
+    public List<RecentTaskInfo> getRecentTasks(int maxNum, int flags) {
+        // AOSP ActivityManager.getRecentTasks checks this before asking the
+        // task service; zero is allowed and yields an empty list.
+        if (maxNum < 0) {
+            throw new IllegalArgumentException("The requested number of tasks should be >= 0");
+        }
+        if (maxNum == 0) return Collections.emptyList();
+        RecentTaskInfo t = macapkOwnTaskInfo();
+        return t == null ? Collections.<RecentTaskInfo>emptyList() : Collections.singletonList(t);
+    }
 
-    public List<AppTask> getAppTasks() { return Collections.emptyList(); }
+    /** The one hosted task as a fresh RecentTaskInfo, or null when the host has
+     *  no activity. Shared by getAppTasks / getRunningTasks / getRecentTasks. */
+    private static RecentTaskInfo macapkOwnTaskInfo() {
+        android.app.Activity[] activities =
+                com.macapk.loader.ActivityHost.macapkTaskActivitySnapshot();
+        if (activities == null || activities.length == 0) return null;
+        android.app.Activity base = activities[0];
+        android.app.Activity top = activities[activities.length - 1];
+        RecentTaskInfo info = new RecentTaskInfo();
+        info.id = 1;
+        info.persistentId = 1;
+        info.taskId = 1;
+        info.baseActivity = new android.content.ComponentName(base, base.getClass());
+        info.topActivity = new android.content.ComponentName(top, top.getClass());
+        info.realActivity = info.baseActivity;
+        info.baseIntent = base.getIntent() == null ? null
+                : new android.content.Intent(base.getIntent());
+        info.numActivities = activities.length;
+        info.isRunning = !top.isFinishing();
+        info.taskDescription = top.macapkTaskDescription();
+        return info;
+    }
+
+    /** AOSP exposes each live task owned by the calling application. Mac.apk's
+     *  ActivityHost maintains exactly one task, so return its coherent snapshot
+     *  while that task contains an activity. This is not a cosmetic "non-empty"
+     *  answer: baseActivity/topActivity/baseIntent/count are read from the real
+     *  hosted Activity stack and are the same values the app would inspect on a
+     *  device. Some Compose/WebView containers use baseActivity to distinguish a
+     *  task root from a child page before creating their content tree. */
+    public List<AppTask> getAppTasks() {
+        RecentTaskInfo info = macapkOwnTaskInfo();
+        if (info == null) return Collections.emptyList();
+        return Collections.singletonList(new AppTask(info));
+    }
 
     public void killBackgroundProcesses(String packageName) {}
     public boolean clearApplicationUserData() { return true; }
@@ -815,18 +877,44 @@ public class ActivityManager {
         }
     }
 
-    /** AOSP API-21+ AppTask -- a handle to one of this app's tasks in
-     *  Recents. We never have tasks to hand out, but apps that call
-     *  getAppTasks() then iterate must find a real type with these
-     *  methods. All operations are no-ops (single-window desktop). */
+    /** AOSP API-21+ AppTask -- a handle to one of this app's tasks in Recents.
+     *  The handle carries the coherent task snapshot returned by getAppTasks().
+     *  Its task-wide operations map to ActivityHost's real single-task model. */
     public static class AppTask {
-        public void finishAndRemoveTask() {}
-        public RecentTaskInfo getTaskInfo() { return new RecentTaskInfo(); }
-        public void moveToFront() {}
+        private final RecentTaskInfo mTaskInfo;
+        private boolean mExcludeFromRecents;
+
+        private AppTask(RecentTaskInfo info) { mTaskInfo = info; }
+        public void finishAndRemoveTask() {
+            com.macapk.loader.ActivityHost.macapkRemoveCurrentTask();
+        }
+        public RecentTaskInfo getTaskInfo() {
+            // Callers may mutate the public fields of the returned value, as on
+            // Android; keep the handle's system-owned representation isolated.
+            RecentTaskInfo copy = new RecentTaskInfo();
+            copy.id = mTaskInfo.id;
+            copy.persistentId = mTaskInfo.persistentId;
+            copy.affiliatedTaskId = mTaskInfo.affiliatedTaskId;
+            copy.realActivity = mTaskInfo.realActivity;
+            copy.description = mTaskInfo.description;
+            copy.taskId = mTaskInfo.taskId;
+            copy.baseActivity = mTaskInfo.baseActivity;
+            copy.baseIntent = mTaskInfo.baseIntent == null ? null
+                    : new android.content.Intent(mTaskInfo.baseIntent);
+            copy.origActivity = mTaskInfo.origActivity;
+            copy.taskDescription = mTaskInfo.taskDescription;
+            copy.topActivity = mTaskInfo.topActivity;
+            copy.numActivities = mTaskInfo.numActivities;
+            copy.isRunning = mTaskInfo.isRunning;
+            return copy;
+        }
+        public void moveToFront() {
+            com.macapk.loader.ActivityHost.macapkMoveCurrentTaskToFront();
+        }
         public void startActivity(android.content.Context context, android.content.Intent intent, android.os.Bundle options) {
             if (context != null && intent != null) context.startActivity(intent, options);
         }
-        public void setExcludeFromRecents(boolean exclude) {}
+        public void setExcludeFromRecents(boolean exclude) { mExcludeFromRecents = exclude; }
     }
 
     /** AOSP getHistoricalProcessExitReasons (API 30): recent process-death
@@ -845,8 +933,14 @@ public class ActivityManager {
     }
 
     public static boolean isLowMemoryKillReportSupported() { return false; }
-    public void setProcessStateSummary(byte[] state) { }
-    public byte[] getProcessStateSummary() { return null; }
+    private static volatile byte[] sProcessStateSummary;
+    public void setProcessStateSummary(byte[] state) {
+        sProcessStateSummary = state == null ? null : java.util.Arrays.copyOf(state, state.length);
+    }
+    public byte[] getProcessStateSummary() {
+        byte[] s = sProcessStateSummary;
+        return s == null ? null : java.util.Arrays.copyOf(s, s.length);
+    }
 
     // ================================================================
     // AOSP API-36 surface completion (android.app.ActivityManager).

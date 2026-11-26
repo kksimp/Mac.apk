@@ -66,7 +66,10 @@
 //
 // ENV:
 //   MACAPK_MIC=0                     hard-disable capture (open always fails).
-//   MACAPK_MIC_TRACE=1               per-stream lifecycle + a ~2 s level meter.
+//   MACAPK_MIC_TRACE=1               per-stream lifecycle + a ~2 s level meter,
+//                                    and a ~2 s meter of what macOS hands the
+//                                    input tap plus the system default input
+//                                    device (see trace_tap_level).
 //   MACAPK_MIC_DUMP=/path.wav        write captured PCM (post-conversion, i.e.
 //                                    exactly what the app reads) as 16-bit WAV.
 //   MACAPK_MIC_PERMISSION_TIMEOUT_MS bound on the first-use prompt wait
@@ -74,6 +77,7 @@
 
 #import <AVFoundation/AVFoundation.h>
 #import <Foundation/Foundation.h>
+#import <CoreAudio/CoreAudio.h>
 
 #include <jni.h>
 
@@ -283,8 +287,10 @@ struct Cap {
     std::atomic<uint64_t> frames_captured{0};
     std::atomic<uint64_t> frames_dropped{0};
 
-    // Conversion state. Owned and touched ONLY by the tap thread (except at
-    // construction), so no locking is needed around the converter itself.
+    // Conversion state. Used by the tap thread, which holds g_mtx for each
+    // delivery (tap_dispatch). Built before the Cap is published, and rebuilt
+    // under g_mtx when the input format changes (adopt_input_format), so a
+    // delivery never sees a converter mid-rebuild.
     AVAudioConverter*  conv    = nil;
     AVAudioFormat*     dst_fmt = nil;   // interleaved float32
     AVAudioPCMBuffer*  out_buf = nil;
@@ -536,8 +542,116 @@ static void cap_consume(Cap* c, AVAudioPCMBuffer* in) {
     }
 }
 
+// Input tap meter (MACAPK_MIC_TRACE). The level meter in cap_consume reports
+// what an AudioRecord reads, after conversion; this one reports what macOS
+// hands the input tap, before any conversion, and which input device the
+// system is using. When an app's caller hears nothing, the lines say where
+// the sound was lost: a tap peak of 0.0000 means macOS delivered silence (for
+// example the default input is a muted or silent device, or macOS withholds
+// the microphone although the authorization check passed); a live tap peak
+// beside "level peak=0.0000" means it was lost in conversion or later; and no
+// tap lines at all mean the tap stopped (AVAudioEngine stops itself on an
+// input configuration change).
+//
+// Observed, not documented by Apple: the engine's own input device is an
+// aggregate macOS builds around the system default input
+// ("CADefaultDeviceAggregate-<pid>-<n>"), so the default input is the device
+// named here. It is logged on the first report and again whenever it changes
+// while the tap is still running. Device names can carry the owner's name
+// (headphones often do), which is one reason this stays behind the opt-in
+// trace flag. Float input is not clipped, so a peak above 1.0 is possible.
+//
+// Its own lock keeps the statics below to one thread at a time:
+// AVAudioEngine does not promise that every tap delivery comes on the same
+// thread.
+static void trace_tap_level(AVAudioPCMBuffer* buf) {
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lk(mtx);
+    static uint64_t win0_ms = 0;
+    static uint64_t frames = 0;
+    static float peak = 0.0f;
+    static AudioDeviceID last_dev = kAudioObjectUnknown;
+    static bool query_failed_logged = false;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    const uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ull
+                          + (uint64_t)ts.tv_nsec / 1000000ull;
+    if (win0_ms == 0) win0_ms = now_ms;
+
+    const AVAudioFrameCount n = buf.frameLength;
+    const AVAudioChannelCount chans = buf.format.channelCount;
+    float* const* ch = buf.floatChannelData;
+    if (ch) {
+        // Planar: one pointer per channel, n samples each. Interleaved: one
+        // pointer, n * channels samples.
+        const bool inter = buf.format.isInterleaved;
+        const AVAudioChannelCount ptrs = inter ? 1 : chans;
+        const uint64_t len = inter ? (uint64_t)n * chans : (uint64_t)n;
+        for (AVAudioChannelCount c = 0; c < ptrs; ++c) {
+            for (uint64_t i = 0; i < len; ++i) {
+                const float a = std::fabs(ch[c][i]);
+                if (a > peak) peak = a;
+            }
+        }
+    }
+    frames += n;
+
+    if (now_ms - win0_ms < 2000) return;
+
+    AudioDeviceID dev = kAudioObjectUnknown;
+    UInt32 dev_size = sizeof dev;
+    const AudioObjectPropertyAddress default_input = {
+        kAudioHardwarePropertyDefaultInputDevice,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    const OSStatus dev_status = AudioObjectGetPropertyData(
+        kAudioObjectSystemObject, &default_input, 0, nullptr, &dev_size, &dev);
+    if (dev_status != noErr && !query_failed_logged) {
+        query_failed_logged = true;
+        std::fprintf(stderr, "[audio-in] default input device query failed "
+                     "(OSStatus %d)\n", (int)dev_status);
+    }
+    if (dev_status == noErr && dev != last_dev) {
+        last_dev = dev;
+        char name[256] = "?";
+        CFStringRef cf_name = nullptr;
+        UInt32 name_size = sizeof cf_name;
+        const AudioObjectPropertyAddress name_addr = {
+            kAudioObjectPropertyName,
+            kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        if (AudioObjectGetPropertyData(dev, &name_addr, 0, nullptr,
+                                       &name_size, &cf_name) == noErr && cf_name) {
+            if (!CFStringGetCString(cf_name, name, sizeof name, kCFStringEncodingUTF8))
+                std::strcpy(name, "?");   // did not fit the buffer
+            CFRelease(cf_name);
+        }
+        std::fprintf(stderr, "[audio-in] input device %u \"%s\" (system default input)\n",
+                     (unsigned)dev, name);
+    }
+
+    const double secs = (double)(now_ms - win0_ms) / 1000.0;
+    if (ch) {
+        std::fprintf(stderr,
+            "[audio-in] tap peak=%.4f frames=%llu in %.2f s (%.0f Hz x%u, "
+            "before conversion)\n",
+            peak, (unsigned long long)frames, secs,
+            buf.format.sampleRate, (unsigned)chans);
+    } else {
+        std::fprintf(stderr,
+            "[audio-in] tap frames=%llu in %.2f s (%.0f Hz x%u, not float: "
+            "peak not measured)\n",
+            (unsigned long long)frames, secs,
+            buf.format.sampleRate, (unsigned)chans);
+    }
+    std::fflush(stderr);
+    win0_ms = now_ms;
+    frames = 0;
+    peak = 0.0f;
+}
+
 static void tap_dispatch(AVAudioPCMBuffer* buf) {
     if (!buf) return;
+    if (trace_on()) trace_tap_level(buf);
     // The tap block runs on an engine-owned thread, NOT the CoreAudio realtime
     // render thread (the existing MACAPK_AUDIO_DUMP tap in audio_backend.mm
     // takes a mutex on the same kind of thread), so a short lock here is fine
@@ -546,87 +660,260 @@ static void tap_dispatch(AVAudioPCMBuffer* buf) {
     for (Cap* c : g_caps) cap_consume(c, buf);
 }
 
+static bool cap_build_converter(Cap* c);
+static void observe_input_engine_changes(AVAudioEngine* engine);
+
+// Install the capture tap on the input node, in the node's own format (the
+// input node rejects any other, which is why conversion lives in cap_consume).
+static bool install_input_tap(AVAudioInputNode* input) {
+    @try {
+        [input installTapOnBus:0
+                    bufferSize:1024
+                        format:nil
+                         block:^(AVAudioPCMBuffer* buf, AVAudioTime* when) {
+            (void)when;
+            // The tap fires ~50x/s for the engine's whole life on an
+            // AVAudioEngine-owned thread that is not guaranteed to drain
+            // an autorelease pool between deliveries. cap_consume's own
+            // traffic is owned allocs, but AVAudioConverter's internals
+            // are free to autorelease, so bound each delivery with a pool
+            // (the v1.0.952 CocoaPresentBitmap rule).
+            @autoreleasepool {
+                tap_dispatch(buf);
+            }
+        }];
+    } @catch (NSException* ex) {
+        std::fprintf(stderr, "[audio-in] installTap failed: %s\n",
+                     ex.reason ? ex.reason.UTF8String : "(no reason)");
+        return false;
+    }
+    return true;
+}
+
+// The hardware input format changed: every converter was built from the old
+// one. Done under g_mtx, which the tap thread holds for each delivery, so no
+// delivery sees g_hw_fmt and a converter that disagree.
+static void adopt_input_format(AVAudioFormat* hw) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    [g_hw_fmt release];
+    g_hw_fmt = [hw retain];
+    for (Cap* c : g_caps) {
+        if (c->released.load(std::memory_order_relaxed)) continue;
+        [c->conv release];    c->conv = nil;
+        [c->dst_fmt release]; c->dst_fmt = nil;
+        [c->out_buf release]; c->out_buf = nil;
+        cap_build_converter(c);   // logs and leaves conv nil on failure
+    }
+}
+
+// Make a NEW engine on the current default input device, tap it and start it.
+// Caller holds g_engine_mtx (NOT g_mtx -- see the two-lock note above).
+// `why` is null for the first start and names the reason for a restart. On
+// success g_in_engine is the running engine; on failure nothing is left
+// running, g_in_engine is nil, and the reason is logged.
+static bool start_input_engine_locked(const char* why) {
+    AVAudioEngine* engine = [[AVAudioEngine alloc] init];   // +1, owned by g_in_engine
+    AVAudioInputNode* input = nil;
+    @try {
+        input = engine.inputNode;
+    } @catch (NSException* ex) {
+        std::fprintf(stderr, "[audio-in] inputNode unavailable: %s\n",
+                     ex.reason ? ex.reason.UTF8String : "(no reason)");
+        [engine release];
+        return false;
+    }
+    if (!input) {
+        std::fprintf(stderr, "[audio-in] no input node\n");
+        [engine release];
+        return false;
+    }
+
+    AVAudioFormat* hw = [input outputFormatForBus:0];
+    // A Mac with no input device (or one the user has muted at the driver
+    // level) reports 0 channels / 0 Hz here, and installTapOnBus would then
+    // raise. This is the honest "no microphone" branch.
+    if (!hw || hw.channelCount == 0 || hw.sampleRate <= 0.0) {
+        std::fprintf(stderr,
+            "[audio-in] no usable input device (format %.0f Hz %u ch)\n",
+            hw ? hw.sampleRate : 0.0, hw ? (unsigned)hw.channelCount : 0u);
+        [engine release];
+        return false;
+    }
+    if (!g_hw_fmt) {
+        g_hw_fmt = [hw retain];   // first start: no AudioRecord has a converter yet
+    } else if (![hw isEqual:g_hw_fmt]) {
+        adopt_input_format(hw);
+    }
+
+    if (!install_input_tap(input)) {
+        [engine release];
+        return false;
+    }
+    [engine prepare];
+    NSError* err = nil;
+    if (![engine startAndReturnError:&err]) {
+        const char* reason = err ? err.localizedDescription.UTF8String : "(unknown)";
+        if (why) {
+            std::fprintf(stderr, "[audio-in] microphone restart FAILED (%s), input %.0f Hz "
+                         "%u ch: %s\n", why, hw.sampleRate, (unsigned)hw.channelCount, reason);
+        } else {
+            std::fprintf(stderr, "[audio-in] engine start FAILED, input %.0f Hz %u ch: %s\n",
+                         hw.sampleRate, (unsigned)hw.channelCount, reason);
+        }
+        [input removeTapOnBus:0];
+        [engine release];
+        return false;
+    }
+    g_in_engine = engine;
+    observe_input_engine_changes(engine);
+    if (why) {
+        std::fprintf(stderr, "[audio-in] microphone restarted (%s): input %.0f Hz %u ch\n",
+                     why, hw.sampleRate, (unsigned)hw.channelCount);
+    } else {
+        std::fprintf(stderr, "[audio-in] microphone live: input %.0f Hz %u ch\n",
+                     hw.sampleRate, (unsigned)hw.channelCount);
+    }
+    return true;
+}
+
+static void restart_input_engine_if_stopped_locked(const char* why);
+
 // ---------------------------------------------------------------------------
-// Lazy input-engine bring-up. Caller holds g_engine_mtx (NOT g_mtx -- see the
-// two-lock note above). Returns true only when a tap is genuinely installed on
-// a real device and the engine is running.
+// Lazy input-engine bring-up. Caller holds g_engine_mtx. Returns true only when
+// a tap is genuinely installed on a real device and the engine is running (a
+// later open first restarts an engine macOS stopped; see below).
 // ---------------------------------------------------------------------------
 static bool ensure_input_engine_locked() {
-    if (g_in_tried) return g_in_ok;
+    if (g_in_tried) {
+        if (g_in_ok) restart_input_engine_if_stopped_locked("an AudioRecord opened");
+        return g_in_ok && g_in_engine;
+    }
     g_in_tried = true;
 
     @autoreleasepool {
-        g_in_engine = [[AVAudioEngine alloc] init];   // +1, kept for process life
-        AVAudioInputNode* input = nil;
-        @try {
-            input = g_in_engine.inputNode;
-        } @catch (NSException* ex) {
-            std::fprintf(stderr, "[audio-in] inputNode unavailable: %s\n",
-                         ex.reason ? ex.reason.UTF8String : "(no reason)");
-            return false;
-        }
-        if (!input) {
-            std::fprintf(stderr, "[audio-in] no input node\n");
-            return false;
-        }
-
-        AVAudioFormat* hw = [input outputFormatForBus:0];
-        // A Mac with no input device (or one the user has muted at the driver
-        // level) reports 0 channels / 0 Hz here, and installTapOnBus would then
-        // raise. This is the honest "no microphone" branch.
-        if (!hw || hw.channelCount == 0 || hw.sampleRate <= 0.0) {
-            std::fprintf(stderr,
-                "[audio-in] no usable input device (format %.0f Hz %u ch)\n",
-                hw ? hw.sampleRate : 0.0, hw ? (unsigned)hw.channelCount : 0u);
-            return false;
-        }
-        g_hw_fmt = [hw retain];
-
         const char* dump_path = std::getenv("MACAPK_MIC_DUMP");
         if (dump_path && *dump_path) {
             g_dump = new WavDump();
             g_dump->open(dump_path);
             std::fprintf(stderr, "[audio-in] DUMP enabled -> %s\n", dump_path);
         }
-
-        @try {
-            // format:nil == the node's own format. The input node rejects any
-            // other format on its tap, which is precisely why the conversion
-            // lives in cap_consume rather than being pushed onto the tap.
-            [input installTapOnBus:0
-                        bufferSize:1024
-                            format:nil
-                             block:^(AVAudioPCMBuffer* buf, AVAudioTime* when) {
-                (void)when;
-                // The tap fires ~50x/s for the engine's whole life on an
-                // AVAudioEngine-owned thread that is not guaranteed to drain
-                // an autorelease pool between deliveries. cap_consume's own
-                // traffic is owned allocs, but AVAudioConverter's internals
-                // are free to autorelease, so bound each delivery with a pool
-                // (the v1.0.952 CocoaPresentBitmap rule).
-                @autoreleasepool {
-                    tap_dispatch(buf);
-                }
-            }];
-        } @catch (NSException* ex) {
-            std::fprintf(stderr, "[audio-in] installTap failed: %s\n",
-                         ex.reason ? ex.reason.UTF8String : "(no reason)");
-            return false;
-        }
-
-        [g_in_engine prepare];
-        NSError* err = nil;
-        if (![g_in_engine startAndReturnError:&err]) {
-            std::fprintf(stderr, "[audio-in] engine start FAILED: %s\n",
-                         err ? err.localizedDescription.UTF8String : "(unknown)");
-            return false;
-        }
-        g_in_ok = true;
-        std::fprintf(stderr,
-            "[audio-in] microphone live: input %.0f Hz %u ch\n",
-            hw.sampleRate, (unsigned)hw.channelCount);
+        g_in_ok = start_input_engine_locked(nullptr);
     }
     return g_in_ok;
+}
+
+// ---------------------------------------------------------------------------
+// Keeping the input engine running.
+//
+// macOS STOPS an AVAudioEngine by itself whenever the audio configuration
+// changes (a device appears or goes, the input format or sample rate changes,
+// another client reconfigures the device) and posts
+// AVAudioEngineConfigurationChangeNotification; the engine stays stopped until
+// it is started again (AVAudioEngine.h). Calls change the configuration all the
+// time. Measured 2026-11-13 on Signal 8.35.2: a second call in one session
+// started a fresh AudioRecord whose every read returned 0 ("AudioRecord.read
+// failed: 0"), so the other side heard nothing.
+//
+// WHY A NEW ENGINE, not a restart of the stopped one: restarting the same
+// engine after headphones were connected mid-call failed with avfaudio error
+// -10868 (kAudioUnitErr_FormatNotSupported) most times (2026-11-13, Signal),
+// because the stopped engine's nodes keep the formats they were configured
+// with. A new engine reads the devices as they are now.
+//
+// So the engine is replaced (a) when the notification arrives while any
+// AudioRecord is recording, and (b) whenever an AudioRecord opens or starts
+// and finds it stopped. A device switch can post several notifications while
+// it settles, and the last one can arrive before the new device is ready, so a
+// replacement that fails while recording is retried a few times, a second
+// apart. Every failure grants a fresh set of retries; at most one retry is
+// scheduled at a time.
+// ---------------------------------------------------------------------------
+static id   g_in_observer = nil;       // the engine's configuration observer (+1)
+static int  g_in_retries_left = 0;     // guarded by g_engine_mtx
+static bool g_in_retry_pending = false; // guarded by g_engine_mtx: a retry is scheduled
+static const int kInputRetries = 5;
+
+static bool any_cap_recording() {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    for (Cap* c : g_caps) {
+        if (c->recording.load(std::memory_order_relaxed)) return true;
+    }
+    return false;
+}
+
+// Caller holds g_engine_mtx.
+static void discard_input_engine_locked() {
+    if (!g_in_engine) return;
+    [[NSNotificationCenter defaultCenter] removeObserver:g_in_observer];
+    [g_in_observer release];
+    g_in_observer = nil;
+    [g_in_engine stop];
+    [g_in_engine.inputNode removeTapOnBus:0];
+    [g_in_engine release];
+    g_in_engine = nil;
+}
+
+static void retry_input_engine_later();
+
+// Caller holds g_engine_mtx.
+static void restart_input_engine_if_stopped_locked(const char* why) {
+    if (!g_in_ok) return;                                  // never opened: nothing to restart
+    if (g_in_engine && g_in_engine.isRunning) return;
+    @autoreleasepool {
+        discard_input_engine_locked();
+        if (start_input_engine_locked(why)) {
+            g_in_retries_left = 0;
+        } else {
+            g_in_retries_left = kInputRetries;
+            retry_input_engine_later();
+        }
+    }
+}
+
+// Caller holds g_engine_mtx. Schedules one retry unless one is already pending.
+static void retry_input_engine_later() {
+    if (g_in_retry_pending) return;
+    g_in_retry_pending = true;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        bool recording = any_cap_recording();
+        std::lock_guard<std::mutex> lk(g_engine_mtx);
+        g_in_retry_pending = false;
+        // Nothing to retry for: recording stopped (the next open() or start()
+        // tries again), or the engine runs again. Ending the run here lets a
+        // later failure start a fresh one.
+        if (!recording || g_in_retries_left <= 0 || (g_in_engine && g_in_engine.isRunning)) {
+            g_in_retries_left = 0;
+            return;
+        }
+        g_in_retries_left--;
+        discard_input_engine_locked();
+        if (start_input_engine_locked("retry after a failed restart")) {
+            g_in_retries_left = 0;
+        } else if (g_in_retries_left > 0) {
+            retry_input_engine_later();
+        } else {
+            std::fprintf(stderr, "[audio-in] microphone still not running after %d retries; "
+                         "the next AudioRecord start tries again\n", kInputRetries);
+        }
+    });
+}
+
+// Caller holds g_engine_mtx.
+static void observe_input_engine_changes(AVAudioEngine* engine) {
+    g_in_observer = [[[NSNotificationCenter defaultCenter]
+        addObserverForName:AVAudioEngineConfigurationChangeNotification
+                    object:engine
+                     queue:nil
+                usingBlock:^(NSNotification*) {
+        // Off the posting thread: the restart takes the engine lock and talks
+        // to CoreAudio, neither of which belongs on a notification callback.
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            if (!any_cap_recording()) return;   // the next open() or start() restarts it
+            std::lock_guard<std::mutex> lk(g_engine_mtx);
+            restart_input_engine_if_stopped_locked("audio configuration changed");
+        });
+    }] retain];
 }
 
 // Build the hardware-format -> app-format converter. Prefer converting straight
@@ -782,6 +1069,10 @@ extern "C" int64_t macapk_mic_open(int sample_rate, int channels, int encoding,
 extern "C" void macapk_mic_start(int64_t h) {
     Cap* c = cap_of(h);
     if (!c) return;
+    {
+        std::lock_guard<std::mutex> lk(g_engine_mtx);
+        restart_input_engine_if_stopped_locked("an AudioRecord started");
+    }
     // Discard anything captured before start so the first read returns audio
     // from now, not from whenever the stream was opened.
     c->ring.rpos.store(c->ring.wpos.load(std::memory_order_acquire),

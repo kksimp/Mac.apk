@@ -26,6 +26,11 @@
 namespace macapk::translator::arm32rc {
 namespace {
 bool tail_live_enabled();   // defined below
+bool bl_live_regs_enabled();   // defined below
+bool frame_jump_enabled();     // defined below
+bool extend_falloff_enabled(); // defined below
+std::vector<uint32_t>& sorted_fn_starts();   // defined below
+std::unordered_set<uint32_t>& frame_jump_targets();   // defined below
 std::unordered_set<uint32_t>& all_entry_targets();     // defined below
 std::unordered_set<uint32_t>& continuation_targets();   // defined below
 
@@ -100,6 +105,14 @@ public:
     // guest registers. Tear our frame down first. w4 is captured BEFORE
     // the epilogue because the epilogue restores x27.
     void tail_branch_direct(uint32_t guest_target) override {
+        // MACAPK_ARM32RC_FRAME_JUMP: a branch into another translated extent
+        // keeps our host frame and every guest register (see the gate).
+        if (frame_jump_enabled() &&
+            frame_jump_targets().count(guest_target & ~1u)) {
+            fjs_.push_back(static_cast<uint32_t>(buf_.size_words()));
+            rc::BufSink::tail_branch_direct(guest_target);
+            return;
+        }
         buf_.put(a64::mov_reg(false, X(HostGpr::X4), X(HostGpr::X27)));
         // ONLY for a SHARED-TAIL target. v1.0.1081 converted EVERY direct tail
         // branch and that was too broad: the protected sweep with the gate on
@@ -145,6 +158,7 @@ public:
     // builder can bind them. Uses the same word-index shape as
     // BufSink::ExternSite.
     const std::vector<uint32_t>& dispatch_sites() const { return disp_; }
+    const std::vector<uint32_t>& frame_jump_sites() const { return fjs_; }
     const std::vector<uint32_t>& capture_sites() const { return cap_; }
 
     // __macapk_capture_entry(fn_vaddr, r0, r1, r2, r3, sp, is_thumb).
@@ -338,7 +352,45 @@ private:
     a64::A64Buf& buf_;
     std::vector<uint32_t> disp_;
     std::vector<uint32_t> cap_;
+    std::vector<uint32_t> fjs_;   // MACAPK_ARM32RC_FRAME_JUMP `b` word indices
 };
+
+// ---------------------------------------------------------------------
+// MACAPK_ARM32RC_ADC_SBIT (default ON; =0 trusts Capstone as before).
+//
+// Capstone 5 reports `update_flags = true` for EVERY 32-bit ADC / SBC / RSC,
+// whatever its S bit says: A32 `adc r3, r1, r2` (e0a13002), T32
+// `adc r3, r1, #-1` (f141 33ff) and `adc.w r3, r1, r2` (eb41 0302) all come
+// back flag-setting although the mnemonic it prints has no `s`. (It derives
+// the field from the instruction touching CPSR, and these READ the carry.
+// The 16-bit Thumb forms, whose flag behaviour depends on the IT state, are
+// reported correctly.) Every xlat_core ALU path keys on that field, so a
+// non-S ADC / SBC / RSC was emitted as ADCS / SBCS and overwrote NZCV:
+//     cmp r0, r1 ; adc r2, r2, #0 ; moveq ...     -- EQ tested the adc result
+// ARM ARM DDI 0406C.d A8.8.1 ADC (immediate) / A8.8.2 (register), A8.8.161 /
+// A8.8.162 SBC, A8.8.152 / A8.8.153 RSC: `setflags = (S == '1')`, S = bit 20
+// in A1 and in T1/T2 of the 32-bit Thumb encodings (bit 4 of the first
+// halfword). So the encoding decides, not the decoder's summary. Found on
+// SQLCipher's libsqlcipher.so (sqlite3Malloc's 64-bit range check at 0x3737c).
+// ---------------------------------------------------------------------
+void fix_carry_alu_setflags(cs_insn* insns, size_t n, bool thumb) {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_ARM32RC_ADC_SBIT");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    if (!on) return;
+    for (size_t i = 0; i < n; ++i) {
+        cs_insn& in = insns[i];
+        if (in.id != ARM_INS_ADC && in.id != ARM_INS_SBC && in.id != ARM_INS_RSC)
+            continue;
+        if (in.size != 4 || !in.detail) continue;   // 16-bit Thumb: IT-dependent, already right
+        // A32: bit 20 of the little-endian word = bit 4 of byte 2.
+        // T32: bit 4 of the first halfword = bit 4 of byte 0.
+        const bool s = thumb ? ((in.bytes[0] >> 4) & 1) != 0
+                             : ((in.bytes[2] >> 4) & 1) != 0;
+        in.detail->arm.update_flags = s;
+    }
+}
 
 // ---------------------------------------------------------------------
 // Capstone handles
@@ -503,6 +555,15 @@ struct FuncOut {
     // address that some OTHER function branches to. Always empty with
     // the gate off, which is what keeps the default path byte-identical.
     std::vector<std::pair<uint32_t, uint64_t>> entries;
+    // MACAPK_ARM32RC_BL_LIVE_REGS: byte offset within `code` of the
+    // non-zeroing entry stub a direct guest `bl` binds to; ~0 = none.
+    uint64_t direct_off = ~0ull;
+    // MACAPK_ARM32RC_FRAME_JUMP: byte offset of the first guest instruction
+    // (the body entry), the offset of each planned interior target's own
+    // instruction, and the word indices of this body's frame-keeping `b`s.
+    uint64_t body_off = ~0ull;
+    std::vector<std::pair<uint32_t, uint64_t>> mids;
+    std::vector<uint32_t> frame_sites;
 };
 
 // MACAPK_ARM32RC_MULTI_ENTRY (v1.0.1047, default OFF).
@@ -617,6 +678,166 @@ bool tail_live_enabled() {
         return !(e && *e == '0');   // default ON
     }();
     return on;
+}
+
+// MACAPK_ARM32RC_BL_LIVE_REGS (default ON; =0 emits exactly the old code).
+//
+// A direct guest `bl` used to land on the callee's ordinary entry, which runs
+// emit_entry_state and ZEROES guest r4-r12 and r14. For an AAPCS32 callee that
+// is invisible (IHI 0042 5.1.1: r4-r11 are callee-saved, a callee may not rely
+// on them). It is WRONG for hand-written assembly, which is free to pass
+// arguments to its own internal routines in any register, and on a CPU a `bl`
+// changes nothing but pc and lr (ARM ARM DDI 0406C.d A8.8.25 BL: `LR =
+// PC - 4 or next_instr_addr; BranchWritePC(targetAddress)`).
+//
+// Measured on OpenSSL 1.0.2g's aes-armv4.S inside SQLCipher's libsqlcipher.so:
+// AES_encrypt (0xdbda0) sets r10 = the Te table, r11 = the key schedule, and
+// `bl _armv4_AES_encrypt` (0xdbe00), whose first instructions are
+// `ldm r11!, {r4-r7}` and `ldr r12, [r11, #0xe0]` (the round count). With r11
+// zeroed it read the key and the round count from guest address 0, so
+// AES_encrypt looped on a garbage count and AES_decrypt produced zeros; the
+// bit-sliced path (_bsaes_key_convert takes r4, r5 and r12) failed the same
+// way. Every page SQLCipher decrypts goes through these.
+//
+// Fix: each translated function gets a second entry, `__macapk_dcall_<vaddr>`,
+// that runs the full host prologue (so the frame and the host callee-saved
+// registers are exactly as for the ordinary entry) but does NOT zero, and a
+// direct intra-module `bl` binds to it. At that `bl` x19-x26 hold the calling
+// guest function's r4-r11, x9 its r12, and the call site has just written the
+// return address into w10 (guest lr), so the callee starts with the register
+// file a CPU would give it. The ordinary entry (JNI thunks, the indirect-call
+// dispatcher, tail branches) is unchanged and still zeroes.
+//
+// What this does NOT do: values a non-AAPCS callee leaves in r4-r11 do not
+// flow BACK, because the shared epilogue restores x19-x26. r0-r3, r12 and the
+// NEON bank (guest memory) do flow back, which covers the routines above.
+bool bl_live_regs_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_ARM32RC_BL_LIVE_REGS");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+
+// MACAPK_ARM32RC_FRAME_JUMP (default ON; =0 emits exactly the old code).
+//
+// A guest `b` (or a table-branch case) whose target lies in ANOTHER translated
+// extent used to be `epilogue ; b <target's ordinary entry>`: the target ran
+// its own prologue and emit_entry_state, i.e. it started with guest r4-r12 and
+// r14 ZEROED. On a CPU a branch changes pc and nothing else (ARM ARM DDI
+// 0406C.d A8.8.18 B: `BranchWritePC(PC + imm32)`).
+//
+// That matters whenever discovery draws MORE THAN ONE extent over one real
+// function, because then an ordinary local jump is a "cross-function" branch
+// with every callee-saved register live across it. Measured on SQLCipher's
+// libsqlcipher.so: sqlite3VdbeExec (0x74c8c..0x79da0, 20,090 bytes, one
+// function, the bytecode interpreter) is cut at the 0x4000 extent clamp and at
+// interior starts into about 25 extents. Its opcode `tbh` dispatch and its
+// `b`s between the pieces entered each piece with r11 (the sqlite3* handle)
+// and r4 zeroed, so `db->xProfile` was read from guest address 0xb0, which is
+// the library's own ELF program headers at load bias 0: the "indirect call to
+// in-image vaddr 0x4 / 0x6" lines, an empty cursor, "unable to close due to
+// unfinalized statements".
+//
+// Fix: every translated extent has ONE host frame shape (emit_prologue: 96
+// bytes, x19-x28 + fp/lr), so a jump between two of them does not need a new
+// frame at all. The branch becomes a plain host `b` to the target's BODY (a
+// local `__macapk_body_<vaddr>` symbol at its first guest instruction, or
+// `__macapk_mid_<vaddr>` at a planned interior entry), with our frame left in
+// place: x19-x26, x9, x10, x27 and x28 arrive untouched, the stack does not
+// grow, and the target's own epilogue pops the frame we pushed and returns to
+// OUR caller. For a genuine tail call that is exactly a tail call; for a split
+// function it is the local jump it always was. This also replaces the
+// MACAPK_ARM32RC_TAIL_LIVE `bl ; epilogue ; ret` for the targets it covers,
+// without that path's host-stack growth.
+//
+// The set of targets is fixed BEFORE translation (function starts with
+// Disposition::Translate plus the multi-entry plan's interior targets, guest
+// PLT excluded). A site whose target then turns out to have no body symbol
+// (the function failed to translate, or pass 1 rejected the interior address)
+// is bound to a small thunk that pops the frame and continues the old way.
+bool frame_jump_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_ARM32RC_FRAME_JUMP");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+std::unordered_set<uint32_t>& frame_jump_targets() {
+    static std::unordered_set<uint32_t> s;
+    return s;
+}
+
+// MACAPK_ARM32RC_EXTEND_FALLOFF (default ON; =0 translates each extent exactly
+// as discovery drew it).
+//
+// Discovery sometimes ends an extent in the middle of straight-line code: its
+// prologue boundary scan treats a `push {.., lr}` as the start of a NEW
+// function, but compilers do not always put the push first. GCC schedules
+// argument arithmetic ahead of it:
+//     decodeFlags (SQLite btree.c), libsqlcipher.so 0x50210:
+//         ubfx r3, r1, #3, #8 ; bic r1, r1, #8 ; push {r4, lr} ; ...
+//     sqlite3Malloc 0x37378:  adds.w / adc / movs ; push.w {r4-r8, lr}
+// The scan marks the push (0x50218), nothing ever lifts a function there (no
+// symbol, no call, no pointer names it), and the real function is left with
+// an 8-byte extent: two instructions and then this translator's "well-formed
+// exit", i.e. it RETURNS. decodeFlags therefore never set MemPage.leaf /
+// intKey, and every schema write reported "database disk image is malformed"
+// (moveToRoot's `(pCur->pKeyInfo==0) != pRoot->intKey`).
+//
+// On a CPU there is no such thing as running off a function: execution
+// continues at the next address. So when an extent's last instruction is NOT
+// an unconditional transfer of control AND the address after it is not the
+// start of any discovered function, the extent is simply too short, and it is
+// extended to the next discovered start (bounded) before translation. When
+// the address after it IS a discovered start, MACAPK_ARM32RC_FRAME_JUMP's
+// fall-through handles it instead. Code that really does end in a no-return
+// call followed by padding gains a few unreachable instructions and nothing
+// else.
+bool extend_falloff_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_ARM32RC_EXTEND_FALLOFF");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+std::vector<uint32_t>& sorted_fn_starts() {
+    static std::vector<uint32_t> v;
+    return v;
+}
+std::atomic<size_t>& extend_falloff_count() {
+    static std::atomic<size_t> n{0};
+    return n;
+}
+std::atomic<size_t>& extend_falloff_bytes() {
+    static std::atomic<size_t> n{0};
+    return n;
+}
+// True when `in` unconditionally leaves straight-line execution.
+bool insn_is_uncond_terminator(const cs_insn& in) {
+    if (in.id == 0 || !in.detail) return false;
+    const cs_arm& d = in.detail->arm;
+    if (d.cc != ARM_CC_AL && d.cc != ARM_CC_INVALID) return false;
+    auto names_pc = [&](int from) {
+        for (int k = from; k < d.op_count; ++k)
+            if (d.operands[k].type == ARM_OP_REG && d.operands[k].reg == ARM_REG_PC)
+                return true;
+        return false;
+    };
+    switch (in.id) {
+        case ARM_INS_B: case ARM_INS_BX: case ARM_INS_BXJ:
+        case ARM_INS_TBB: case ARM_INS_TBH: case ARM_INS_UDF:
+            return true;
+        case ARM_INS_POP:
+            return names_pc(0);
+        case ARM_INS_LDM: case ARM_INS_LDMIB: case ARM_INS_LDMDA: case ARM_INS_LDMDB:
+            return names_pc(1);
+        case ARM_INS_LDR: case ARM_INS_MOV: case ARM_INS_ADD: case ARM_INS_SUB:
+            return d.op_count >= 1 && d.operands[0].type == ARM_OP_REG &&
+                   d.operands[0].reg == ARM_REG_PC;
+        default:
+            return false;
+    }
 }
 
 bool multi_entry_enabled() {
@@ -815,6 +1036,9 @@ public:
     // `entry_targets` is the MACAPK_ARM32RC_MULTI_ENTRY plan for THIS
     // function (sorted, unique, strictly interior), or nullptr with the
     // gate off.
+    bool run_impl(const DiscoveredFunction& fn,
+                  const std::vector<uint32_t>* entry_targets, FuncOut* out);
+    uint32_t extended_size(const DiscoveredFunction& fn);
     bool run(const DiscoveredFunction& fn,
              const std::vector<uint32_t>* entry_targets, FuncOut* out);
 
@@ -826,9 +1050,57 @@ private:
     RcStats* st_;
 };
 
+// MACAPK_ARM32RC_EXTEND_FALLOFF: the size this extent should be translated at.
+uint32_t extended_size_of(const ImageView& view_, const CsPair& cs_,
+                          const DiscoveredFunction& fn) {
+    if (!extend_falloff_enabled() || fn.size == 0) return fn.size;
+    const uint8_t* bytes = view_.at(fn.vaddr, fn.size);
+    if (!bytes) return fn.size;
+    cs_insn* ins = nullptr;
+    const size_t n = cs_disasm(cs_.get(fn.is_thumb), bytes, fn.size, fn.vaddr, 0, &ins);
+    if (n == 0) return fn.size;
+    bool falls_off = false;
+    uint32_t end = fn.vaddr + fn.size;
+    for (size_t i = n; i-- > 0;) {
+        if (ins[i].id == 0) continue;            // skipdata: look at the last real one
+        falls_off = !insn_is_uncond_terminator(ins[i]);
+        end = static_cast<uint32_t>(ins[i].address) + ins[i].size;
+        break;
+    }
+    cs_free(ins, n);
+    if (!falls_off) return fn.size;
+    const auto& st = sorted_fn_starts();
+    auto it = std::upper_bound(st.begin(), st.end(), fn.vaddr & ~1u);
+    // The next discovered start. At or before our end: the fall-through lands
+    // on a translated function (FRAME_JUMP's business). None: leave it alone.
+    while (it != st.end() && *it < end) ++it;
+    if (it == st.end() || *it == end) return fn.size;
+    const uint32_t kMaxExtend = 0x2000;          // a prologue-scan cut is a few hundred bytes at most
+    if (*it - end > kMaxExtend) return fn.size;
+    const uint32_t ext = *it - (fn.vaddr & ~1u);
+    if (!view_.at(fn.vaddr, ext)) return fn.size;
+    extend_falloff_count().fetch_add(1, std::memory_order_relaxed);
+    extend_falloff_bytes().fetch_add(ext - fn.size, std::memory_order_relaxed);
+    return ext;
+}
+
+uint32_t FunctionTranslator::extended_size(const DiscoveredFunction& fn) {
+    return extended_size_of(view_, cs_, fn);
+}
+
 bool FunctionTranslator::run(const DiscoveredFunction& fn,
                              const std::vector<uint32_t>* entry_targets,
                              FuncOut* out) {
+    const uint32_t ext = extended_size(fn);
+    if (ext == fn.size) return run_impl(fn, entry_targets, out);
+    DiscoveredFunction fx = fn;
+    fx.size = ext;
+    return run_impl(fx, entry_targets, out);
+}
+
+bool FunctionTranslator::run_impl(const DiscoveredFunction& fn,
+                                  const std::vector<uint32_t>* entry_targets,
+                                  FuncOut* out) {
     const uint8_t* bytes = view_.at(fn.vaddr, fn.size);
     if (!bytes) return false;
 
@@ -836,6 +1108,7 @@ bool FunctionTranslator::run(const DiscoveredFunction& fn,
     const size_t raw_n = cs_disasm(cs_.get(fn.is_thumb), bytes, fn.size,
                                    fn.vaddr, 0, &raw_insns);
     if (raw_n == 0) return false;
+    fix_carry_alu_setflags(raw_insns, raw_n, fn.is_thumb);
     // Every capstone allocation this function makes, freed on every exit.
     struct CsHold {
         std::vector<std::pair<cs_insn*, size_t>> v;
@@ -962,6 +1235,7 @@ bool FunctionTranslator::run(const DiscoveredFunction& fn,
                 const size_t en = cs_disasm(cs_.get(true), bytes + (t - fn.vaddr),
                                             end_va - t, t, 0, &ex);
                 if (en == 0) continue;
+                fix_carry_alu_setflags(ex, en, true);
                 cs_hold.v.push_back({ex, en});
                 std::vector<cs_insn> fresh;
                 uint32_t sync = end_va;
@@ -1144,6 +1418,12 @@ bool FunctionTranslator::run(const DiscoveredFunction& fn,
             if (labels.find(t) == labels.end()) labels[t] = sink.new_label();
         }
     }
+    // MACAPK_ARM32RC_BL_LIVE_REGS: the direct-call stub branches to the first
+    // guest instruction, so that address needs a label too.
+    const uint32_t first_addr = n ? static_cast<uint32_t>(insns[0].address) : 0u;
+    const bool want_direct = bl_live_regs_enabled() && n != 0 && insns[0].id != 0;
+    if (want_direct && labels.find(first_addr) == labels.end())
+        labels[first_addr] = sink.new_label();
 
     // ---- hooks
     rc::XlatOptions xopts;
@@ -1169,6 +1449,9 @@ bool FunctionTranslator::run(const DiscoveredFunction& fn,
             return (s.sh_flags & 0x1) != 0;             // SHF_WRITE
         }
         return false;
+    };
+    hooks.extern_tail_target = [](uint32_t v) {
+        return frame_jump_enabled() && frame_jump_targets().count(v & ~1u) != 0;
     };
     hooks.label_for_guest = [&labels](uint32_t v, rc::Label* out) {
         auto it = labels.find(v & ~1u);
@@ -1219,11 +1502,17 @@ bool FunctionTranslator::run(const DiscoveredFunction& fn,
     const uint32_t base_adrp_word = DriverSink::emit_entry_state(buf);
 
     bool partial = false;
+    out->body_off = buf.size_bytes();
+    std::unordered_set<uint32_t> mid_set;
+    if (entry_targets && frame_jump_enabled())
+        mid_set.insert(entry_targets->begin(), entry_targets->end());
     for (size_t i = 0; i < n; ++i) {
         const cs_insn& in = insns[i];
         const uint32_t addr = static_cast<uint32_t>(in.address);
         auto lit = labels.find(addr);
         if (lit != labels.end()) sink.bind(lit->second);
+        if (!mid_set.empty() && mid_set.count(addr))
+            out->mids.push_back({addr, buf.size_bytes()});
 
         ++st_->insns_total;
         if (in.id == 0) { ++st_->insns_skipdata; continue; }
@@ -1333,6 +1622,22 @@ bool FunctionTranslator::run(const DiscoveredFunction& fn,
     // A function whose last instruction fell through (no terminator)
     // still needs a well-formed exit, or execution runs into whatever
     // the linker placed next.
+    //
+    // MACAPK_ARM32RC_FRAME_JUMP: when the address right after this extent is
+    // itself a translated extent's start (or a planned interior entry), the
+    // fall-through is what the hardware does -- execution simply continues
+    // there. That is the normal case for one real function cut in pieces
+    // (the 0x4000 extent clamp ends a piece in the middle of straight-line
+    // code); returning instead, as the old exit did, abandoned the function
+    // half way with whatever was in r0. After a real terminator this branch
+    // is unreachable and costs one word.
+    if (frame_jump_enabled() && n != 0) {
+        const cs_insn& li = insns[n - 1];
+        const uint32_t end_addr =
+            static_cast<uint32_t>(li.address) + static_cast<uint32_t>(li.size);
+        if (frame_jump_targets().count(end_addr & ~1u))
+            sink.tail_branch_direct(end_addr);
+    }
     DriverSink::emit_epilogue(buf);
     buf.put(a64::ret());
 
@@ -1403,6 +1708,20 @@ bool FunctionTranslator::run(const DiscoveredFunction& fn,
             entry_base_words.push_back(stub_adrp);
         }
     }
+    // MACAPK_ARM32RC_BL_LIVE_REGS: the non-zeroing entry for direct `bl`.
+    // Same construction as an alternate entry stub (full prologue, guest SP
+    // from w4, its own guest-base pair), just without the zeroing, so the
+    // body's one epilogue pairs with it exactly as with the ordinary entry.
+    if (want_direct) {
+        auto lit = labels.find(first_addr);
+        if (lit != labels.end()) {
+            out->direct_off = buf.size_bytes();
+            DriverSink::emit_prologue(buf);
+            entry_base_words.push_back(
+                DriverSink::emit_entry_state(buf, /*zero_regs=*/false));
+            sink.b(lit->second);
+        }
+    }
 
     std::vector<a64::Fixup> overflow;
     if (!buf.resolve(&overflow) || !overflow.empty()) {
@@ -1411,6 +1730,7 @@ bool FunctionTranslator::run(const DiscoveredFunction& fn,
 
     out->code = buf.bytes();
     out->sites = sink.extern_sites();
+    out->frame_sites = sink.frame_jump_sites();
     // Record where the prologue's guest-base adrp/ldr pair lives so the
     // module builder can attach the linker fixups.
     out->sites.push_back({base_adrp_word, 0xfffffffeu, false});
@@ -1954,14 +2274,14 @@ void JniThunkEmitter::emit_typed_float(a64::A64Buf& c,
 // Module
 // ---------------------------------------------------------------------
 bool build_module(const Elf32Image& img,
-                  const std::vector<DiscoveredFunction>& funcs,
+                  const std::vector<DiscoveredFunction>& funcs_in,
                   const RcOptions& opts,
                   const std::string& out_path,
                   RcStats* stats,
                   std::string* error) {
     RcStats local;
     RcStats& st = stats ? *stats : local;
-    st.functions_in = funcs.size();
+    st.functions_in = funcs_in.size();
 
     CsPair cs;
     if (!cs.ok()) {
@@ -2020,10 +2340,41 @@ bool build_module(const Elf32Image& img,
         // MACAPK_ARM32RC_MULTI_ENTRY: (guest vaddr, byte offset into this
         // body) per alternate entry stub. Always empty with the gate off.
         std::vector<std::pair<uint32_t, uint64_t>> entries;
+        uint64_t direct_off = ~0ull;   // MACAPK_ARM32RC_BL_LIVE_REGS stub, ~0 = none
+        std::unordered_set<uint32_t> frame_sites;   // MACAPK_ARM32RC_FRAME_JUMP
     };
     std::vector<Emitted> emitted;
+    // MACAPK_ARM32RC_BL_LIVE_REGS: function start vaddr -> its non-zeroing
+    // `__macapk_dcall_<vaddr>` entry, for direct `bl` sites.
+    std::unordered_map<uint32_t, uint32_t> vaddr_to_dcall;
+    // MACAPK_ARM32RC_FRAME_JUMP: guest vaddr -> the body / interior symbol a
+    // frame-keeping `b` binds to. Function starts are entered first and win.
+    std::unordered_map<uint32_t, uint32_t> vaddr_to_fj;
+    std::vector<std::pair<uint32_t, uint64_t>> fj_mids_pending;   // (vaddr, text off)
+    size_t fj_bound = 0, fj_thunked = 0;
     std::unordered_map<uint32_t, uint32_t> vaddr_to_sym;
 
+    // MACAPK_ARM32RC_EXTEND_FALLOFF: every discovered start, sorted, then the
+    // repaired extents. Done BEFORE the multi-entry plan, which scans each
+    // extent for branches into other extents: a plan made on the short extents
+    // never sees the branches in the part that is added, and their targets
+    // would bind panic stubs.
+    std::vector<DiscoveredFunction> funcs_repaired;
+    {
+        auto& fs = sorted_fn_starts();
+        fs.clear();
+        for (const DiscoveredFunction& fn : funcs_in) fs.push_back(fn.vaddr & ~1u);
+        std::sort(fs.begin(), fs.end());
+        fs.erase(std::unique(fs.begin(), fs.end()), fs.end());
+        extend_falloff_count() = 0;
+        extend_falloff_bytes() = 0;
+        funcs_repaired = funcs_in;
+        if (extend_falloff_enabled())
+            for (DiscoveredFunction& fn : funcs_repaired)
+                if (fn.disposition == Disposition::Translate)
+                    fn.size = extended_size_of(view, cs, fn);
+    }
+    const std::vector<DiscoveredFunction>& funcs = funcs_repaired;
     // MACAPK_ARM32RC_MULTI_ENTRY: which interior addresses does anything
     // branch to? Computed BEFORE the emit loop because a label has to
     // exist while its function is being emitted, and the function that
@@ -2055,6 +2406,32 @@ bool build_module(const Elf32Image& img,
                      me_plan.targets, me_plan.by_fn.size());
     }
     size_t me_emitted = 0;
+    // MACAPK_ARM32RC_FRAME_JUMP: the targets a frame-keeping `b` may name,
+    // fixed before any function is translated (the workers only read it).
+    frame_jump_targets().clear();
+    if (frame_jump_enabled()) {
+        uint32_t fj_plt_lo = 0xffffffffu, fj_plt_hi = 0u;
+        auto fj_note = [&](uint32_t a) {
+            if (a == 0) return;
+            a &= ~1u;
+            if (a < fj_plt_lo) fj_plt_lo = a;
+            if (a + 16u > fj_plt_hi) fj_plt_hi = a + 16u;
+        };
+        for (const auto& imp : img.imports) fj_note(imp.plt_addr);
+        for (const auto& [pa, lt] : img.plt_local_bindings) { (void)lt; fj_note(pa); }
+        auto in_plt = [&](uint32_t a) {
+            return fj_plt_hi > fj_plt_lo && a + 4u >= fj_plt_lo && a < fj_plt_hi;
+        };
+        for (const DiscoveredFunction& fn : funcs)
+            if (fn.disposition == Disposition::Translate && fn.size != 0 &&
+                !in_plt(fn.vaddr & ~1u))
+                frame_jump_targets().insert(fn.vaddr & ~1u);
+        for (const auto& [f, ts] : me_plan.by_fn) {
+            (void)f;
+            for (uint32_t t : ts)
+                if (!in_plt(t & ~1u)) frame_jump_targets().insert(t & ~1u);
+        }
+    }
     ptimer.mark("multi-entry-plan");
 
     FunctionTranslator ft(img, view, cs, opts, &st);
@@ -2136,6 +2513,10 @@ bool build_module(const Elf32Image& img,
         std::vector<rc::BufSink::ExternSite> sites;
         std::vector<BranchSite> branches;
         std::vector<std::pair<uint32_t, uint64_t>> entries;
+        uint64_t direct_off = ~0ull;
+        uint64_t body_off = ~0ull;
+        std::vector<std::pair<uint32_t, uint64_t>> mids;
+        std::vector<uint32_t> frame_sites;
 
         if (fn.disposition == Disposition::Translate) {
             FuncOut fo;
@@ -2159,6 +2540,10 @@ bool build_module(const Elf32Image& img,
             code = std::move(fo.code);
             sites = std::move(fo.sites);
             entries = std::move(fo.entries);
+            direct_off = fo.direct_off;
+            body_off = fo.body_off;
+            mids = std::move(fo.mids);
+            frame_sites = std::move(fo.frame_sites);
         } else {
             a64::A64Buf b;
             switch (fn.disposition) {
@@ -2206,7 +2591,24 @@ bool build_module(const Elf32Image& img,
             link.branch(Sec::Text, off + bs.byte_off,
                         link.undefined(bs.symbol));
         vaddr_to_sym[fn.vaddr] = sym;
-        emitted.push_back({&fn, off, sym, std::move(sites), std::move(entries)});
+        if (direct_off != ~0ull) {
+            char dn[64];
+            std::snprintf(dn, sizeof(dn), "__macapk_dcall_%08x", fn.vaddr & ~1u);
+            vaddr_to_dcall[fn.vaddr & ~1u] =
+                link.define(dn, Sec::Text, off + direct_off, false);
+        }
+        if (frame_jump_enabled() && body_off != ~0ull) {
+            char bn[64];
+            std::snprintf(bn, sizeof(bn), "__macapk_body_%08x", fn.vaddr & ~1u);
+            vaddr_to_fj[fn.vaddr & ~1u] =
+                link.define(bn, Sec::Text, off + body_off, false);
+            for (const auto& m : mids)
+                fj_mids_pending.push_back({m.first & ~1u, off + m.second});
+        }
+        emitted.push_back({&fn, off, sym, std::move(sites), std::move(entries),
+                           direct_off,
+                           std::unordered_set<uint32_t>(frame_sites.begin(),
+                                                        frame_sites.end())});
 
         if (fn.is_jni_export) {
             if (!jni.emit(fn, sym, error)) return false;
@@ -2235,6 +2637,12 @@ bool build_module(const Elf32Image& img,
     // trampolines: nothing outside this module refers to them, and
     // link.branch resolves a local target the same way it resolves an
     // exported one.
+    for (const auto& m : fj_mids_pending) {
+        if (vaddr_to_fj.count(m.first)) continue;   // a function start wins
+        char mn[64];
+        std::snprintf(mn, sizeof(mn), "__macapk_mid_%08x", m.first);
+        vaddr_to_fj[m.first] = link.define(mn, Sec::Text, m.second, false);
+    }
     if (!emitted.empty() && multi_entry_enabled()) {
         for (const Emitted& e : emitted) {
             for (const auto& en : e.entries) {
@@ -2300,6 +2708,7 @@ bool build_module(const Elf32Image& img,
         for (const auto& [pa, lt] : img.plt_local_bindings)
             plt_to_local[pa & ~1u] = lt;
     size_t plt_local_resolved = 0, plt_local_unlifted = 0;
+    size_t bl_live_sites = 0;
     // MACAPK_ARM32RC_PLT_RELOC_FIRST (default ON): a branch to a PLT stub goes
     // where the stub's R_ARM_JUMP_SLOT relocation says, even when discovery
     // also lifted the stub's own bytes as a function. On Android the stub is
@@ -2384,6 +2793,15 @@ bool build_module(const Elf32Image& img,
             if (lf != vaddr_to_sym.end() && !reloc_first) {
                 target_sym = lf->second;
                 have_local = true;
+                // MACAPK_ARM32RC_BL_LIVE_REGS: a direct `bl` to a function
+                // start enters without zeroing the callee's r4-r12 / r14.
+                if (s.is_call) {
+                    auto dc = vaddr_to_dcall.find(gt);
+                    if (dc != vaddr_to_dcall.end()) {
+                        target_sym = dc->second;
+                        ++bl_live_sites;
+                    }
+                }
             } else if (auto pl = plt_to_local.find(gt);
                        pl != plt_to_local.end()) {
                 // Intra-module PLT stub -> the local body its JUMP_SLOT binds.
@@ -2392,6 +2810,13 @@ bool build_module(const Elf32Image& img,
                     target_sym = lf2->second;
                     have_local = true;
                     ++plt_local_resolved;
+                    if (s.is_call) {
+                        auto dc = vaddr_to_dcall.find(pl->second & ~1u);
+                        if (dc != vaddr_to_dcall.end()) {
+                            target_sym = dc->second;
+                            ++bl_live_sites;
+                        }
+                    }
                 } else {
                     // Intra-module, but discovery never lifted the TARGET.
                     // That is a discovery gap, not an unknown address, and it
@@ -2476,6 +2901,32 @@ bool build_module(const Elf32Image& img,
                 }
             }
             if (reloc_first && target_sym != lf->second) ++plt_stub_sites_moved;
+            if (!s.is_call && e.frame_sites.count(s.insn_index)) {
+                // MACAPK_ARM32RC_FRAME_JUMP: this `b` was emitted WITHOUT the
+                // epilogue, so it must land on a body that shares our frame.
+                auto fj = vaddr_to_fj.find(gt);
+                if (fj != vaddr_to_fj.end()) {
+                    link.branch(Sec::Text, word_off, fj->second);
+                    ++fj_bound;
+                    continue;
+                }
+                // No body symbol after all: pop the frame here and continue
+                // the way the old code did (`mov w4, w27 ; epilogue ; b`).
+                a64::A64Buf t;
+                t.put(a64::mov_reg(false, X(HostGpr::X4), X(HostGpr::X27)));
+                DriverSink::emit_epilogue(t);
+                t.put(a64::b(0));
+                const std::vector<uint8_t> tb = t.bytes();
+                const uint64_t toff = link.add_text(tb.data(), tb.size(), 4);
+                link.branch(Sec::Text, toff + tb.size() - 4, target_sym);
+                char tn[64];
+                std::snprintf(tn, sizeof(tn), "__macapk_fjpop_%llx",
+                              static_cast<unsigned long long>(toff));
+                link.branch(Sec::Text, word_off,
+                            link.define(tn, Sec::Text, toff, false));
+                ++fj_thunked;
+                continue;
+            }
             link.branch(Sec::Text, word_off, target_sym);
         }
         // Per-target trampolines (above) are small (2 instructions
@@ -2488,6 +2939,24 @@ bool build_module(const Elf32Image& img,
     // generic resolved/stubbed tallies. `unlifted` is the interesting number:
     // it means the stub IS intra-module but discovery never produced a body
     // for its target, i.e. a discovery gap wearing a linker-resolution mask.
+    if (extend_falloff_enabled())
+        std::fprintf(stderr,
+                     "[arm32rc] extent repair: %zu extent(s) ended in straight-"
+                     "line code with no function after them and were extended "
+                     "to the next start, +%zu bytes (MACAPK_ARM32RC_EXTEND_FALLOFF)\n",
+                     extend_falloff_count().load(), extend_falloff_bytes().load());
+    if (frame_jump_enabled())
+        std::fprintf(stderr,
+                     "[arm32rc] frame jumps: %zu branch(es) between translated "
+                     "extents keep the frame and the registers, %zu fell back "
+                     "to a frame-pop thunk (MACAPK_ARM32RC_FRAME_JUMP)\n",
+                     fj_bound, fj_thunked);
+    if (bl_live_regs_enabled())
+        std::fprintf(stderr,
+                     "[arm32rc] direct-call entries: %zu function(s) have a "
+                     "non-zeroing entry, %zu direct bl site(s) bound to one "
+                     "(MACAPK_ARM32RC_BL_LIVE_REGS)\n",
+                     vaddr_to_dcall.size(), bl_live_sites);
     if (plt_local_resolved || plt_local_unlifted) {
         std::fprintf(stderr,
                      "[arm32rc] intra-module PLT: %zu call site(s) bound to "

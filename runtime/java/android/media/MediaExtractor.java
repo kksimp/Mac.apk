@@ -20,13 +20,36 @@ public final class MediaExtractor {
     // quarter-gigabyte-plus "audio" region to disk.
     private static final long MAX_SRC_BYTES = 256L << 20;
 
+    // AOSP creates the native JMediaExtractor in the constructor and only
+    // release() drops it; getMediaExtractor() == NULL is what the JNI turns into
+    // IllegalStateException. So "no data source yet" is NOT that state: asking an
+    // extractor that has no source for a track fails the range check
+    // (IllegalArgumentException), and only a released extractor throws
+    // IllegalStateException. mReleased models exactly that.
+    private boolean mReleased = false;
+
     public MediaExtractor() {}
 
     public void setDataSource(String path) throws java.io.IOException {
-        release();
+        // AOSP: MediaHTTPService.createHttpServiceBinderIfNecessary(path) calls
+        // path.startsWith(...) before the JNI is reached, so null is an NPE.
+        if (path == null) {
+            throw new NullPointerException("path == null");
+        }
+        if (mReleased) throw new IllegalStateException();
+        if (path.isEmpty()) {
+            throw new java.io.IOException("MediaExtractor: path cannot be empty");
+        }
+        closeSource();
         // Strip a file:// scheme; the native opener wants a filesystem path.
         String p = path;
-        if (p != null && p.startsWith("file://")) p = p.substring(7);
+        if (p.startsWith("file://localhost/")) {
+            p = p.substring(16);
+        } else if (p.startsWith("file://")) {
+            p = p.substring(7);
+        } else if (p.startsWith("file:/")) {
+            p = p.substring(5);
+        }
         mHandle = com.macapk.loader.NativeMedia.nativeDemuxOpen(p);
         if (mHandle == 0)
             throw new java.io.IOException("MediaExtractor: cannot open " + path);
@@ -52,7 +75,8 @@ public final class MediaExtractor {
     public void setDataSource(FileDescriptor fd, long offset, long length) throws java.io.IOException {
         if (fd == null || !fd.valid())
             throw new java.io.IOException("MediaExtractor: invalid FileDescriptor");
-        release();
+        if (mReleased) throw new IllegalStateException();
+        closeSource();
         // Deliberately NOT closed: the descriptor belongs to the caller (an
         // AssetFileDescriptor it may keep using), and a FileInputStream
         // adopted from an existing FileDescriptor registers no GC-time
@@ -102,13 +126,42 @@ public final class MediaExtractor {
     public void setDataSource(MediaDataSource source) {}
     public void setDataSource(android.content.Context context, android.net.Uri uri,
                               Map<String, String> headers) throws java.io.IOException {
-        if (uri != null && ("file".equals(uri.getScheme()) || uri.getScheme() == null))
-            setDataSource(uri.getPath());
+        if (uri == null) {
+            // AOSP dereferences uri.getScheme() first.
+            throw new NullPointerException("uri == null");
+        }
+        String scheme = uri.getScheme();
+        if ("content".equalsIgnoreCase(scheme)) {
+            android.content.res.AssetFileDescriptor afd = null;
+            try {
+                if (context != null && context.getContentResolver() != null) {
+                    afd = context.getContentResolver().openAssetFileDescriptor(uri, "r");
+                }
+            } catch (Exception ignored) {}
+            if (afd != null) {
+                try {
+                    setDataSource(afd);
+                    return;
+                } finally {
+                    try { afd.close(); } catch (Exception ignored) {}
+                }
+            }
+            throw new java.io.IOException("MediaExtractor: cannot open content URI " + uri);
+        }
+        if (scheme != null && !"file".equalsIgnoreCase(scheme)) {
+            throw new java.io.IOException("MediaExtractor: unsupported scheme " + scheme);
+        }
+        String path = uri.getPath();
+        if (path == null) {
+            throw new java.io.IOException("MediaExtractor: missing path in uri " + uri);
+        }
+        setDataSource(path);
     }
     // AOSP: a declared length below 0 means "the whole file", so it drops the
     // slice bounds entirely rather than passing a negative length down.
     public void setDataSource(android.content.res.AssetFileDescriptor afd) throws java.io.IOException {
-        if (afd == null) throw new IllegalArgumentException("afd == null");
+        // AOSP: Preconditions.checkNotNull(afd).
+        if (afd == null) throw new NullPointerException("afd == null");
         if (afd.getDeclaredLength() < 0) {
             setDataSource(afd.getFileDescriptor());
         } else {
@@ -125,8 +178,12 @@ public final class MediaExtractor {
     }
 
     public MediaFormat getTrackFormat(int index) {
+        if (mReleased)
+            throw new IllegalStateException();
+        int trackCount = getTrackCount();
+        if (index < 0 || index >= trackCount)
+            throw new IllegalArgumentException("Invalid track index: " + index + ", trackCount: " + trackCount);
         MediaFormat f = new MediaFormat();
-        if (mHandle == 0) return f;
         int fmt = com.macapk.loader.NativeMedia.nativeDemuxFormatId(mHandle);
         String mime = (fmt == 1) ? MediaFormat.MIMETYPE_AUDIO_AAC
                     : (fmt == 2) ? MediaFormat.MIMETYPE_AUDIO_MPEG
@@ -142,8 +199,21 @@ public final class MediaExtractor {
         return f;
     }
 
-    public void selectTrack(int index)   { mSelected = true; }
-    public void unselectTrack(int index) { mSelected = false; }
+    public void selectTrack(int index) {
+        if (mReleased)
+            throw new IllegalStateException();
+        if (index < 0 || index >= getTrackCount())
+            throw new IllegalArgumentException("Invalid track index: " + index);
+        mSelected = true;
+    }
+
+    public void unselectTrack(int index) {
+        if (mReleased)
+            throw new IllegalStateException();
+        if (index < 0 || index >= getTrackCount())
+            throw new IllegalArgumentException("Invalid track index: " + index);
+        mSelected = false;
+    }
 
     public boolean advance() {
         if (mHandle == 0) return false;
@@ -180,7 +250,15 @@ public final class MediaExtractor {
     public boolean hasCacheReachedEndOfStream() { return false; }
     public boolean getSampleCryptoInfo(MediaCodec.CryptoInfo info) { return false; }
 
+    /** AOSP release(): drops the native extractor; later calls that need it
+     *  throw IllegalStateException. */
     public void release() {
+        closeSource();
+        mReleased = true;
+    }
+
+    /** Closes the current data source only (what a second setDataSource does). */
+    private void closeSource() {
         if (mHandle != 0) { com.macapk.loader.NativeMedia.nativeDemuxClose(mHandle); mHandle = 0; }
         // Mirrors ext_close_demux in media_ndk.cpp: the spooled fd slice stays
         // alive only as long as the demuxer that reads it.

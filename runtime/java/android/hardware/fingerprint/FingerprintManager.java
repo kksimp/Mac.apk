@@ -1,8 +1,11 @@
 // android.hardware.fingerprint.FingerprintManager -- the deprecated
-// fingerprint API (pre-BiometricPrompt). Mac.apk has no fingerprint
-// hardware: isHardwareDetected/hasEnrolledFingerprints return false and
-// authenticate() reports FINGERPRINT_ERROR_HW_NOT_PRESENT. The nested
-// callback + CryptoObject types must exist for callers to compile.
+// fingerprint API (pre-BiometricPrompt). It is answered by the host
+// verification bridge (UserVerificationBridge, Touch ID through
+// LocalAuthentication) exactly as BiometricManager/BiometricPrompt are: the
+// hardware and enrollment answers are macOS's, and authenticate() shows the
+// real Touch ID prompt. On a Mac without Touch ID, or with the bridge turned
+// off for this app, it reports no hardware and FINGERPRINT_ERROR_HW_NOT_PRESENT.
+// A fingerprint-only API never falls back to the Mac password.
 package android.hardware.fingerprint;
 
 import android.os.CancellationSignal;
@@ -21,8 +24,14 @@ public class FingerprintManager {
 
     public FingerprintManager() {}
 
-    public boolean isHardwareDetected() { return false; }
-    public boolean hasEnrolledFingerprints() { return false; }
+    // BiometricManager codes: 0 success, 1 HW_UNAVAILABLE (e.g. locked out),
+    // 11 NONE_ENROLLED (hardware present), 12 NO_HARDWARE (also: bridge off).
+    private static int status() {
+        return com.macapk.loader.UserVerificationBridge.canAuthenticate(
+                com.macapk.loader.UserVerificationBridge.STRONG);
+    }
+    public boolean isHardwareDetected() { int r = status(); return r == 0 || r == 1 || r == 11; }
+    public boolean hasEnrolledFingerprints() { return status() == 0; }
 
     /** AOSP's real authenticate() (frameworks/base/core/java/android/hardware/
      *  fingerprint/FingerprintManager.java, useHandler()): "If a handler is
@@ -40,12 +49,20 @@ public class FingerprintManager {
         if (callback == null) return;
         android.os.Looper looper = (handler != null) ? handler.getLooper() : null;
         if (looper == null) looper = android.os.Looper.getMainLooper();
-        new Handler(looper).post(() -> {
-            try {
-                callback.onAuthenticationError(FINGERPRINT_ERROR_HW_NOT_PRESENT,
-                        "No fingerprint hardware");
-            } catch (Throwable ignored) {}
-        });
+        final Handler h = new Handler(looper);
+        // The bridge reports on the executor it is given, never inside this
+        // call, so every callback arrives on the looper as in AOSP. Its error
+        // codes are the FINGERPRINT_ERROR_* values (same numbers as
+        // BiometricPrompt's). STRONG only: no Mac-password fallback here.
+        com.macapk.loader.UserVerificationBridge.authenticate(
+                com.macapk.loader.UserVerificationBridge.STRONG, "Verify your identity",
+                crypto == null ? null : crypto.mCrypto, cancel, h::post,
+                (success, type, error, message) -> {
+                    try {
+                        if (success) callback.onAuthenticationSucceeded(new AuthenticationResult(crypto));
+                        else callback.onAuthenticationError(error, message);
+                    } catch (Throwable ignored) {}
+                });
     }
 
     public static abstract class AuthenticationCallback {

@@ -4638,6 +4638,41 @@ public final class MacApkPackageManager extends PackageManager {
         } else {
             f.add("android.hardware.ram.low");
         }
+        // ---- Telecom, for SELF-MANAGED calls (2026-11-12) ----------------
+        // FEATURE_TELECOM ("android.software.telecom", API 33+) is "the device
+        // supports the Telecom Service APIs"; FEATURE_CONNECTION_SERVICE
+        // ("android.software.connectionservice") is its pre-33 name for the
+        // ConnectionService API. Both are now backed end to end for
+        // self-managed accounts by android.telecom.SelfManagedTelecom:
+        // registerPhoneAccount stores the app's account, placeCall /
+        // addNewIncomingCall create the app's own ConnectionService and deliver
+        // onCreateOutgoingConnection / onCreateIncomingConnection on the main
+        // thread, and the account queries report what was registered.
+        //
+        // What this costs while absent, measured: OurFamilyWizard 2026.11.1
+        // (CallsFragment.doesDeviceSupportCalls) shows "This device is not
+        // capable of placing or receiving calls" unless one of telecom,
+        // telephony.calling, sip, sip.voip or telephony is declared.
+        //
+        // ⚠ KNOWN INCOMPLETENESS, notated rather than hidden: MANAGED calls
+        // (SIM/carrier accounts, a tel: placeCall with no self-managed handle)
+        // still refuse with UnsupportedOperationException, and FEATURE_TELEPHONY
+        // stays absent because there is no radio. A device with Telecom and no
+        // SIM is a real Android configuration (Wi-Fi tablets), so the pair is
+        // coherent.
+        //
+        // ⚠ AOSP DIVERGENCE this creates, for the maintainers' judgement:
+        // registerPhoneAccount documents UnsupportedOperationException only
+        // for a device WITHOUT FEATURE_TELECOM. With the feature reported, a
+        // third-party MANAGED account (CAPABILITY_CALL_PROVIDER, the kind a
+        // user must enable under Calling accounts) would register on a device
+        // but still throws here. Calling apps that probe Telecom wrap
+        // registration in try/catch and fall back, which is the path they took
+        // before this change, so the visible effect should be none. Not tested
+        // with an app that registers a managed account (Signal 8.35.2 registers
+        // none; Telegram and WhatsApp not tried).
+        f.add("android.software.telecom");
+        f.add("android.software.connectionservice");
         SYSTEM_FEATURES = java.util.Collections.unmodifiableSet(f);
     }
 
@@ -4657,6 +4692,15 @@ public final class MacApkPackageManager extends PackageManager {
         boolean has = version <= 0 && SYSTEM_FEATURES.contains(name);
         if (version <= 0 && "android.hardware.bluetooth_le".equals(name)) {
             has = BluetoothBridge.available();
+        }
+        // Touch ID is this device's fingerprint sensor, answered by the host
+        // verification bridge: present only when this app may use it AND the Mac
+        // has the hardware (a Mac without Touch ID, or the switch off, says no,
+        // as a phone without a sensor does). Hardware, not enrollment, so it is
+        // the same answer for the life of the process.
+        if (version <= 0 && "android.hardware.fingerprint".equals(name)) {
+            int r = UserVerificationBridge.canAuthenticate(UserVerificationBridge.STRONG);
+            has = r == 0 || r == 1 || r == 11;
         }
         // Guest Vulkan (Boot.noteGuestVulkan / bionic_shim_vulkan.cpp): an app
         // that gets libvulkan.so also sees the features that announce it, with
@@ -4995,6 +5039,7 @@ public final class MacApkPackageManager extends PackageManager {
         info.processName = macapkComponentProcess(entry.name);
         info.enabled     = entry.enabled;
         info.exported    = entry.exported;
+        info.permission  = entry.permission;
         if ((flags & GET_META_DATA) != 0 && !entry.metaData.isEmpty()) {
             android.os.Bundle md = new android.os.Bundle();
             for (Map.Entry<String, String> e : entry.metaData.entrySet()) {

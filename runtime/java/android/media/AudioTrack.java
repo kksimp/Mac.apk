@@ -445,7 +445,78 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
         return SUCCESS;
     }
 
+    // AudioTrack.SUPPORTED_OUT_CHANNELS (AOSP): every CHANNEL_OUT_* position bit
+    // except DEFAULT and the haptic bits. Values are AudioFormat's.
+    private static final int SUPPORTED_OUT_CHANNELS = 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80
+            | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x10000
+            | 0x20000 | 0x40000 | 0x80000 | 0x100000 | 0x200000 | 0x400000 | 0x800000
+            | 0x1000000 | 0x2000000 | 0x4000000 | 0x8000000;
+    // AOSP CHANNEL_PAIR_MAP values: positions that may only appear together.
+    private static final int[] CHANNEL_PAIRS = {
+        0x4 | 0x8,              // front
+        0x40 | 0x80,            // back
+        0x100 | 0x200,          // front of center
+        0x800 | 0x1000,         // side
+        0x4000 | 0x10000,       // top front
+        0x20000 | 0x80000,      // top back
+        0x100000 | 0x200000,    // top side
+        0x400000 | 0x1000000,   // bottom front
+        0x4000000 | 0x8000000,  // front wide
+    };
+
+    /** AudioFormat.isPublicEncoding. In the AOSP source checked, the public
+     *  encodings are exactly 2 (PCM_16BIT) through 44
+     *  (IAMF_BASE_ENHANCED_PROFILE_PCM); ENCODING_INVALID (0) and
+     *  ENCODING_DEFAULT (1) are not public. */
+    private static boolean isPublicEncoding(int enc) {
+        return enc >= 2 && enc <= 44;
+    }
+
+    /** AudioFormat.isEncodingLinearFrames: PCM, IEC61937 and DEFAULT. */
+    private static boolean isEncodingLinearFrames(int enc) {
+        return enc == 1 || enc == 2 || enc == 3 || enc == 4 || enc == 13 || enc == 21
+                || enc == 22;
+    }
+
+    /** AudioTrack.isMultichannelConfigSupported (AOSP). Only the compressed
+     *  24-channel limit is modelled: the PCM limit is the HAL's, and no mask
+     *  built from the supported positions exceeds it. */
+    private static boolean isMultichannelConfigSupported(int channelConfig, int encoding) {
+        if ((channelConfig & SUPPORTED_OUT_CHANNELS) != channelConfig) return false;
+        if (!isEncodingLinearFrames(encoding) && Integer.bitCount(channelConfig) > 24) {
+            return false;
+        }
+        if ((channelConfig & 0xC) != 0xC) return false; // FL/FR must be present
+        for (int pair : CHANNEL_PAIRS) {
+            if ((channelConfig & pair) != 0 && (channelConfig & pair) != pair) return false;
+        }
+        return true;
+    }
+
+    // AOSP AudioTrack.getMinBufferSize validation order: channel config, then
+    // isPublicEncoding, then the sample rate range; every failure is
+    // ERROR_BAD_VALUE. The size itself is native on AOSP (HAL dependent).
     public static int getMinBufferSize(int sampleRateInHz, int channelConfig, int audioFormat) {
+        switch (channelConfig) {
+            case 0x4:   // CHANNEL_OUT_MONO
+            case 2:     // CHANNEL_CONFIGURATION_MONO
+            case 0xc:   // CHANNEL_OUT_STEREO
+            case 3:     // CHANNEL_CONFIGURATION_STEREO
+                break;
+            default:
+                if (!isMultichannelConfigSupported(channelConfig, audioFormat)) {
+                    return ERROR_BAD_VALUE;
+                }
+        }
+        if (!isPublicEncoding(audioFormat)) {
+            return ERROR_BAD_VALUE;
+        }
+        // AudioFormat.SAMPLE_RATE_HZ_MIN/MAX come from native code on AOSP
+        // (4000..192000 on the platform builds we compare against; the value
+        // is not in the Java sources, so it is carried from AudioRecord here).
+        if (sampleRateInHz < 4000 || sampleRateInHz > 192000) {
+            return ERROR_BAD_VALUE;
+        }
         int ch  = channelsFromConfig(channelConfig);
         int bps = bytesPerSample(normalizeEncoding(audioFormat));
         // ~ minimum sane buffer: 25 ms, floored so callers that multiply it

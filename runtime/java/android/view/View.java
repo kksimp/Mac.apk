@@ -2300,12 +2300,29 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         // Intentionally empty.
     }
 
-    public void setScrollBarFadeDuration(int duration) {}
-    public int  getScrollBarFadeDuration() { return 0; }
-    public void setScrollBarDefaultDelayBeforeFade(int delay) {}
-    public int  getScrollBarDefaultDelayBeforeFade() { return 0; }
-    public void setScrollBarSize(int size) {}
-    public int  getScrollBarSize() { return 0; }
+    // AOSP keeps these in a lazily created ScrollabilityCache; until one exists
+    // (no setter called, no scrollbar attribute read) the getters answer from
+    // ViewConfiguration: getScrollBarFadeDuration() (250), getScrollDefaultDelay()
+    // (300) and get(mContext).getScaledScrollBarSize(). Boxed so "never set" is
+    // distinguishable from an explicit 0.
+    private Integer mScrollBarFadeDuration;
+    private Integer mScrollBarDefaultDelayBeforeFade;
+    private Integer mScrollBarSize;
+    public void setScrollBarFadeDuration(int duration) { mScrollBarFadeDuration = duration; }
+    public int  getScrollBarFadeDuration() {
+        return mScrollBarFadeDuration == null ? ViewConfiguration.getScrollBarFadeDuration()
+                : mScrollBarFadeDuration;
+    }
+    public void setScrollBarDefaultDelayBeforeFade(int delay) { mScrollBarDefaultDelayBeforeFade = delay; }
+    public int  getScrollBarDefaultDelayBeforeFade() {
+        return mScrollBarDefaultDelayBeforeFade == null ? ViewConfiguration.getScrollDefaultDelay()
+                : mScrollBarDefaultDelayBeforeFade;
+    }
+    public void setScrollBarSize(int size) { mScrollBarSize = size; }
+    public int  getScrollBarSize() {
+        return mScrollBarSize == null ? ViewConfiguration.get(mContext).getScaledScrollBarSize()
+                : mScrollBarSize;
+    }
     /** AOSP View.setVerticalScrollbarThumbDrawable (android11-release
      *  View.java:6792-6795): routes through mScrollCache.scrollBar (a
      *  ScrollBarDrawable) which this file never allocates (see the
@@ -2388,15 +2405,14 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     public int  getImportantForContentCapture() { return importantForContentCapture; }
     public void setImportantForContentCapture(int mode) { importantForContentCapture = mode; }
     /** AOSP API-29+ `View.getContentCaptureSession()`. Returns the
-     *  ContentCaptureSession this view should report to, or null if
-     *  ContentCapture isn't enabled. Mac.apk has no ContentCapture
-     *  pipeline, so always null. F-Droid's RecyclerView+ViewHolder
-     *  bind path calls this reflectively and NPEs at class-link time
-     *  if the method is missing. */
+     *  ContentCaptureSession explicitly set on this view, or null if none. */
+    private android.view.contentcapture.ContentCaptureSession mContentCaptureSession;
     public android.view.contentcapture.ContentCaptureSession getContentCaptureSession() {
-        return null;
+        return mContentCaptureSession;
     }
-    public void setContentCaptureSession(android.view.contentcapture.ContentCaptureSession session) {}
+    public void setContentCaptureSession(android.view.contentcapture.ContentCaptureSession session) {
+        mContentCaptureSession = session;
+    }
 
     // Accessibility-importance (API 16+). Same shape.
     public static final int IMPORTANT_FOR_ACCESSIBILITY_AUTO = 0;
@@ -3350,8 +3366,9 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     // View.setPointerIcon(PointerIcon) via reflectionless direct
     // invokevirtual; the JVM resolves by exact signature so we need
     // the PointerIcon-typed overload, not just Object. v1.0.95.
-    public void setPointerIcon(android.view.PointerIcon icon) {}
-    public android.view.PointerIcon getPointerIcon() { return null; }
+    private android.view.PointerIcon mPointerIcon;
+    public void setPointerIcon(android.view.PointerIcon icon) { mPointerIcon = icon; }
+    public android.view.PointerIcon getPointerIcon() { return mPointerIcon; }
     public android.view.PointerIcon onResolvePointerIcon(android.view.MotionEvent event, int pointerIndex) { return null; }
 
     // API 26+: setTooltipText / getTooltipText. Called via
@@ -3388,10 +3405,12 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     }
 
     // API 23+: setForegroundTintList / Mode.
-    public void setForegroundTintList(android.content.res.ColorStateList tint) {}
-    public android.content.res.ColorStateList getForegroundTintList() { return null; }
-    public void setForegroundTintMode(android.graphics.PorterDuff.Mode mode) {}
-    public android.graphics.PorterDuff.Mode getForegroundTintMode() { return null; }
+    private android.content.res.ColorStateList mForegroundTintList;
+    private android.graphics.PorterDuff.Mode mForegroundTintMode;
+    public void setForegroundTintList(android.content.res.ColorStateList tint) { mForegroundTintList = tint; }
+    public android.content.res.ColorStateList getForegroundTintList() { return mForegroundTintList; }
+    public void setForegroundTintMode(android.graphics.PorterDuff.Mode mode) { mForegroundTintMode = mode; }
+    public android.graphics.PorterDuff.Mode getForegroundTintMode() { return mForegroundTintMode; }
 
     // API 21+: setBackgroundTintList / Mode. AOSP applies the tint as
     // a PorterDuff SRC_IN over the background drawable -- for the
@@ -3461,8 +3480,13 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     public android.content.res.ColorStateList getBackgroundTintList() {
         return macapkBackgroundTintList;
     }
-    public void setBackgroundTintMode(android.graphics.PorterDuff.Mode mode) {}
-    public android.graphics.PorterDuff.Mode getBackgroundTintMode() { return null; }
+    private android.graphics.PorterDuff.Mode macapkBackgroundTintMode;
+    public void setBackgroundTintMode(android.graphics.PorterDuff.Mode mode) {
+        this.macapkBackgroundTintMode = mode;
+    }
+    public android.graphics.PorterDuff.Mode getBackgroundTintMode() {
+        return macapkBackgroundTintMode;
+    }
 
     // (setElevation / getElevation already defined elsewhere)
     // AOSP signature takes android.animation.StateListAnimator -- the APK's
@@ -3485,8 +3509,9 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     }
 
     // API 30+: setForceDarkAllowed.
-    public void setForceDarkAllowed(boolean allow) {}
-    public boolean isForceDarkAllowed() { return false; }
+    private boolean mForceDarkAllowed = true;
+    public void setForceDarkAllowed(boolean allow) { mForceDarkAllowed = allow; }
+    public boolean isForceDarkAllowed() { return mForceDarkAllowed; }
 
     // Layout-change listener (API 11+). Material widgets, androidx (Kotlin
     // doOnLayout / doOnNextLayout, SearchView, CarouselLayoutManager,
@@ -9885,11 +9910,9 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     // ---- tint blend modes (API 29) -------------------------------------------
     // AOSP keeps ONE tint mode per drawable slot: setBackgroundTintMode(
     // PorterDuff.Mode) converts to a BlendMode and writes the same
-    // TintInfo.mBlendMode this pair reads. Mac.apk's PorterDuff pair predates
-    // this and is a documented no-op/null (see setBackgroundTintMode above); the
-    // two are deliberately NOT wired together here, because making the
-    // PorterDuff getter start answering would change behaviour every Canvas-tier
-    // app already depends on. See the lane report.
+    // TintInfo.mBlendMode this pair reads. Mac.apk keeps mBackgroundTintBlendMode
+    // separate from macapkBackgroundTintMode so Canvas-tier callers setting
+    // only BlendMode do not see the PorterDuff getter change underneath them.
     private android.graphics.BlendMode mBackgroundTintBlendMode;
     private android.graphics.BlendMode mForegroundTintBlendMode;
     public void setBackgroundTintBlendMode(android.graphics.BlendMode blendMode) {

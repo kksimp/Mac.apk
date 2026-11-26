@@ -737,6 +737,9 @@ static const std::unordered_set<std::string> kSoftFloatDoubleImports = {
     // for a symbol nothing currently needs is exactly the kind of unverified
     // work the project's own rules ask us not to ship speculatively.
     "atoll", "strtoll", "strtoull",
+    // strtoimax / strtoumax (GitHub #140): intmax_t is 64 bits on LP32 Bionic,
+    // same r0:r1 delivery as strtoll / strtoull.
+    "strtoimax", "strtoumax",
 };
 
 // v1.0.1655: MACAPK_ARM32_SOFTFP_ATOF (default ON; =0 restores the old
@@ -821,6 +824,22 @@ static bool is_arm32_rwlock_import(const std::string& nm) {
         "flockfile", "funlockfile", "ftrylockfile",
         "fseeko", "ftello", "popen", "pclose", "asprintf", "vasprintf",
         "eglGetProcAddress", "fscanf", "vfscanf", "tmpfile",
+    };
+    return k.count(nm) != 0;
+}
+// MACAPK_ARM32_FDPATH_SHIM (v1.0.2380, default ON; =0 binds exactly as before, i.e. libSystem's bare
+// names). The fd / path / lock / misc libc calls below had no ARM32 twin, so a direct call handed
+// libSystem guest vaddrs, Linux fcntl commands and ILP32 structs, and a function POINTER to one never
+// bound at all (the data-import link gives no host fallback to a HostDlsym-tier name), which left nine
+// entries of SQLite's aSyscall[] table NULL in SQLCipher's libsqlcipher.so. Bodies and the per-call
+// layout notes: bionic_shim.cpp "ARM32 fd / path / lock / misc libc twins". A separate set, like the
+// rwlock family, so =0 is a real escape.
+static bool is_arm32_fdpath_import(const std::string& nm) {
+    static const bool on = arm32_gap_gate_on("MACAPK_ARM32_FDPATH_SHIM");
+    if (!on) return false;
+    static const std::set<std::string> k = {
+        "ftruncate", "fcntl", "fchmod", "fchown", "unlink", "rmdir", "readlink", "geteuid",
+        "mremap", "sysconf", "gmtime_r", "utimes", "mlock", "munlock", "sigprocmask",
     };
     return k.count(nm) != 0;
 }
@@ -4276,6 +4295,10 @@ int run_pipeline(const std::string& in_path,
         }();
         std::set<uint32_t> literal_pool_bytes_arm;  // ARM-mode pool starts (4 or 8 byte ranges)
         std::set<uint32_t> literal_pool_bytes_thumb;  // Thumb-mode pool starts
+        static const bool s_pool_aligned = [] {
+            const char* e = std::getenv("MACAPK_ARM32_POOL_ALIGNED");
+            return !(e && e[0] == '0' && e[1] == '\0');
+        }();
         // Helper: mark `count` bytes starting at addr as literal pool.
         auto mark_pool = [](std::set<uint32_t>& out,
                             uint32_t addr, uint32_t count) {
@@ -4330,6 +4353,24 @@ int run_pipeline(const std::string& in_path,
                     bool U = (insn >> 23) & 1;
                     uint32_t target = U ? (pc_value + imm12)
                                         : (pc_value - imm12);
+                    // MACAPK_ARM32_POOL_ALIGNED (default ON; =0 marks as
+                    // before): a WORD literal sits on a 4-byte boundary.
+                    // The ARM-mode pc is word-aligned, so a real `ldr
+                    // rX, [pc, #imm]` of a pool entry has imm % 4 == 0 --
+                    // every assembler and linker aligns .word / constant
+                    // islands to 4 (ELF for the ARM Architecture IHI 0044,
+                    // 4.4.7: literal data in code is marked $d and word
+                    // data is word-aligned). An UNALIGNED target is this
+                    // sweep reading DATA as an instruction. The one that
+                    // mattered: OpenSSL's AES tables live in .text, and the
+                    // Te word 0x259f9fba at 0xdba18 of SQLCipher's
+                    // libsqlcipher.so reads as `ldrcs r9, [pc, #0xfba]`,
+                    // marking 0xdc9da..0xdc9dd -- the middle of
+                    // _armv4_AES_decrypt's first round. The lifter stopped
+                    // at that "pool", so the routine was translated as its
+                    // first 39 instructions and a return, and every
+                    // single-block AES_decrypt gave garbage.
+                    if (s_pool_aligned && (target & 3u) != 0) continue;
                     mark_pool(literal_pool_bytes_arm, target, 4);
                     continue;
                 }
@@ -4342,6 +4383,7 @@ int run_pipeline(const std::string& in_path,
                     bool U = (insn >> 23) & 1;
                     uint32_t target = U ? (pc_value + imm8)
                                         : (pc_value - imm8);
+                    if (s_pool_aligned && (target & 3u) != 0) continue;
                     mark_pool(literal_pool_bytes_arm, target, 8);
                     continue;
                 }
@@ -4407,6 +4449,9 @@ int run_pipeline(const std::string& in_path,
                     bool U = (hw1 >> 7) & 1;
                     uint32_t target = U ? (pc_aligned + imm12)
                                         : (pc_aligned - imm12);
+                    // MACAPK_ARM32_POOL_ALIGNED: same rule for the Thumb-2
+                    // LDR.W word load (Align(PC,4) + imm12, so imm12 % 4).
+                    if (s_pool_aligned && (target & 3u) != 0) continue;
                     mark_pool(literal_pool_bytes_thumb, target, 4);
                     continue;
                 }
@@ -4982,6 +5027,22 @@ int run_pipeline(const std::string& in_path,
         // mid-body. (A duplicate definition follows in the prologue-scan
         // section -- mode-dependent helpers there use it.) The body is
         // exactly the same as the late copy; keep them in sync.
+        // MACAPK_ARM32_TERM_ARM_NOP_HINT / MACAPK_ARM32_TERM_POOL_WALK_THUMB:
+        // see their uses in is_preceded_by_terminator_in_context (default ON).
+        auto term_arm_nop_hint_on = []() {
+            static const bool on = [](){
+                const char* e = std::getenv("MACAPK_ARM32_TERM_ARM_NOP_HINT");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            return on;
+        };
+        auto term_pool_walk_thumb_on = []() {
+            static const bool on = [](){
+                const char* e = std::getenv("MACAPK_ARM32_TERM_POOL_WALK_THUMB");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            return on;
+        };
         auto is_preceded_by_terminator_early =
                 [&](uint32_t vaddr, bool is_thumb) -> bool {
             if (is_thumb) {
@@ -5320,11 +5381,12 @@ int run_pipeline(const std::string& in_path,
         size_t term_noreturn_plt_hits = 0, term_pool_walk_hits = 0;
         auto is_preceded_by_terminator_in_context =
                 [&](uint32_t vaddr, bool candidate_is_thumb = false,
-                    bool fnptr_seed = false) -> bool {
+                    bool fnptr_seed = false, bool legacy_walk = false) -> bool {
             uint32_t check_addr = vaddr;
             // MACAPK_ARM32_TERM_POOL_WALK: provable pool words stepped over
             // beyond the historical 8-step budget (seed site only).
             int pool_walk_extra = 0;
+            int nop_free = 0;
             // MACAPK_ARM32_TERM_THUMB_SEED: the seed's own tag AND its own
             // bytes say "Thumb function entry" (see the gate's declaration).
             const bool thumb_entry_evidence = term_thumb_seed_on
@@ -5446,6 +5508,9 @@ int run_pipeline(const std::string& in_path,
                 if ((hw == 0xbf00 || hw == 0x46c0)   // Thumb-16 NOPs
                     && !thumb_hw_is_second_half(img, check_addr - 2)) {
                     check_addr -= 2;
+                    if (fnptr_seed && !legacy_walk && term_arm_nop_hint_on() && nop_free < 64) {
+                        ++nop_free; --steps;   // padding is not evidence
+                    }
                     continue;
                 }
                 // MACAPK_ARM32_TERM_NOPW: the Thumb-2 NOP (see the gate's
@@ -5471,6 +5536,26 @@ int run_pipeline(const std::string& in_path,
                                       | (uint32_t(pre4[3]) << 24);
                         if (insn == 0xe1a00000) {  // ARM NOP
                             check_addr -= 4;
+                            continue;
+                        }
+                        // MACAPK_ARM32_TERM_ARM_NOP_HINT (default ON; =0 is the old
+                        // walk). The architectural A32 NOP hint is 0xe320f000
+                        // (ARM ARM DDI 0406C.d A8.8.119, encoding A1, cond AL);
+                        // `mov r0,r0` (0xe1a00000, above) is only the pre-ARMv6K
+                        // spelling. Modern GNU ld/gas pad ARM functions with the
+                        // hint (OpenSSL's .align 4 after OPENSSL_instrument_bus2),
+                        // and the walk stopped at it: the function after the
+                        // padding was never accepted as a function-pointer seed,
+                        // never translated, and an indirect call to it logged
+                        // "indirect call to in-image vaddr 0xac500". That is
+                        // OpenSSL's obj_name_cmp, the lhash COMPARE callback, which
+                        // therefore always returned 0 (e-Anatomy lane 3).
+                        if (insn == 0xe320f000u && term_arm_nop_hint_on() && !legacy_walk) {
+                            check_addr -= 4;
+                            // Padding is not evidence: do not spend the 8-step
+                            // budget on it (a 7-word `.align` pad plus one
+                            // literal word exhausted it).
+                            if (fnptr_seed && nop_free < 64) { ++nop_free; --steps; }
                             continue;
                         }
                         // Walk back through literal-pool-looking
@@ -5500,7 +5585,9 @@ int run_pipeline(const std::string& in_path,
                             // spending it, up to 1024 words (seed site only).
                             if (fnptr_seed && term_pool_walk_on && steps == 7
                                     && pool_walk_extra < 1024
-                                    && literal_pool_bytes_arm.count(check_addr - 4)) {
+                                    && (literal_pool_bytes_arm.count(check_addr - 4)
+                                        || (!legacy_walk && term_pool_walk_thumb_on()
+                                            && literal_pool_bytes_thumb.count(check_addr - 4)))) {
                                 ++pool_walk_extra;
                                 --steps;
                             }
@@ -6512,7 +6599,55 @@ int run_pipeline(const std::string& in_path,
                         ? "PIC-scan (terminator-checked)"
                         : "R_ARM_RELATIVE/exidx");
             }
-            data_seed_to_lift.emplace_back(v_clean, thumb);
+            {
+                const bool ext_only = !bypass_terminator_check &&
+                    !is_preceded_by_terminator_in_context(v_clean, thumb, true, true);
+                if (ext_only) {
+                    // The extended walk-back (padding and provable Thumb pool words do not
+                    // spend the step budget) alone is too permissive: a basic block after
+                    // an intra-function `b` and a few pool words passes it. Admit such a
+                    // seed only with evidence at the seed itself: alignment padding (NOP
+                    // hint / NOP) directly in front of it, or a `push {..,lr}` as one of its
+                    // first two instructions (the PIC literal load is often scheduled above
+                    // the push). Without it the seed stays rejected, as before.
+                    auto rdh = [&](uint32_t a) -> int {
+                        auto c = img.code_at(a, 2);
+                        return c.size() == 2 ? int(uint16_t(c[0]) | (uint16_t(c[1]) << 8)) : -1;
+                    };
+                    auto rdw = [&](uint32_t a) -> int64_t {
+                        auto c = img.code_at(a, 4);
+                        return c.size() == 4 ? int64_t(uint32_t(c[0]) | (uint32_t(c[1]) << 8) |
+                                                       (uint32_t(c[2]) << 16) | (uint32_t(c[3]) << 24)) : -1;
+                    };
+                    bool evidence = false;
+                    if (thumb) {
+                        const int p2 = v_clean >= 2 ? rdh(v_clean - 2) : -1;
+                        if (p2 == 0xbf00 || p2 == 0x46c0) evidence = true;
+                        if (!evidence && v_clean >= 4 && rdh(v_clean - 4) == 0xf3af && p2 == 0x8000) evidence = true;
+                        if (!evidence) {
+                            if (opens_with_thumb_push_lr(v_clean)) evidence = true;
+                            const int h0 = rdh(v_clean);
+                            if (!evidence && h0 >= 0 && (h0 & 0xf800) == 0x4800 &&
+                                opens_with_thumb_push_lr(v_clean + 2)) evidence = true;
+                            if (!evidence && h0 == 0xf8df && opens_with_thumb_push_lr(v_clean + 4)) evidence = true;
+                        }
+                    } else {
+                        const int64_t pw = v_clean >= 4 ? rdw(v_clean - 4) : -1;
+                        if (pw == 0xe320f000LL || pw == 0xe1a00000LL) evidence = true;
+                        if (!evidence) {
+                            if (opens_with_arm_push_lr(v_clean)) evidence = true;
+                            const int64_t w0 = rdw(v_clean);
+                            if (!evidence && w0 >= 0 && (w0 & 0x0f7f0000) == 0x051f0000 &&
+                                opens_with_arm_push_lr(v_clean + 4)) evidence = true;
+                        }
+                    }
+                    if (!evidence && img.exidx_fn_starts.count(v_clean)) evidence = true;   // linker-verified start
+                    if (!evidence) continue;
+                    data_seed_to_lift.emplace_back(v_clean, thumb);
+                } else {
+                    data_seed_to_lift.emplace_back(v_clean, thumb);
+                }
+            }
         }
         if (seed_exidx_confirm_on) {
             std::fprintf(stderr,
@@ -6692,6 +6827,14 @@ int run_pipeline(const std::string& in_path,
             static const bool on = [] {
                 const char* e = std::getenv("MACAPK_ARM32_PRO_SCAN_ARM_CONTEXT");
                 return !(e && *e == '0');
+            }();
+            return on;
+        };
+        size_t pro_scan_thumb_context_rejects = 0;
+        auto pro_scan_thumb_context_on = []() {
+            static const bool on = [](){
+                const char* e = std::getenv("MACAPK_ARM32_PRO_SCAN_THUMB_CONTEXT");
+                return !(e && e[0] == '0' && e[1] == '\0');
             }();
             return on;
         };
@@ -7072,6 +7215,70 @@ int run_pipeline(const std::string& in_path,
             reach_trim_bytes += size - trimmed;
             return trimmed;
         };
+        // Evidence that something references an address as a code entry: a Thumb
+        // BL / BLX / B.W immediate (decoded exactly as is_preceded_by_terminator_early
+        // does), an A32 B/BL (arm_b_targets, filled below), a data / relocation /
+        // PC-relative function-pointer seed, an .ARM.exidx function start, or a raw
+        // word in a non-executable segment that points into code. Built lazily once.
+        // Over-approximate on purpose: a false reference only keeps the old behaviour.
+        std::unordered_set<uint32_t> pro_scan_refs;
+        bool pro_scan_refs_built = false;
+        auto pro_scan_referenced = [&](uint32_t va) -> bool {
+            if (!pro_scan_refs_built) {
+                pro_scan_refs_built = true;
+                for (uint32_t v : data_fnptr_seeds_all) pro_scan_refs.insert(v & ~1u);
+                for (uint32_t v : img.exidx_fn_starts) pro_scan_refs.insert(v & ~1u);
+                for (uint32_t v : arm_b_targets) pro_scan_refs.insert(v & ~1u);
+                // Blind A32 B/BL decode (no symbol-table ISA filter): ARM functions
+                // that sit in a gap between Thumb symbols (libjingle's compiler-rt
+                // ARM helpers) are only referenced by other ARM code that the ISA
+                // lookup also files under Thumb, so arm_b_targets misses them.
+                for (const auto& sg : img.loadable) {
+                    if (!sg.executable) continue;
+                    const auto& bs = sg.bytes;
+                    for (size_t o = 0; o + 4 <= bs.size(); o += 4) {
+                        const uint32_t pva = sg.vaddr + uint32_t(o);
+                        if (!in_code_section(pva)) continue;
+                        const uint32_t w = uint32_t(bs[o]) | (uint32_t(bs[o+1]) << 8)
+                                         | (uint32_t(bs[o+2]) << 16) | (uint32_t(bs[o+3]) << 24);
+                        if ((w >> 28) == 0xfu || (w & 0x0e000000u) != 0x0a000000u) continue;
+                        int32_t imm24 = int32_t(w & 0x00ffffffu);
+                        if (imm24 & 0x00800000) imm24 |= int32_t(0xff000000u);
+                        pro_scan_refs.insert((pva + 8 + uint32_t(imm24 << 2)) & ~1u);
+                    }
+                }
+                for (const auto& sg : img.loadable) {
+                    const auto& bs = sg.bytes;
+                    if (sg.executable) {
+                        for (size_t o = 0; o + 4 <= bs.size(); o += 2) {
+                            const uint32_t lo = uint32_t(bs[o]) | (uint32_t(bs[o + 1]) << 8);
+                            const uint32_t hi = uint32_t(bs[o + 2]) | (uint32_t(bs[o + 3]) << 8);
+                            if ((lo & 0xf800u) != 0xf000u) continue;
+                            const bool bl = (hi & 0xd000u) == 0xd000u;
+                            const bool blx = (hi & 0xd001u) == 0xc000u;
+                            const bool bw = (hi & 0xd000u) == 0x9000u;
+                            if (!(bl || blx || bw)) continue;
+                            const uint32_t sb = (lo >> 10) & 1u, imm10 = lo & 0x3ffu;
+                            const uint32_t j1 = (hi >> 13) & 1u, j2 = (hi >> 11) & 1u;
+                            const uint32_t imm11 = hi & 0x7ffu;
+                            const uint32_t i1 = (~(j1 ^ sb)) & 1u, i2 = (~(j2 ^ sb)) & 1u;
+                            int32_t off = int32_t((i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm11 << 1));
+                            if (sb) off |= int32_t(0xff000000u);
+                            uint32_t t = sg.vaddr + uint32_t(o) + 4u + uint32_t(off);
+                            if (blx) t &= ~3u;
+                            pro_scan_refs.insert(t & ~1u);
+                        }
+                    } else {
+                        for (size_t o = 0; o + 4 <= bs.size(); o += 4) {
+                            const uint32_t w = uint32_t(bs[o]) | (uint32_t(bs[o + 1]) << 8)
+                                             | (uint32_t(bs[o + 2]) << 16) | (uint32_t(bs[o + 3]) << 24);
+                            if (in_code_section(w & ~1u)) pro_scan_refs.insert(w & ~1u);
+                        }
+                    }
+                }
+            }
+            return pro_scan_refs.count(va & ~1u) != 0;
+        };
         for (const auto& seg : img.loadable) {
             if (!seg.executable) continue;
             const uint8_t* base = seg.bytes.data();
@@ -7114,6 +7321,29 @@ int run_pipeline(const std::string& in_path,
                     is_arm_pro = push_w || push_lr_only || sub_sp;
                 }
                 if (!(is_thumb_pro || is_arm_pro)) continue;
+                // MACAPK_ARM32_PRO_SCAN_THUMB_CONTEXT (default ON; =0 is the old
+                // scan). The mirror of ARM_CONTEXT above: a Thumb-2 `push.w`
+                // (halfwords e92d,XXXX) read as an ARM word two bytes earlier is
+                // [YY YY 2d e9], an ARM `stmdb sp!,{..}` whatever YYYY is, so a
+                // 4-aligned address two bytes before a push.w passes the ARM
+                // push pattern. In code the symbol table says is Thumb it is an
+                // instruction boundary inside a function. libsqlcipher's
+                // sqlite3Malloc (`adds.w; adc; movs r1,#0; push.w`) was capped
+                // at 0x37380 to its first two instructions by exactly this, so
+                // it returned its size argument as the pointer and every sqlite
+                // allocation was NOMEM (e-Anatomy "Could not open database").
+                if (is_arm_pro && !is_thumb_pro && pro_scan_thumb_context_on()) {
+                    auto m = lookup_is_thumb(va);
+                    // A candidate something POINTS at is a real entry whatever its
+                    // bytes look like (a Thumb function that opens with a halfword
+                    // and then a push.w is called by its first halfword). Only an
+                    // unreferenced coincidence is vetoed; a referenced one keeps
+                    // the old behaviour exactly.
+                    if (m && *m && !pro_scan_referenced(va)) {
+                        ++pro_scan_thumb_context_rejects;
+                        continue;
+                    }
+                }
                 // CRITICAL: require terminator-precedence. Without
                 // this, intra-function pushes to save callee-saved
                 // regs around an arg-passing call site get marked
@@ -7230,6 +7460,11 @@ int run_pipeline(const std::string& in_path,
         // MACAPK_ARM32_PRO_SCAN_ARM_CONTEXT is self-describing. With =0 the line
         // is not printed, so that arm's stderr is the old one.
         const size_t pro_scan_arm_context_rejects_boundary = pro_scan_arm_context_rejects;
+        if (pro_scan_thumb_context_rejects)
+            std::fprintf(stderr,
+                "[translator] prologue scan: %zu ARM-push coincidence(s) in Thumb "
+                "context rejected (MACAPK_ARM32_PRO_SCAN_THUMB_CONTEXT)\n",
+                pro_scan_thumb_context_rejects);
         if (pro_scan_arm_context_on()) {
             std::fprintf(stderr,
                 "[translator] prologue scan: %zu Thumb-push coincidence(s) in ARM "
@@ -7856,8 +8091,9 @@ int run_pipeline(const std::string& in_path,
         // a known lifted range BEFORE we look at fnptr seeds, so
         // `inside_any_known_body` filters out the mid-function
         // candidates.
-        for (auto [vaddr, is_thumb] : data_seed_to_lift) {
-            if (known_starts.count(vaddr)) continue;
+        // Lifts one data-fnptr seed (the former loop body, unchanged).
+        auto lift_data_seed = [&](uint32_t vaddr, bool is_thumb) {
+            if (known_starts.count(vaddr)) return;
             // Re-check inside-known-body in case BL/synth round 1
             // committed a synth whose body now covers this vaddr.
             // This is the load-bearing filter for the HCR
@@ -7940,7 +8176,7 @@ int run_pipeline(const std::string& in_path,
                         "[translator] data fnptr seed skip 0x%x: "
                         "inside known function body\n", vaddr);
                 }
-                continue;
+                return;
             }
             // Pure-thrower override before lifting.
             if (emit_stub_synth(vaddr) || emit_veneer_synth(vaddr) || emit_path_remap_synth(vaddr) || emit_pure_thrower_synth(vaddr)) {
@@ -7948,10 +8184,10 @@ int run_pipeline(const std::string& in_path,
                 known_thumb[vaddr] = is_thumb;
                 ++discovered_init;
                 ++lifted;
-                continue;
+                return;
             }
             const auto* seg = exec_segment_for(vaddr);
-            if (!seg) continue;
+            if (!seg) return;
             uint32_t seg_end = seg->vaddr + seg->bytes.size();
             // v1.0.57: walk past bogus known_starts entries.
             // Resolve the mode BEFORE sizing: the extent walker needs to know
@@ -7965,7 +8201,7 @@ int run_pipeline(const std::string& in_path,
             }();
             uint32_t end = next_real_function_start(
                 anticipated_starts, vaddr, seg_end, mode_arm_hint);
-            if (end <= vaddr) continue;
+            if (end <= vaddr) return;
             uint32_t size = end - vaddr;
             const uint32_t size_raw = size;
             if (size > 0x4000) { ++g_size_clamp_hits; size = 0x4000; }
@@ -7977,7 +8213,7 @@ int run_pipeline(const std::string& in_path,
                         "[translator] data fnptr seed skip 0x%x (thumb=%d): %s\n",
                         vaddr, int(is_thumb), lf.error.c_str());
                 }
-                continue;
+                return;
             }
             module_ir << lf.ir_body;
             known_starts.insert(vaddr);
@@ -7989,7 +8225,8 @@ int run_pipeline(const std::string& in_path,
             // than the BL-target round-trip.
             ++discovered_init;
             ++lifted;
-        }
+        };
+        for (auto [vaddr, is_thumb] : data_seed_to_lift) lift_data_seed(vaddr, is_thumb);
 
         // ------------------------------------------------------------
         // Prologue scan: pick up unsymbolled functions reached only via
@@ -9267,6 +9504,7 @@ int run_pipeline(const std::string& in_path,
                     kPointerAwareImports.count(nm) ||
                     is_arm32_env_writer_import(nm) ||
                     is_arm32_rwlock_import(nm) ||
+                    is_arm32_fdpath_import(nm) ||
                     is_softfloat_double_import(nm) ||
                     kSoftFloatFloatImports.count(nm)) {
                     // MACAPK_ARM32_SOFTFP_ATOF: atof/strtod bind their

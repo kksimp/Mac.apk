@@ -217,13 +217,88 @@ public class ContentResolver {
         p.macapkEnforceRead(uri);
         return p.query(uri, projection, queryArgs, cancellationSignal);
     }
+    /** AOSP ContentResolver.OpenResourceIdResult (@hide): the Resources and the
+     *  id an android.resource: Uri names. */
+    public class OpenResourceIdResult {
+        public android.content.res.Resources r;
+        public int id;
+    }
+
+    /** AOSP ContentResolver.getResourceId(Uri) (@hide), the same rules: the
+     *  authority is the package; one path segment is a numeric id
+     *  (android.resource://pkg/2131951618), two are type and name
+     *  (android.resource://pkg/raw/calling); anything else, or an id of 0, is
+     *  FileNotFoundException. AOSP asks its Context's PackageManager for the
+     *  package's Resources; this resolver keeps no Context, so it asks the
+     *  process's Application, which is the same PackageManager.
+     *  getResourcesForApplication answers the running app and "android", and
+     *  throws for any other package, which is not installed here. */
+    public OpenResourceIdResult getResourceId(Uri uri) throws java.io.FileNotFoundException {
+        String authority = uri.getAuthority();
+        if (authority == null || authority.isEmpty()) {
+            throw new java.io.FileNotFoundException("No authority: " + uri);
+        }
+        android.content.res.Resources r;
+        try {
+            android.app.Application app = android.app.Application.macapk_get();
+            if (app == null) throw new android.content.pm.PackageManager.NameNotFoundException(authority);
+            r = app.getPackageManager().getResourcesForApplication(authority);
+        } catch (android.content.pm.PackageManager.NameNotFoundException ex) {
+            throw new java.io.FileNotFoundException("No package found for authority: " + uri);
+        }
+        List<String> path = uri.getPathSegments();
+        if (path == null) {
+            throw new java.io.FileNotFoundException("No path: " + uri);
+        }
+        int len = path.size();
+        int id;
+        if (len == 1) {
+            try {
+                id = Integer.parseInt(path.get(0));
+            } catch (NumberFormatException e) {
+                throw new java.io.FileNotFoundException("Single path segment is not a resource ID: " + uri);
+            }
+        } else if (len == 2) {
+            id = r.getIdentifier(path.get(1), path.get(0), authority);
+        } else {
+            throw new java.io.FileNotFoundException("More than two path segments: " + uri);
+        }
+        if (id == 0) {
+            throw new java.io.FileNotFoundException("No resource found for: " + uri);
+        }
+        OpenResourceIdResult res = new OpenResourceIdResult();
+        res.r = r;
+        res.id = id;
+        return res;
+    }
+
     public final java.io.InputStream openInputStream(Uri uri) throws java.io.FileNotFoundException {
         // AOSP ContentResolver.openInputStream handles the file:, android.resource:
         // and content: schemes. We support file: directly (the most common
-        // non-provider case) and content: via the provider's openFile path.
-        if (uri != null && SCHEME_FILE.equals(uri.getScheme())) {
-            String path = uri.getPath();
-            return path != null ? new java.io.FileInputStream(path) : null;
+        // non-provider case), android.resource: through the app's Resources as
+        // AOSP does, and content: via the provider's openFile path.
+        //
+        // android.resource: was missing until 2026-11-13, and the gap was
+        // silent: OurFamilyWizard plays its outgoing-call ringback through
+        // RingtoneManager.getRingtone(android.resource://com.ourfamilywizard/
+        // 2131951618), which reaches MediaPlayer.setDataSource(Context, Uri) and
+        // then here. A null stream sent MediaPlayer to its file fallback on the
+        // path "/2131951618", so the caller heard nothing and nothing was logged.
+        // AOSP: Objects.requireNonNull(uri, "uri") before anything else.
+        java.util.Objects.requireNonNull(uri, "uri");
+        if (SCHEME_ANDROID_RESOURCE.equals(uri.getScheme())) {
+            // AOSP: "Note: left here to avoid breaking compatibility."
+            OpenResourceIdResult r = getResourceId(uri);
+            try {
+                return r.r.openRawResource(r.id);
+            } catch (android.content.res.Resources.NotFoundException ex) {
+                throw new java.io.FileNotFoundException("Resource does not exist: " + uri);
+            }
+        }
+        if (SCHEME_FILE.equals(uri.getScheme())) {
+            // AOSP: new FileInputStream(uri.getPath()); a null path is the NPE
+            // FileInputStream itself throws.
+            return new java.io.FileInputStream(uri.getPath());
         }
         ContentProvider p = providerFor(uri);
         if (p == null) return null;
@@ -343,7 +418,10 @@ public class ContentResolver {
                 android.content.res.AssetFileDescriptor.UNKNOWN_LENGTH);
         }
         ContentProvider p = providerFor(uri);
-        if (p == null) return null;
+        // AOSP distinguishes an absent provider from a provider returning null.
+        // Media clients catch this IOException to fall back to opening a
+        // network URL themselves; returning null silently skips that path.
+        if (p == null) throw new java.io.FileNotFoundException("No content provider: " + uri);
         p.macapkEnforceFile(uri, mode);
         return p.openAssetFile(uri, mode, sig);   // Transport.openAssetFile's 3-arg call
     }
@@ -354,7 +432,10 @@ public class ContentResolver {
     public final android.content.res.AssetFileDescriptor openTypedAssetFileDescriptor(Uri uri, String mimeType, Bundle opts, CancellationSignal sig)
             throws java.io.FileNotFoundException {
         ContentProvider p = providerFor(uri);
-        if (p == null) return null;
+        // AOSP distinguishes an absent provider from a provider returning null.
+        // Media clients catch this IOException to fall back to opening a
+        // network URL themselves; returning null silently skips that path.
+        if (p == null) throw new java.io.FileNotFoundException("No content provider: " + uri);
         p.macapkEnforceFile(uri, "r");   // Transport.openTypedAssetFile
         // The 4-arg call Transport makes (android14 ContentProvider.java:667).
         return p.openTypedAssetFile(uri, mimeType, opts, sig);

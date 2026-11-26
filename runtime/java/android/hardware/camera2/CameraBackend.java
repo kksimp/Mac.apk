@@ -213,10 +213,22 @@ final class CameraBackend {
         if (facing < 0) facing = CameraCharacteristics.LENS_FACING_EXTERNAL;
         p.put(CameraCharacteristics.LENS_FACING, Integer.valueOf(facing));
 
-        // SENSOR_ORIENTATION is 0 on a Mac: the sensor does not rotate with the
-        // device, so the app must apply no preview rotation. This is the value
-        // apps feed into their display-rotation maths, so a wrong one shows a
-        // sideways preview -- it is behaviour, not documentation.
+        // SENSOR_ORIENTATION: the same value as Camera.CameraInfo.orientation,
+        // the one that, combined with the Display.getRotation() this runtime
+        // reports, makes a Camera1 app apply NO net preview rotation -- a Mac's
+        // camera image is already upright on its screen.
+        // CameraBridge.getSensorOrientation explains the formula and why it is
+        // not simply 0. Apps feed it into their display-rotation maths, so a
+        // wrong one shows a sideways preview -- it is behaviour, not
+        // documentation.
+        //
+        // ⚠ camera2 is NOT yet consistent with it: on a device,
+        // CameraUtils::getRotationTransform also folds SENSOR_ORIENTATION into
+        // each SurfaceTexture output's transform, and consumers such as
+        // WebRTC's Camera2Session undo that rotation. CameraCaptureSessionImpl
+        // applies only the mirror half, so such a consumer still turns the
+        // picture 90 degrees in a landscape window, as it did when this was 0.
+        // Untested with a camera2 app; Camera1 is the measured path.
         p.put(CameraCharacteristics.SENSOR_ORIENTATION,
                 Integer.valueOf(CameraBridge.getSensorOrientation(index)));
 
@@ -253,6 +265,21 @@ final class CameraBackend {
         p.put(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES,
                 new int[] { CameraMetadata.CONTROL_AF_MODE_OFF });
         p.put(CameraCharacteristics.CONTROL_MAX_REGIONS_AF, Integer.valueOf(0));
+
+        // Video stabilization: we do not stabilize, so the one available mode
+        // is OFF. AOSP documents CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES as
+        // "available on all devices", and a LEGACY device reports exactly
+        // { CONTROL_VIDEO_STABILIZATION_MODE_OFF } when Camera1 cannot stabilize
+        // (LegacyMetadataMapper.mapControlOther, android11-release). Absent,
+        // WebRTC's Camera2Session.chooseStabilizationMode, which loops over this
+        // array without a null check, threw a NullPointerException from
+        // onConfigured, so capture never started and a later stopCapture waited
+        // forever for the session (seen 2026-11-15 with Twilio Video 7.10.5's
+        // tvi.webrtc copy of Camera2Session).
+        // LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION stays absent: LEGACY does
+        // not report it, and WebRTC checks that one for null.
+        p.put(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES,
+                new int[] { CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF });
 
         // AE: auto-exposure is always on and is not under app control, so the
         // single available mode is ON (not ON_AUTO_FLASH -- there is no flash).

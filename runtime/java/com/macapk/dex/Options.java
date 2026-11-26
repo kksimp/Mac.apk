@@ -12,7 +12,6 @@
 //   syntheticPrefix  dex2jvm.syntheticPrefix    DEX2JVM_SYNTHETIC_PREFIX    SYNTHETIC_PREFIX
 //   unsafeRedirect   dex2jvm.redirectUnsafe     DEX2JVM_REDIRECT_UNSAFE     REDIRECT_UNSAFE
 //   exitRedirect     dex2jvm.redirectExit       DEX2JVM_REDIRECT_EXIT       REDIRECT_EXIT
-//   nativeLoadRedirect dex2jvm.redirectNativeLoad DEX2JVM_REDIRECT_NATIVE_LOAD REDIRECT_NATIVE_LOAD
 //   threads          dex2jvm.threads            DEX2JVM_THREADS             THREADS
 //   logTag           dex2jvm.logTag             DEX2JVM_LOG_TAG             LOG_TAG
 //   parsedMarker     dex2jvm.parsedMarker       DEX2JVM_PARSED_MARKER       PARSED_MARKER
@@ -63,22 +62,6 @@ public final class Options {
      */
     public static volatile String exitRedirect = setting("dex2jvm.redirectExit",
             "DEX2JVM_REDIRECT_EXIT", "REDIRECT_EXIT", null);
-
-    /**
-     * When non-null, the internal name of a class that receives the app's calls
-     * to {@code System.mapLibraryName(String)} as {@code mapLibraryName
-     * (Ljava/lang/String;)Ljava/lang/String;}, {@code System.load(String)} as
-     * {@code load(Ljava/lang/String;)V} and {@code Runtime.load(String)} as
-     * {@code runtimeLoad(Ljava/lang/Runtime;Ljava/lang/String;)V}. Null (the
-     * default) leaves them alone.
-     *
-     * <p>For hosts where the file name Android uses for a native library
-     * ({@code libfoo.so}) is not what the host's JVM would produce, so an app
-     * that builds the name itself and then loads the file it names (a custom
-     * SoLoader does exactly this) can be answered the way Bionic answers it.
-     */
-    public static volatile String nativeLoadRedirect = setting("dex2jvm.redirectNativeLoad",
-            "DEX2JVM_REDIRECT_NATIVE_LOAD", "REDIRECT_NATIVE_LOAD", null);
 
     /**
      * Worker threads for a bulk conversion; 0 means one per core, capped by heap

@@ -834,10 +834,8 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
             try { dispatchWindowAttributesChanged(attrs); } catch (Throwable ignored) {}
         }
 
-        /** PhoneWindow.getElevation: mElevation. (No @Override: this tree's
-         *  android.view.Window does not declare getElevation yet; AOSP's base
-         *  answers 0.0f. Once it does, this overrides it.) */
-        public float getElevation() {
+        /** PhoneWindow.getElevation: mElevation. */
+        @Override public float getElevation() {
             return MACAPK_WINDOW_ELEVATION_ACTIVE ? mMacapkElevation : 0f;
         }
 

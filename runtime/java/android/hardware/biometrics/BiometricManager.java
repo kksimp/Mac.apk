@@ -37,12 +37,14 @@ public class BiometricManager {
      * there: it fires before the service is reached, so an app passing 0 or a
      * weak-biometric bit gets IllegalArgumentException on any device.
      *
-     * The answer is BIOMETRIC_NO_AUTHENTICATION, which is AOSP's OWN answer
-     * when it has no service to ask (:791-793). It is honest twice over here:
-     * we expose no biometric bridge, so no biometric authentication has ever
-     * happened in this process; and the macOS login that got the user to their
-     * desktop is not an Android device-credential unlock and must not be
-     * reported as one. An app uses this timestamp to decide whether a recent
+     * The answer comes from the host verification bridge
+     * (UserVerificationBridge): the time of the newest Touch ID or Mac-password
+     * check THIS process asked macOS for and saw succeed, or
+     * BIOMETRIC_NO_AUTHENTICATION -- AOSP's own answer when it has no service to
+     * ask (:791-793) -- when the bridge is off for this app or nothing matching
+     * has succeeded. The macOS login that got the user to their desktop is not
+     * an Android device-credential unlock and is never reported as one. An app
+     * uses this timestamp to decide whether a recent
      * unlock is fresh enough to skip a re-auth -- reporting a time we did not
      * observe would let it skip a check it wanted, which is exactly the
      * credential bypass this project forbids.
@@ -71,10 +73,10 @@ public class BiometricManager {
      *
      * All three getters are @Nullable, and AOSP's javadoc gives null the precise
      * meaning we need: there is no authenticator of the requested kind to name.
-     * With no biometric hardware exposed there is nothing to call anything, so
-     * null it is. An app is expected to fall back to its own generic wording --
-     * which is the correct outcome, and strictly better than inventing a label
-     * like "Touch ID" for a sensor we do not drive.
+     * So the label is "Use Touch ID" only when the host bridge is on for this
+     * app and macOS reports Touch ID usable, "Use Mac password" when only the
+     * password is, and null otherwise -- never a label for a sensor that cannot
+     * be used.
      */
     public static class Strings {
         private final int mAuthenticators;

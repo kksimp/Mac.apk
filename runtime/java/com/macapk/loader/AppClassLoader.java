@@ -1560,12 +1560,24 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         // the superpack loader .so in this very directory. Nothing else in the
         // tree reads the extra dylibs we drop, so a false negative just leaves
         // an app exactly as it is today; a false positive costs a few translations.
+        //
+        // R8 does NOT keep SysUtil / MinElf by name in every app. A minified React
+        // Native release (RN 0.8x, Expo) keeps only SoLoader.class itself, because
+        // RN's consumer rules name it, while SysUtil, MinElf and the DSO-not-found
+        // error are renamed (SysUtil survives only as its SysUtil$*Sysdeps inner
+        // classes) and NativeLoader is not shipped at all. SoLoader.class still
+        // loads every top-level lib with mapLibraryName, so such an app needs this
+        // pass as much as Instagram does. Two more signals cover it: SoLoader.class
+        // in the merged jar, and libfbjni.so next to the app's libs (fbjni's Java
+        // side loads through SoLoader, so an app that ships it ships SoLoader).
         boolean usesSoLoader =
                 findResource("com/facebook/soloader/SysUtil.class") != null
              || findResource("com/facebook/soloader/MinElf.class") != null
              || findResource("com/facebook/soloader/nativeloader/NativeLoader.class") != null
+             || findResource("com/facebook/soloader/SoLoader.class") != null
              || new File(soDir, "libsuperpack-jni.so").exists()
-             || new File(soDir, "libfb.so").exists();
+             || new File(soDir, "libfb.so").exists()
+             || new File(soDir, "libfbjni.so").exists();
         if (!usesSoLoader) return;
         // Everything is EXPOSED in the plain DirectorySoSource dir (soDir =
         // the installed lib/<isa>). Two SoLoader source kinds see our files differently:

@@ -816,6 +816,9 @@ public final class Translator {
             final java.util.TreeMap<Integer, CodeWriter.Label> cloneLabels =
                     new java.util.TreeMap<>();
 
+            final java.util.TreeMap<Integer, CodeWriter.Label> tailLabels =
+                    new java.util.TreeMap<>();
+
             PartState(int index, CodeWriter writer, MethodSplitter.Part part) {
                 this.index = index;
                 this.writer = writer;
@@ -864,6 +867,9 @@ public final class Translator {
                     if (incumbent == null || betterFrameSource(this, dexOffset, incumbent)) {
                         bytecodeToDex.put(l.offset, dexOffset);
                     }
+                }
+                for (Map.Entry<Integer, CodeWriter.Label> e : tailLabels.entrySet()) {
+                    if (e.getValue().offset >= 0) bytecodeToDex.put(e.getValue().offset, e.getKey());
                 }
                 // A handler copy's pc is that handler's program point: its frame
                 // is the handler's own (locals at the handler, the exception on
@@ -1589,6 +1595,13 @@ public final class Translator {
                 int pi = split.partIndexOf(dexOffset);
                 if (pi > cur.index) return portalFor(dexOffset);
                 if (pi < cur.index) {
+                    if (split.terminalTail(dexOffset) != null) {
+                        return cur.tailLabels.computeIfAbsent(dexOffset, target -> {
+                            CodeWriter.Label copy = out.newLabel("tail-copy@0x" + Integer.toHexString(target));
+                            labelOwner.put(copy, out);
+                            return copy;
+                        });
+                    }
                     // MethodSplitter only cuts where no edge runs backwards, so
                     // this cannot happen for a plan it produced. Failing loudly
                     // makes translate() fall back to the unsplit translation
@@ -1818,6 +1831,25 @@ public final class Translator {
             }
         }
 
+        /** Copies have no successors or protected ranges, so each branch can
+         *  use the original target's locals and empty-stack frame directly. */
+        void emitTailClones() {
+            if (cur.tailLabels.isEmpty()) return;
+            Map<Integer, TypeInference.Insn> byOffset = new HashMap<>();
+            for (TypeInference.Insn in : lastNorm) byOffset.put(in.offset, in);
+            for (Map.Entry<Integer, CodeWriter.Label> copy : cur.tailLabels.entrySet()) {
+                out.mark(copy.getValue());
+                for (int offset : split.terminalTail(copy.getKey())) {
+                    TypeInference.Insn insn = byOffset.get(offset);
+                    if (insn == null) {
+                        throw new TranslationException("tail copy: no instruction at 0x"
+                                + Integer.toHexString(offset));
+                    }
+                    emitOne(insn, types.typesFor(offset));
+                }
+            }
+        }
+
         /** True when a range of the CURRENT part names this handler. */
         boolean partUsesHandler(int handlerOffset) {
             for (TypeInference.TryBlock t : cur.tries) {
@@ -1853,6 +1885,7 @@ public final class Translator {
             emitHandlerStubs(partHandlerOffsets());
             emitPortals();
             emitHandlerClones();
+            emitTailClones();
             emitTryCatch(cur.tries);
             emitLineNumbers(cur.labels);
             cur.writer.setFrameProvider(cur);

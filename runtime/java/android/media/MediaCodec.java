@@ -113,18 +113,25 @@ public final class MediaCodec {
         public static final int ERROR_INSUFFICIENT_RESOURCE = 1100;
         public static final int ERROR_RECLAIMED = 1101;
         private final int mErrorCode;
-        private final boolean mRecoverable;
-        private final boolean mTransient;
+        // Native MediaCodec clients read these AOSP fields through JNI.
+        private final int mActionCode;
+        private final String mDiagnosticInfo;
+        private static final int ACTION_TRANSIENT = 1;
+        private static final int ACTION_RECOVERABLE = 2;
         CodecException(int errorCode, String detail) {
+            this(errorCode, 0, detail);
+        }
+        CodecException(int errorCode, int actionCode, String detail) {
             super(detail);
             mErrorCode = errorCode;
-            mRecoverable = false;
-            mTransient = false;
+            mActionCode = actionCode;
+            mDiagnosticInfo = "android.media.MediaCodec.error_"
+                    + (errorCode < 0 ? "neg_" : "") + Math.abs(errorCode);
         }
         public int getErrorCode() { return mErrorCode; }
-        public boolean isRecoverable() { return mRecoverable; }
-        public boolean isTransient() { return mTransient; }
-        public String getDiagnosticInfo() { return getMessage(); }
+        public boolean isRecoverable() { return mActionCode == ACTION_RECOVERABLE; }
+        public boolean isTransient() { return mActionCode == ACTION_TRANSIENT; }
+        public String getDiagnosticInfo() { return mDiagnosticInfo; }
     }
     // AOSP MediaCodec.CryptoInfo -- per-sample encryption metadata used by
     // queueSecureInputBuffer and MediaExtractor.getSampleCryptoInfo. Mac.apk
@@ -1237,6 +1244,18 @@ public final class MediaCodec {
         info.set(0, e.pcm.length, e.pts, e.flags);
         return oi;
     }
+    private void renderVideoFrame(long frame) {
+        android.view.Surface previous = android.graphics.SurfaceTexture.macapkSetVideoFrameSurface(mSurface);
+        try {
+            // CocoaPresentVideoFrame queries the target synchronously, before
+            // its SurfaceView dispatch. Carry the codec's identity across that
+            // JNI callback instead of relying on the newest texture globally.
+            com.macapk.loader.NativeMedia.nativeVidRender(frame, mVidWidth, mVidHeight);
+        } finally {
+            android.graphics.SurfaceTexture.macapkSetVideoFrameSurface(previous);
+        }
+    }
+
     public void releaseOutputBuffer(int index, boolean render) {
         synchronized (mAsyncLock) {
             if (mIsVideo && mOutPixbuf != null && index >= 0 && index < mOutPixbuf.length) {
@@ -1251,7 +1270,7 @@ public final class MediaCodec {
                     if (PRESENT_TRACE && !render) mTraceAppDrops++;
                     if (render && mHasSurface) {
                         if (PRESENT_TRACE) tracePresent();
-                        com.macapk.loader.NativeMedia.nativeVidRender(pb, mVidWidth, mVidHeight);
+                        renderVideoFrame(pb);
                         com.macapk.loader.MediaStats.codecRendered(mStat);
                     }
                     com.macapk.loader.NativeMedia.nativeVidReleaseFrame(pb);
@@ -1391,7 +1410,7 @@ public final class MediaCodec {
                 // release) waits for an in-flight present instead of freeing
                 // the buffer underneath it.
                 try {
-                    com.macapk.loader.NativeMedia.nativeVidRender(show[0], mVidWidth, mVidHeight);
+                    renderVideoFrame(show[0]);
                     com.macapk.loader.MediaStats.codecRendered(mStat);
                 } catch (Throwable ignored) {}
                 com.macapk.loader.NativeMedia.nativeVidReleaseFrame(show[0]);

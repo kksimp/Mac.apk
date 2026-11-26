@@ -28,6 +28,7 @@
 import AppKit
 import CryptoKit
 import Darwin
+import LocalAuthentication
 
 // MARK: - Small helpers
 
@@ -44,6 +45,91 @@ private func stubLog(_ msg: String) {
     let line = "[MacApkAppStub] " + msg + "\n"
     stubLogBuffer.append(line)
     FileHandle.standardError.write(Data(line.utf8))
+}
+
+// MARK: - Touch ID prompts on the runtime's behalf
+
+/// Shows one Touch ID or Mac password prompt for the runtime, then exits with
+/// the result. The runtime starts this executable with `flag` as its first
+/// argument (runtime/src/user_verification_bridge.mm, `RunHelper`); nothing
+/// else in this file runs in that mode.
+///
+/// WHY THE STUB SHOWS IT. macOS names a LocalAuthentication prompt after the
+/// program that asks: the CFBundleName embedded in that program, else its
+/// file name. Only a bundle's own executable gets the bundle's name (and
+/// icon). Every app runs the one shared macapk-runtime, whose embedded name is
+/// "Mac.apk", so every app's prompt read "Mac.apk is trying to ...", and the
+/// user could not tell which app wanted their fingerprint. This stub IS the
+/// app's bundle executable, so its prompt names the app that is asking, as
+/// Android's does. Measured 2026-11-13 with five probe bundles: a program run
+/// through a bundle's symlink showed its embedded name, or with none its file
+/// name, never the bundle's; a bundle's own executable showed the bundle's
+/// name. A helper rather than a renamed copy of the runtime: tools that find
+/// running apps by the runtime's file name keep working, and it costs no disk.
+///
+/// Arguments after the flag: policy ("biometric" or "password"), reason,
+/// fallback-button title ("" hides it), cancel-button title ("" keeps the
+/// system's). The result is one line on stdout, and the exit status: 0
+/// allowed; 100 + n for LAError code -n; 98 for any other failure; 99 for
+/// unusable arguments. Nothing is ever written to stdin: when it reaches end
+/// of file (the runtime cancelled, timed out, quit or crashed) this process
+/// exits, and its prompt closes with it.
+enum UserVerificationHelper {
+    static let flag = "--macapk-verify-user=1"
+
+    static func run(_ args: [String]) -> Never {
+        guard args.count == 4 else { finish(99) }
+        let lifeline = DispatchSource.makeReadSource(fileDescriptor: 0, queue: .global())
+        lifeline.setEventHandler {
+            var byte: UInt8 = 0
+            if read(0, &byte, 1) <= 0 { finish(98) }
+        }
+        lifeline.resume()
+        let (policy, reason, fallback, cancel) = (args[0], args[1], args[2], args[3])
+        let context = LAContext()
+        context.touchIDAuthenticationAllowableReuseDuration = 0
+        context.localizedFallbackTitle = fallback
+        if !cancel.isEmpty { context.localizedCancelTitle = cancel }
+        let done = DispatchSemaphore(value: 0)
+        var status: Int32 = 98
+        let reply: (Bool, Error?) -> Void = { ok, error in
+            status = ok ? 0 : exitStatus(error)
+            done.signal()
+        }
+        switch policy {
+        case "biometric":
+            context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics,
+                                   localizedReason: reason, reply: reply)
+        case "password":
+            // Password only, as the runtime's own path does: the broader owner
+            // policy can be satisfied by Touch ID, which is not a password result.
+            guard let control = SecAccessControlCreateWithFlags(
+                nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, .devicePasscode, nil)
+            else { finish(98) }
+            context.evaluateAccessControl(control, operation: .useItem,
+                                          localizedReason: reason, reply: reply)
+        default:
+            finish(99)
+        }
+        done.wait()
+        finish(status)
+    }
+
+    /// Held by the first caller and never released: the reply and the stdin
+    /// handler can both get here, and only one line and one exit may happen.
+    private static let finishing = NSLock()
+
+    private static func finish(_ status: Int32) -> Never {
+        finishing.lock()
+        FileHandle.standardOutput.write(Data("\(status)\n".utf8))
+        exit(status)
+    }
+
+    private static func exitStatus(_ error: Error?) -> Int32 {
+        guard let e = error as NSError?, e.domain == LAErrorDomain,
+              e.code < 0, e.code > -98 else { return 98 }
+        return Int32(100 - e.code)
+    }
 }
 
 // MARK: - The run log
@@ -536,6 +622,12 @@ struct AppStubMain {
     }
 
     static func main() {
+        // Not a launch: a Touch ID prompt the runtime asked for. Before anything
+        // else, so it touches no log, registry or staged runtime.
+        let args = CommandLine.arguments
+        if args.count >= 2, args[1] == UserVerificationHelper.flag {
+            UserVerificationHelper.run(Array(args.dropFirst(2)))
+        }
         let fm = FileManager.default
 
         // 1. Resolve our own bundle from the executable location:
@@ -707,7 +799,8 @@ struct AppStubMain {
         // run yesterday's runtime after a rebuild. It is a no-op once the
         // staged build-id matches, and -- the part that matters -- it REFUSES
         // to run at all once the user has pressed Uninstall.
-        let runtimeURL = RuntimeInstall.ensureStaged(extraSources: appCandidates) {
+        let runtimeURL = RuntimeInstall.ensureStaged(extraSources: appCandidates,
+                                                     willStage: EarlyCheckIn.now) {
             stubLog($0)
         }
         guard let runtime = runtimeURL else {
@@ -1197,19 +1290,26 @@ struct AppStubMain {
         // assessment then fails with "a sealed resource is missing or
         // invalid" -- an app that launches once and is refused afterwards.
         // BundleGenerator pre-creates it, so the common path is a no-op.
-        let have = try? FileManager.default
-            .destinationOfSymbolicLink(atPath: execLink.path)
-        if have == runtime.path {
-            execPath = execLink.path
-        } else {
-            unlink(execLink.path)
-            if symlink(runtime.path, execLink.path) == 0 {
+        // A headless secondary process must not register as this launchable
+        // app. If it executes the same bundle-relative link, LaunchServices
+        // can keep treating the background worker as the running app after
+        // the UI process exits; Finder then activates that worker instead of
+        // starting a new window. Only the primary needs the bundle identity.
+        if !secondaryProcess {
+            let have = try? FileManager.default
+                .destinationOfSymbolicLink(atPath: execLink.path)
+            if have == runtime.path {
                 execPath = execLink.path
-                stubLog("exec link repointed -> \(runtime.path) (was \(have ?? "absent")); "
-                        + "the bundle seal is now stale until the next install")
             } else {
-                stubLog("WARN: could not create \(execLink.path) (errno \(errno)); "
-                        + "exec'ing the runtime directly (Dock will show its own name)")
+                unlink(execLink.path)
+                if symlink(runtime.path, execLink.path) == 0 {
+                    execPath = execLink.path
+                    stubLog("exec link repointed -> \(runtime.path) (was \(have ?? "absent")); "
+                            + "the bundle seal is now stale until the next install")
+                } else {
+                    stubLog("WARN: could not create \(execLink.path) (errno \(errno)); "
+                            + "exec'ing the runtime directly (Dock will show its own name)")
+                }
             }
         }
         // Last line of defence before handing control to the runtime. The
@@ -1324,6 +1424,44 @@ enum PlayBootstrap {
 }
 
 // MARK: - The system broker's background item
+
+/// Connect to the window server before a slow first launch, so the launch's
+/// activation lands while the user is still looking at it.
+///
+/// LaunchServices makes a launched app frontmost when the app checks in, which
+/// AppKit does in NSApplication.shared. The runtime does that in CocoaInit,
+/// after this stub has exec'd it, which on an ordinary launch is a fraction of
+/// a second in. On the first launch after Mac.apk is installed or updated the
+/// stub first re-stages the runtime and macOS then checks the new program,
+/// and the system log showed the runtime checking in four seconds after the
+/// launch (OurFamilyWizard, 2026-11-14). A user who switched to another app
+/// inside those seconds kept it, as macOS intends, but the launched app had
+/// never been active, so it opened behind and sorted last in Command-Tab,
+/// where a native app, checked in at once, would be second.
+///
+/// Called only on that path (RuntimeInstall.ensureStaged's willStage), and it
+/// only creates the shared NSApplication: no finishLaunching, no run loop, so
+/// the launch's Apple Events are not read here. The runtime checks in again
+/// after the exec. Never for a secondary process (MACAPK_SECONDARY_PROCESS=1):
+/// a headless worker must not register as the app, and neither must a
+/// service host the system broker starts (MACAPK_SERVICE_HOST: the runtime makes
+/// that one a prohibited-policy process, with no Dock tile). Nor when the app is already
+/// running: this launch is then a relay (LaunchUrlHandoff, which keeps its own
+/// NSApplication off the Dock) and must not take the Dock tile or activation.
+enum EarlyCheckIn {
+    static func now() {
+        let env = ProcessInfo.processInfo.environment
+        guard env["MACAPK_EARLY_CHECKIN"] != "0", env["MACAPK_SECONDARY_PROCESS"] != "1",
+              env["MACAPK_SERVICE_HOST"] == nil else { return }
+        if let id = Bundle.main.bundleIdentifier {
+            let me = ProcessInfo.processInfo.processIdentifier
+            if NSRunningApplication.runningApplications(withBundleIdentifier: id)
+                .contains(where: { $0.processIdentifier != me }) { return }
+        }
+        _ = NSApplication.shared
+        stubLog("[runtime] connected to the window server before staging, so the launch activation is not lost")
+    }
+}
 
 /// Is the "Use Google GMS" switch on, and does launchd hold the broker? When the
 /// switch is on and launchd does not, Mac.apk.app registers it (SMAppService can

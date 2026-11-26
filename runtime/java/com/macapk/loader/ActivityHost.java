@@ -71,6 +71,12 @@ public final class ActivityHost {
     private static Application app;
     private static ClassLoader appCl;
     private static final Deque<Activity> stack = new ArrayDeque<>();
+    /** Bottom-to-top snapshot for framework APIs that need a coherent view of
+     *  the app task. ActivityManager.getAppTasks() is synchronous and may be
+     *  called while ordinary Activity bookkeeping is changing, so readers must
+     *  not walk the mutable Deque directly. publishTaskSnapshot() runs at the
+     *  only two mutation points (push and finish). */
+    private static volatile Activity[] sTaskActivities = new Activity[0];
 
     public static void init(Application application, ClassLoader cl) {
         app = application;
@@ -87,10 +93,50 @@ public final class ActivityHost {
 
     public static Activity push(Activity a) {
         stack.push(a);
+        publishTaskSnapshot();
         return a;
     }
 
     public static Activity peek() { return stack.peek(); }
+
+    private static void publishTaskSnapshot() {
+        java.util.ArrayList<Activity> bottomToTop = new java.util.ArrayList<>(stack);
+        java.util.Collections.reverse(bottomToTop);
+        sTaskActivities = bottomToTop.toArray(new Activity[0]);
+    }
+
+    /** A coherent bottom-to-top snapshot of the one task hosted by this process.
+     *  AOSP exposes the same task through ActivityManager.getAppTasks(); keeping
+     *  the snapshot behind the ActivityHost avoids leaking stack internals to the
+     *  framework jar and gives background callers an immutable view. */
+    public static Activity[] macapkTaskActivitySnapshot() {
+        return sTaskActivities.clone();
+    }
+
+    /** AppTask.finishAndRemoveTask(): remove the whole task, regardless of which
+     *  member is currently on top. */
+    public static void macapkRemoveCurrentTask() {
+        if (android.os.Looper.getMainLooper() != null && !macapkOnMainThread()) {
+            ownerHandler().post(new Runnable() {
+                @Override public void run() { macapkRemoveCurrentTask(); }
+            });
+            return;
+        }
+        Activity root = taskRoot();
+        if (root != null) macapkFinishTask(root, true);
+    }
+
+    /** AppTask.moveToFront(): this process owns the only hosted task, so its
+     *  task handle always means the current macOS application window. */
+    public static void macapkMoveCurrentTaskToFront() {
+        if (android.os.Looper.getMainLooper() != null && !macapkOnMainThread()) {
+            ownerHandler().post(new Runnable() {
+                @Override public void run() { macapkMoveCurrentTaskToFront(); }
+            });
+            return;
+        }
+        try { NativeCocoa.moveTaskToFront(); } catch (Throwable ignored) {}
+    }
 
     /** True while `a` is STOPPED because another activity covers it
      *  (stopForNewTop). Read by GLSurfaceView's GL-BEHIND-TOP detector. */
@@ -487,6 +533,7 @@ public final class ActivityHost {
         }
         boolean wasTop = !stack.isEmpty() && stack.peek() == a;
         stack.remove(a);
+        publishTaskSnapshot();
         // Whatever we recorded about `a` being backgrounded is meaningless once
         // it is destroyed, and holding the entry would let a later restore of a
         // recycled instance believe it owes onRestart(). Read it first, though:
@@ -2783,7 +2830,12 @@ public final class ActivityHost {
         if (intent.hasFileDescriptors()) {
             throw new IllegalArgumentException("File descriptors passed in Intent");
         }
-        final String own = app != null ? app.getPackageName() : null;
+        // An attached Application may represent a plugin package. Keep that
+        // identity routable alongside Boot's installed manifest package.
+        final String installedPackage = Boot.packageName();
+        final String reportedPackage = app != null ? app.getPackageName() : null;
+        final String own = reportedPackage != null && !reportedPackage.isEmpty()
+                ? reportedPackage : installedPackage;
         final ComponentName cn = intent.getComponent();
         if (cn != null) {
             final String pkg = cn.getPackageName();
@@ -2791,7 +2843,7 @@ public final class ActivityHost {
             // resolver. It performs the same real host check as the implicit
             // Keyguard intent, before cross-app resolution is considered.
             if (DeviceCredentialHandler.isCredentialIntent(intent) && resolveImplicitToHost(intent)) return null;
-            if (own == null || own.equals(pkg)) return intent;
+            if (own == null || own.equals(pkg) || pkg.equals(installedPackage)) return intent;
             // The platform package installer, pinned by the caller (a store
             // picks InstallStart out of queryIntentActivities and setClassName()s
             // it): performed by the installer surface, as the implicit start is.
@@ -2833,7 +2885,8 @@ public final class ActivityHost {
         android.content.pm.ResolveInfo pick = null;
         for (android.content.pm.ResolveInfo ri : rows) {
             if (ri == null || ri.activityInfo == null) continue;
-            final boolean mine = own != null && own.equals(ri.activityInfo.packageName);
+            final boolean mine = own != null && own.equals(ri.activityInfo.packageName)
+                    || installedPackage != null && installedPackage.equals(ri.activityInfo.packageName);
             if (mine && web) continue;
             if (exportedOnly && !ri.activityInfo.exported) continue;
             pick = ri;
@@ -2848,9 +2901,10 @@ public final class ActivityHost {
                     + intent.getAction() + " data=" + intent.getDataString() + ") -- ignored");
             return null;
         }
-        if (own != null && own.equals(pick.activityInfo.packageName)) {
+        if (own != null && own.equals(pick.activityInfo.packageName)
+                || installedPackage != null && installedPackage.equals(pick.activityInfo.packageName)) {
             Intent copy = new Intent(intent);
-            copy.setComponent(new ComponentName(own, pick.activityInfo.name));
+            copy.setComponent(new ComponentName(pick.activityInfo.packageName, pick.activityInfo.name));
             NativeLog.i(TAG, "startActivity implicit (action=" + intent.getAction()
                     + ") -> own " + pick.activityInfo.name);
             return copy;

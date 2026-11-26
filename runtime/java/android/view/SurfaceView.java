@@ -898,6 +898,17 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
      *  "native window owner" section below. */
     static final boolean sGuestBelowGate =
         !"0".equals(System.getenv("MACAPK_SV_GUEST_BELOW"));
+    /** MACAPK_SV_NATIVE_LAYER_RECT (default ON, 2026-11-15): the native-EGL
+     *  window layer covers its owning SurfaceView's rect, not the whole window,
+     *  when that view does not fill its window, and the view's holder reports
+     *  the view's own size. =0 keeps the window-sized layer and holder answer
+     *  exactly as before. See macapkNativeWindowLayerRectPacked. Needs
+     *  MACAPK_SV_GUEST_BELOW (with the layer above the window there is no hole
+     *  to line up with) and MACAPK_SV_VIEW_SIZE (the layout snapshot the rect is
+     *  read from, and the holder half): the layer and the holder move together
+     *  or not at all, as the hole and the layer do. */
+    static final boolean sNativeLayerRectGate = sGuestBelowGate && sViewSizeGate
+        && !"0".equals(System.getenv("MACAPK_SV_NATIVE_LAYER_RECT"));
 
     /** MACAPK_GL_WAIT_FRAME (2026-09-27, default ON): a renderer's FIRST
      *  onSurfaceCreated waits for the view's first layout, as AOSP's
@@ -1256,7 +1267,13 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
      *  first frame (BobBall: 3360x1636, then 3360x1560). */
     private int[] macapkHolderSurfaceSize(int displayW, int displayH) {
         if (sViewSizeGate && !holder.macapkFixedSize) {
-            boolean gl = !holder.macapkLockedCanvas;                   /*HOLDER-RULE*/
+            // A view whose native-EGL layer follows its rect is not drawn into
+            // the window-box GL layer, so the GL anchor rule does not bind it:
+            // it takes its own size wherever it sits, as a Canvas consumer does
+            // (MACAPK_SV_NATIVE_LAYER_RECT).
+            boolean gl = !holder.macapkLockedCanvas                    /*HOLDER-RULE*/
+                && !(sNativeLayerRectGate && macapkIsNativeWindowOwner()
+                     && macapkNativeLayerCanFollow());
             int[] v = macapkNonFillingViewSize(displayW, displayH, gl);
             if (v != null) return v;
         }
@@ -1768,6 +1785,88 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
         SurfaceView v = ref != null ? ref.get() : null;
         if (v == null) return sHadNativeWindowOwner ? 1 : 0;
         return v.mZOrderOnTop ? 2 : 1;
+    }
+
+    /** Can the native-EGL window layer follow this view's rect at all? The ONE
+     *  predicate for both halves of MACAPK_SV_NATIVE_LAYER_RECT: the layer pull
+     *  (macapkNativeWindowLayerRectPacked) places the layer only when it holds,
+     *  and the holder rule (macapkHolderSurfaceSize) lets the owner leave the GL
+     *  anchor rule only when it holds, so a refused view keeps both its old
+     *  layer and its old holder answer. The sizes come from the volatile layout
+     *  snapshot; the attach and fixed-size flags are read as
+     *  macapkNonFillingViewSize reads them, so an off-thread caller may see a
+     *  flag one frame stale, as that rule already can.
+     *  Refused: a detached view; a fixed-size holder (its buffer size is the
+     *  app's choice); a view LARGER than its window (a crop/fill layout: the
+     *  ANGLE path needs a clip mask, MacapkSyncGlClipMask, to keep such a layer
+     *  out of the system-bar strips, and this layer has none); a view over
+     *  Metal's 16384-pixel drawable limit. */
+    private boolean macapkNativeLayerCanFollow() {
+        if (!macapkAttached || holder.macapkFixedSize) return false;
+        LayoutSnap s = macapkLayoutSnap;
+        if (s == null || s.w <= 0 || s.h <= 0 || s.rootW <= 0 || s.rootH <= 0) return false;
+        if (s.w > s.rootW || s.h > s.rootH) return false;
+        return s.w <= 16384 && s.h <= 16384;
+    }
+
+    /** Native pull, every drawInMTKView tick while a PUBLISHED native-EGL window
+     *  layer exists: the rect that layer covers, packed as
+     *  macapkActiveVideoRectPacked is, (x << 48) | (y << 32) | (w << 16) | h in
+     *  DISPLAY-surface pixels with x/y signed; 0 = the whole window, the
+     *  placement it has always had; -1 = keep the layer where it is (the owner
+     *  is attached but hidden, has a zero size mid-relayout, or sits beyond
+     *  int16 range); the holder keeps the view's size too.
+     *
+     *  WHY. On a device the compositor shows a SurfaceView's buffer at the view's
+     *  own rect (onSetSurfacePositionAndScale; see the video-sink section). Here
+     *  the one native-EGL layer was always the size of the window, and only the
+     *  hole the owner punches was the view's size. A producer that sizes its
+     *  drawing from the EGL surface (WebRTC's EglRenderer, under Twilio Video's
+     *  VideoView) then drew a window-sized picture behind the window, and the
+     *  hole showed whichever part of it lay underneath: OurFamilyWizard's
+     *  draggable self-view tile showed a wall at the window's left edge and the
+     *  caller's face only when dragged to the middle (owner report 2026-11-15). A view
+     *  that fills its window (as Unity, AGDK and SDL games normally do) answers 0, so those
+     *  keep the window box exactly.
+     *
+     *  The rect comes from macapkWindowOrigin and getWidth/getHeight, the same
+     *  numbers the hole and the video plane use, so the layer and its hole
+     *  cannot drift apart. A fixed-size holder answers 0: its buffer size is the
+     *  app's choice, not the view's (setFixedSize is OPEN with the native layers,
+     *  see the view-size section). So do the other views
+     *  macapkNativeLayerCanFollow refuses, which keep the window box they have
+     *  always had. */
+    public static long macapkNativeWindowLayerRectPacked() {
+        if (!sNativeLayerRectGate) return 0L;
+        java.lang.ref.WeakReference<SurfaceView> ref = sNativeWindowOwner;
+        SurfaceView v = ref != null ? ref.get() : null;
+        if (v == null) return 0L;
+        try {
+            // The same predicate the holder rule asks, so the layer and the
+            // holder's size move together or not at all.
+            if (!v.macapkNativeLayerCanFollow()) return 0L;
+            if (!v.isShown()) return -1L;                                   // hidden: keep
+            LayoutSnap s = v.macapkLayoutSnap;
+            if (s.w == s.rootW && s.h == s.rootH) return 0L;               // fills
+            int w = v.getWidth(), h = v.getHeight();
+            int[] o = new int[2];
+            v.macapkWindowOrigin(o);
+            // A mid-relayout zero size, or an origin dragged beyond what packs
+            // as int16 (32767 px away): keep the current placement for this
+            // tick, as for a hidden owner, so the holder's view size still
+            // matches the layer the next good tick places.
+            if (w <= 0 || h <= 0
+                || o[0] < Short.MIN_VALUE || o[0] > Short.MAX_VALUE
+                || o[1] < Short.MIN_VALUE || o[1] > Short.MAX_VALUE) return -1L;
+            long packed = ((long) (o[0] & 0xffffL) << 48)
+                 | ((long) (o[1] & 0xffffL) << 32)
+                 | ((long) (w & 0xffffL) << 16)
+                 |  (long) (h & 0xffffL);
+            // -1 is never a real rect (w and h would both be 65535): keep it free.
+            return packed == -1L ? 0L : packed;
+        } catch (Throwable t) {
+            return 0L;   // a half-torn-down tree keeps the window box; never throw into JNI
+        }
     }
 
     // ---- MetalSurfaceCallbacks: reflection-driven autodiscovery ----

@@ -287,24 +287,41 @@ public final class Bundle extends BaseBundle implements Parcelable, Cloneable {
             @Override public Bundle[] newArray(int size) { return new Bundle[size]; }
         };
 
-    // API 33 type-safe getters: the Class arg disambiguates at the call site.
-    // Mac.apk stores unerased objects, so we delegate to the legacy getters and
-    // let the caller's expected type drive resolution.
+    // API 33 type-safe getters. AOSP's in-memory path is getValue(key, X.class,
+    // itemType) -> clazz.cast(value) with clazz = ArrayList / Parcelable[] /
+    // SparseArray / the requested class: only the CONTAINER is checked, and the
+    // javadoc says the item type "is only verified when unparceling". So a list
+    // or sparse array whose items are of another type is still returned, never
+    // null (BaseBundle.getValueAt). The array getter below additionally hands
+    // back a clazz-typed copy when every item is an instance, because our Parcel
+    // may rebuild arrays as Parcelable[] where AOSP rebuilds them as clazz[].
     @SuppressWarnings("unchecked")
     public <T> java.util.ArrayList<T> getParcelableArrayList(String key, Class<? extends T> clazz) {
+        java.util.Objects.requireNonNull(clazz);
         return (java.util.ArrayList<T>) getParcelableArrayList(key);
     }
     @SuppressWarnings("unchecked")
     public <T> T[] getParcelableArray(String key, Class<T> clazz) {
+        java.util.Objects.requireNonNull(clazz);
         Object[] a = getParcelableArray(key);
-        return (T[]) a;
+        if (a == null) return null;
+        for (Object o : a) {
+            if (o != null && !clazz.isInstance(o)) return (T[]) a;
+        }
+        T[] out = (T[]) java.lang.reflect.Array.newInstance(clazz, a.length);
+        for (int i = 0; i < a.length; i++) out[i] = (T) a[i];
+        return out;
     }
     @SuppressWarnings("unchecked")
     public <T extends java.io.Serializable> T getSerializable(String key, Class<T> clazz) {
-        return (T) getSerializable(key);
+        java.util.Objects.requireNonNull(clazz);
+        unparcel();
+        Object v = map.get(key);
+        return (v != null && clazz.isInstance(v)) ? (T) v : null;
     }
     @SuppressWarnings("unchecked")
     public <T> android.util.SparseArray<T> getSparseParcelableArray(String key, Class<? extends T> clazz) {
+        java.util.Objects.requireNonNull(clazz);
         return (android.util.SparseArray<T>) getSparseParcelableArray(key);
     }
 

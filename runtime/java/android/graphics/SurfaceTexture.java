@@ -871,15 +871,9 @@ public class SurfaceTexture {
     // (macapkLatchBitmap, below) instead of the fullscreen hole-punch layer
     // CocoaPresentVideoFrame uses for a plain SurfaceView.
     //
-    // MOST-RECENT-REGISTRATION-WINS, matching an existing simplification
-    // rather than introducing a new one: CocoaPresentVideoFrame's OWN
-    // fullscreen path already targets "whichever MTKView is currently
-    // active", not a specific Surface identity, because nothing upstream of
-    // it carries one either. A real per-Surface BufferQueue identity would
-    // remove the need for a registry entirely; that is a MediaCodec.java /
-    // NativeMedia.java change (threading a Surface or SurfaceTexture handle
-    // through nativeVidRender) outside this class's owned files.
-    //
+    // Legacy render callers still use the last registered candidate. MediaCodec
+    // scopes each synchronous native render to its configured Surface instead:
+    // creating a fullscreen GL output must not steal that decoder's input.
     // Weak, so a registration can never keep a SurfaceTexture -- and the
     // View/Bitmaps it drags in -- alive past its real owner's lifecycle.
     // Volatile: written from whichever thread constructs a Surface (normally
@@ -887,6 +881,24 @@ public class SurfaceTexture {
     // decode/render thread, or MediaCodec's own async dispatch thread) --
     // a plain field has no cross-thread visibility guarantee for that.
     private static volatile java.lang.ref.WeakReference<SurfaceTexture> sActiveVideoTarget;
+    private static final ThreadLocal<android.view.Surface> sVideoFrameSurface = new ThreadLocal<>();
+
+    /** Scope one synchronous native render to its codec's configured Surface.
+     *  The caller restores the returned value in finally, including nested
+     *  renders. A plain Surface explicitly bypasses unrelated texture targets. */
+    public static android.view.Surface macapkSetVideoFrameSurface(android.view.Surface surface) {
+        android.view.Surface previous = sVideoFrameSurface.get();
+        if (surface == null) sVideoFrameSurface.remove();
+        else sVideoFrameSurface.set(surface);
+        return previous;
+    }
+
+    private static SurfaceTexture videoFrameTarget() {
+        android.view.Surface surface = sVideoFrameSurface.get();
+        if (surface != null) return surface.macapkGetSurfaceTexture();
+        return sActiveVideoTarget != null ? sActiveVideoTarget.get() : null;
+    }
+
 
     /** Mac.apk framework-internal: register this instance as the current
      *  candidate destination for a decoded-video frame. Called by
@@ -910,7 +922,7 @@ public class SurfaceTexture {
      *  all? Abandoned counts as "no" even if still referenced, matching
      *  every other producer entry point's checkNotAbandoned-shaped gate. */
     public static boolean macapkHasActiveVideoTarget() {
-        SurfaceTexture t = sActiveVideoTarget != null ? sActiveVideoTarget.get() : null;
+        SurfaceTexture t = videoFrameTarget();
         return t != null && !t.mAbandoned;
     }
 
@@ -928,21 +940,31 @@ public class SurfaceTexture {
      */
     public static boolean macapkOfferDecodedFrame(int[] argb, int width, int height,
                                                   int strideInPixels) {
-        SurfaceTexture target = sActiveVideoTarget != null ? sActiveVideoTarget.get() : null;
+        SurfaceTexture target = videoFrameTarget();
         if (target == null || target.mAbandoned) return false;
         target.macapkQueueDecodedFrame(argb, width, height, strideInPixels);
         return true;
     }
+
+    private static final float[] DECODED_FRAME_TRANSFORM = {
+        1f, 0f, 0f, 0f,
+        0f, -1f, 0f, 0f,
+        0f, 0f, 1f, 0f,
+        0f, 1f, 0f, 1f,
+    };
 
     /** Mac.apk framework-internal PRODUCER entry point, decoded-video shape
      *  (the sole caller is macapkOfferDecodedFrame above). Unlike
      *  macapkQueueFrame (the metadata-only, pull-the-pixels-later shape the
      *  camera producer uses), the pixels are already in hand here, so they
      *  are stored directly rather than triggering a later pull. Now a thin
-     *  delegate of the per-instance macapkQueueProducerFrame below, with no
-     *  transform and no recycler, which is exactly what it always did. */
+     *  delegate of the per-instance macapkQueueProducerFrame below. The
+     *  pixels have top-down rows, so GL sampling needs the same vertical
+     *  transform as a buffer queued by a GL window producer. The software
+     *  consumer reads the unchanged top-down pixels directly. */
     void macapkQueueDecodedFrame(int[] argb, int width, int height, int strideInPixels) {
-        macapkQueueProducerFrame(argb, width, height, strideInPixels, null, null, false);
+        macapkQueueProducerFrame(argb, width, height, strideInPixels,
+                DECODED_FRAME_TRANSFORM, null, false);
     }
 
     // ---- Per-instance pixel producer (EGL window surfaces) ----------------
@@ -1001,7 +1023,7 @@ public class SurfaceTexture {
      *     with it.
      * @param transform the frame's 4x4 column-major texture transform, reported
      *     by getTransformMatrix once updateTexImage latches this frame, or null
-     *     to leave the current one (the decoded-video behaviour).
+     *     to leave the current one.
      * @param recycler receives {@code argb} back once the frame is consumed by
      *     either latch or superseded by a newer frame, so a producer can reuse
      *     its buffers (at most three in flight: filling, queued, latching) the
@@ -1068,8 +1090,7 @@ public class SurfaceTexture {
     }
 
     /** Consume the pushed frame's owner hooks under mLock: apply its own
-     *  transform (a GL producer's; decoded video has none, so the current
-     *  matrix is untouched exactly as before) and hand back its recycler for
+     *  texture transform and hand back its recycler for
      *  the caller to run once the pixels are copied. */
     /** One ARGB_8888 int from straight to premultiplied alpha, rounded as
      *  Skia's SkMulDiv255Round (the GLUtils upload uses the same rounding). */
@@ -1126,12 +1147,9 @@ public class SurfaceTexture {
                 // consumer shapes... mirroring the two consumers real Android
                 // has": this is a third PRODUCER shape feeding the same two
                 // consumers (this method, and updateTexImage's GL upload).
-                // The transform matrix is deliberately left untouched
-                // (identity, unless an app or earlier producer already set
-                // one): the decoded frame arrives already right-way-up and
-                // uncropped -- see cocoa_bridge.mm's extraction, a raw memcpy
-                // off the same CVPixelBuffer memory the proven SurfaceView
-                // present path reads, with no GL sampling step to correct for.
+                // The bitmap consumes top-down pixels directly. Its GL
+                // sampling transform is still latched as frame metadata,
+                // but is not applied to this software copy.
                 vArgb = mVideoFrameArgb; vW = mVideoFrameW; vH = mVideoFrameH;
                 vStride = mVideoFrameStride;
                 mCurrentTimestamp = mPendingTimestamp;

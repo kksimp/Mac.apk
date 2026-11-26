@@ -435,9 +435,36 @@ std::string read_elf32(const std::string& path, Elf32Image* out,
             } else {
                 plt_addr = plt->sh_addr + ARM_PLT0_SIZE + i * ARM_PLT_ENTRY;
             }
+            // Interworking PLT (GNU ld, Thumb-compiled library): some entries
+            // are `bx pc ; nop` (Thumb 0x4778 0x46c0) followed by the three
+            // ARM instructions, so the entry is reachable at TWO addresses: a
+            // Thumb `bl` / `b.w` branches to the veneer (stub - 4) and a
+            // `blx` or ARM `bl` to the ARM stub itself (binutils
+            // elf32-arm.c elf32_arm_plt_thumb_stub = { 0x4778, 0x46c0 }). On a
+            // device `bx pc` falls into the stub, so both mean the same
+            // import. Only the stub used to be registered: a call through
+            // the veneer ran the lifted veneer whose `ldr pc,[GOT]` read the
+            // lazy slot (PLT0), or hit the unresolved-call panic stub and
+            // returned 0 (libsqlcipher: free, pthread_mutex_lock/unlock ...,
+            // so sqlite3_initialize and sqlite3_open failed).
+            // The duplicate ImportedSymbol is appended AFTER every real
+            // import (the vector is positional for dynidx_to_import and the
+            // data-import sites), so no existing index moves.
+            uint32_t veneer = 0;
+            if (plt_addr >= plt->sh_addr + 4u) {
+                uint32_t v = 0;
+                if (read_at(out->raw, plt->sh_offset + (plt_addr - plt->sh_addr) - 4u, &v)
+                    && v == 0x46c04778u)
+                    veneer = plt_addr - 4u;
+            }
             auto it = dynidx_to_import.find(sym_idx);
             if (it != dynidx_to_import.end() && it->second < out->imports.size()) {
                 out->imports[it->second].plt_addr = plt_addr;
+                if (veneer) {
+                    ImportedSymbol dup = out->imports[it->second];
+                    dup.plt_addr = veneer;
+                    out->imports.push_back(std::move(dup));
+                }
             } else if (sym_idx < dynsym_value_by_index.size()
                        && dynsym_value_by_index[sym_idx] != 0) {
                 // .rel.plt JUMP_SLOT naming a DEFINED-LOCAL symbol -- an
@@ -456,6 +483,11 @@ std::string read_elf32(const std::string& path, Elf32Image* out,
                     ImportedSymbol is{};
                     is.name     = is_new ? "_Znwj" : "_ZdlPv";
                     is.plt_addr = plt_addr;
+                    if (veneer) {
+                        ImportedSymbol dup = is;
+                        dup.plt_addr = veneer;
+                        out->imports.push_back(std::move(dup));
+                    }
                     out->imports.push_back(std::move(is));
                 } else {
                     // Bind the GOT slot to the local definition: st_value +
@@ -511,6 +543,9 @@ std::string read_elf32(const std::string& path, Elf32Image* out,
                     // address spaces; do not unify them.
                     out->plt_local_bindings.emplace_back(
                         plt_addr, dynsym_value_by_index[sym_idx]);
+                    if (veneer)
+                        out->plt_local_bindings.emplace_back(
+                            veneer, dynsym_value_by_index[sym_idx]);
                 }
             }
         }

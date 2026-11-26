@@ -18,9 +18,21 @@ package android.os;
 public final class ServiceManager {
     private ServiceManager() {}
 
+    public static class ServiceNotFoundException extends Exception {
+        public ServiceNotFoundException(String name) {
+            super("No service published for: " + name);
+        }
+    }
+
     public static IBinder getService(String name) { return null; }
     public static IBinder checkService(String name) { return null; }
-    public static IBinder getServiceOrThrow(String name) throws Exception { return null; }
+    public static IBinder getServiceOrThrow(String name) throws ServiceNotFoundException {
+        IBinder service = getService(name);
+        if (service != null) {
+            return service;
+        }
+        throw new ServiceNotFoundException(name);
+    }
     public static IBinder waitForService(String name) { return null; }
     public static IBinder waitForDeclaredService(String name) { return null; }
     public static void addService(String name, IBinder service) {}

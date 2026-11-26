@@ -1802,6 +1802,9 @@ public class Activity extends ContextThemeWrapper
             mStatusBarColor = r[0];
             mNavigationBarColor = r[1];
             mEdgeToEdgeEnforced = r[2] != 0;
+            // PhoneWindow.generateLayout (:2502-2506): enforcement also resets
+            // the divider colour to TRANSPARENT.
+            if (mEdgeToEdgeEnforced) mNavigationBarDividerColor = 0;
         }
 
         /** One theme BOOLEAN, read RAW rather than through TypedArray.
@@ -2093,6 +2096,14 @@ public class Activity extends ContextThemeWrapper
             if (!MACAPK_WINDOW_BAR_COLORS) return;
             mNavigationBarColor = color;
             mForcedNavigationBarColor = true;
+        }
+
+        /** PhoneWindow.setNavigationBarDividerColor (:4025-4033): ignored once
+         *  edge-to-edge is enforced, otherwise stored. (Window's own body is the
+         *  empty base-class one; the getter is PhoneWindow's field read.) */
+        @Override public void setNavigationBarDividerColor(int dividerColor) {
+            if (MACAPK_WINDOW_BAR_COLORS && mEdgeToEdgeEnforced) return;
+            super.setNavigationBarDividerColor(dividerColor);
         }
 
         @Override public android.view.View getDecorView() {
@@ -3726,7 +3737,9 @@ public class Activity extends ContextThemeWrapper
         }
         android.app.Application a = android.app.Application.macapk_get();
         String p = (a != null) ? a.getPackageName() : null;
-        return (p != null) ? p : "";
+        if (p != null && !p.isEmpty()) return p;
+        String installed = com.macapk.loader.Boot.packageName();
+        return installed != null ? installed : "";
     }
     @Override public File getFilesDir()           { return application != null ? application.getFilesDir() : new File("."); }
     @Override public File getCacheDir()           { return application != null ? application.getCacheDir() : new File("."); }
@@ -4330,8 +4343,9 @@ public class Activity extends ContextThemeWrapper
      *  would double-dispatch). What is left is AOSP's override point, which is
      *  also what makes Activity a complete ComponentCallbacks2. */
     public void onLowMemory() {}
-    public boolean isImmersive() { return false; }
-    public void setImmersive(boolean i) {}
+    private boolean mImmersive;
+    public boolean isImmersive() { return mImmersive; }
+    public void setImmersive(boolean i) { mImmersive = i; }
     // API 27+: show over the lock screen / wake the screen. No lock
     // screen on Mac.apk; flags are inert (Calculator sets both in
     // onStart).
@@ -4557,8 +4571,12 @@ public class Activity extends ContextThemeWrapper
     }
 
     public android.app.PendingIntent createPendingResult(int requestCode, android.content.Intent data, int flags) { return null; }
-    public android.media.session.MediaController getMediaController() { return null; }
-    public void setMediaController(android.media.session.MediaController controller) { }
+    public android.media.session.MediaController getMediaController() {
+        return windowImpl != null ? windowImpl.getMediaController() : null;
+    }
+    public void setMediaController(android.media.session.MediaController controller) {
+        getWindow().setMediaController(controller);
+    }
     public android.content.SharedPreferences getPreferences(int mode) {
         return getSharedPreferences(getClass().getName(), mode);
     }

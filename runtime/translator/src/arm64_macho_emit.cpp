@@ -343,7 +343,8 @@ int emit_arm64_wrapper_dylib(const std::string& out_path,
                              const std::string& soname,
                              const std::string& shim_install_name,
                              const std::string& shim_dir,
-                             bool verbose) {
+                             bool verbose,
+                             bool deferred_jni_onload) {
     const size_t N = exports.size();
 
     // t3-mmap-emit (2026-07-24): which of the two wrapper formats to emit.
@@ -625,11 +626,13 @@ int emit_arm64_wrapper_dylib(const std::string& out_path,
     const size_t ctor_insn_count = gen_ctor().size();
     const uint64_t ctor_bytes = ctor_insn_count * 4;
 
-    // Trampoline size for export i (4 or 5 instructions).
-    auto tramp_insn_count = [](size_t i) -> size_t {
+    // Ordinary trampolines use 4 or 5 instructions; an optional JNI lifecycle
+    // trampoline adds four instructions for the specified no-hook default.
+    auto tramp_insn_count = [&](size_t i) -> size_t {
         size_t off = i * 8;
         size_t high = off >> 12;
-        return high > 0 ? 5 : 4;
+        const bool optional_jni = deferred_jni_onload && exports[i]->name == "JNI_OnLoad";
+        return (high > 0 ? 5 : 4) + (optional_jni ? 4 : 0);
     };
     // __text total = constructor + all trampolines.
     uint64_t text_size = ctor_bytes;
@@ -749,6 +752,15 @@ int emit_arm64_wrapper_dylib(const std::string& out_path,
             text.u32(enc_add_imm(16, 16, uint32_t(high), 1));        // add x16, x16, #high, lsl #12
         }
         text.u32(enc_ldr_imm(16, 16, uint32_t(low)));               // ldr x16, [x16, #low]
+        if (deferred_jni_onload && exports[i]->name == "JNI_OnLoad") {
+            // A real post-constructor hook receives the original VM/reserved
+            // arguments verbatim. With no hook, JNI specifies version 1.1 as
+            // the VM's normal default; no guest initializer is skipped.
+            text.u32(enc_cbz(16, 16) | 0x01000000u);               // cbnz x16, real
+            text.u32(enc_movz(0, 1, 0));                           // x0 = JNI_VERSION_1_1
+            text.u32(enc_movk(0, 1, 1));
+            text.u32(enc_ret());
+        }
         text.u32(enc_br(16));                                       // br x16
     }
     if (text.size() != text_size) {

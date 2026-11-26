@@ -79,6 +79,12 @@ public class Binder implements IBinder {
         if (data != null) {
             data.setDataPosition(0);
         }
+        // No transaction-depth marking here: AOSP's transact() is exactly
+        // "rewind, onTransact, rewind". Binder.isDirectlyHandlingTransaction()
+        // is true only while the binder driver is dispatching a call
+        // (IPCThreadState serving-call state), never for a local in-process
+        // transact(), so getCallingUidOrThrow() throws there on a device too.
+        // Only the cross-process path (MacApkBinderTransport) marks depth.
         boolean r = onTransact(code, data, reply, flags);
         if (reply != null) {
             reply.setDataPosition(0);
@@ -120,6 +126,9 @@ public class Binder implements IBinder {
     // checks the header against the pid it launched.) With no dispatch on the
     // thread, the answers are this process's, unchanged.
     static final ThreadLocal<long[]> sCallingIdentity = new ThreadLocal<>();
+    static final ThreadLocal<Integer> sTransactionDepth = ThreadLocal.withInitial(() -> 0);
+    static final ThreadLocal<Integer> sExplicitIdentityDepth = ThreadLocal.withInitial(() -> 0);
+
     public static int getCallingPid() {
         long[] id = sCallingIdentity.get();
         return id != null ? (int) id[0] : android.os.Process.myPid();
@@ -140,9 +149,15 @@ public class Binder implements IBinder {
     public static long clearCallingIdentity() {
         long token = ((long) getCallingUid() << 32) | (getCallingPid() & 0xffffffffL);
         sCallingIdentity.remove();
+        sExplicitIdentityDepth.set(sExplicitIdentityDepth.get() + 1);
         return token;
     }
     public static void restoreCallingIdentity(long token) {
+        int count = sExplicitIdentityDepth.get();
+        if (count > 0) {
+            if (count == 1) sExplicitIdentityDepth.remove();
+            else sExplicitIdentityDepth.set(count - 1);
+        }
         int uid = (int) (token >>> 32), pid = (int) token;
         if (pid == android.os.Process.myPid() && uid == android.os.Process.myUid()) {
             sCallingIdentity.remove();
@@ -161,12 +176,15 @@ public class Binder implements IBinder {
 
     /** AOSP :386 -- getCallingUid(), but throwing IllegalStateException when
      *  the thread is neither inside a binder transaction nor holding an
-     *  identity explicitly set by clearCallingIdentity(). Mac.apk's
-     *  clearCallingIdentity() (above) always establishes such an identity for
-     *  this process and there is exactly one identity, so the "not in a
-     *  transaction AND no explicit identity" branch cannot be reached in a way
-     *  we could distinguish -- we always have an explicit identity. */
-    public static int getCallingUidOrThrow() { return getCallingUid(); }
+     *  identity explicitly set by clearCallingIdentity(). */
+    public static int getCallingUidOrThrow() {
+        if (sTransactionDepth.get() == 0 && sExplicitIdentityDepth.get() == 0) {
+            throw new IllegalStateException(
+                    "Thread is not in a binder transaction, and the calling identity has not been "
+                            + "explicitly set via clearCallingIdentity");
+        }
+        return getCallingUid();
+    }
 
     /** AOSP :426 -- `UserHandle.of(UserHandle.getUserId(getCallingUid()))`.
      *  Ported verbatim; with a single user it resolves to user 0. */

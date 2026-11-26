@@ -32,6 +32,11 @@ public class Display {
      *  it from ROTATION_270, nor ROTATION_0 from ROTATION_180). Boot.java
      *  uses the identical width>height test for Configuration.orientation. */
     public int getRotation() {
+        return macapkRotation();
+    }
+    /** getRotation()'s answer without a Display instance, for code that must
+     *  agree with it exactly (CameraBridge.getSensorOrientation cancels it). */
+    public static int macapkRotation() {
         // v1.0.1637: the COMMITTED display (see macapkRealWidthPx), so this can
         // never disagree with Configuration.orientation mid-change.
         return (macapkRealWidthPx() > macapkRealHeightPx())

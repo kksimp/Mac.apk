@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "macapk/camera_capture.h"
+#include "macapk/screen_camera.h"
 
 // ===========================================================================
 // PIXEL FORMAT: Android YUV_420_888  <->  CoreVideo NV12
@@ -256,6 +257,10 @@ struct MacapkCamSession {
     int              width  = 0;
     int              height = 0;
     bool             running = false;
+    // screen_camera.h: this session's frames may be replaced by the screen +
+    // camera picture while the user has ticked Camera > Share Screen in
+    // Camera (off until then). Only the built-in camera.
+    bool             screenCamera = false;
 };
 
 // Delegate: runs on the session's private serial queue.
@@ -283,8 +288,15 @@ struct MacapkCamSession {
     int64_t ns = CMTIME_IS_VALID(pts)
         ? (int64_t)(CMTimeGetSeconds(pts) * 1.0e9) : 0;
 
-    CVPixelBufferRef pb = (CVPixelBufferRef)CFRetain(img);
-    CVPixelBufferRef pbLatest = (CVPixelBufferRef)CFRetain(img);
+    // With the screen camera on, every consumer gets the composite instead,
+    // at the same size and format; until the screen is captured (or if it is
+    // refused) the camera frame itself goes through.
+    CVPixelBufferRef composite = s->screenCamera
+        ? macapk_screencam_compose((CVPixelBufferRef)img) : nullptr;
+    CVImageBufferRef frame = composite ? composite : img;
+    CVPixelBufferRef pb = (CVPixelBufferRef)CFRetain(frame);
+    CVPixelBufferRef pbLatest = (CVPixelBufferRef)CFRetain(frame);
+    if (composite) CFRelease(composite);
 
     CVPixelBufferRef displaced = nullptr;
     CVPixelBufferRef displacedLatest = nullptr;
@@ -343,8 +355,10 @@ bool macapk_cam_device_info(int index, MacapkCamDeviceInfo* out) {
         copy_str(out->id,   sizeof(out->id),   d.uniqueID);
         copy_str(out->name, sizeof(out->name), d.localizedName);
         out->facing = facing_for(d);
-        // A Mac's camera sensor does not rotate with the device, so camera2's
-        // SENSOR_ORIENTATION is 0 and no preview rotation is implied.
+        // A Mac's camera sensor does not rotate with the device, so its BASE
+        // orientation is 0. The value apps are told is
+        // CameraBridge.getSensorOrientation, which adds what cancels the
+        // window's reported display rotation.
         out->sensorOrientation = 0;
         out->formatCount = (int32_t)d.formats.count;
         return true;
@@ -454,6 +468,7 @@ MacapkCamSession* macapk_cam_open(int index) {
         }
 
         MacapkCamSession* s = new MacapkCamSession();
+        s->screenCamera = macapk_screencam_enabled() && facing_for(dev) == MACAPK_CAM_FACING_FRONT;
         s->device  = [dev retain];
         s->input   = [in retain];
         s->session = [[AVCaptureSession alloc] init];
@@ -494,6 +509,8 @@ MacapkCamSession* macapk_cam_open(int index) {
         if (trace_on())
             std::fprintf(stderr, "[camera] opened '%s' %dx%d\n",
                          dev.localizedName.UTF8String, s->width, s->height);
+        // The app now uses a camera: the Camera menu may appear (screen_camera.h).
+        macapk_screencam_camera_opened(dev.localizedName.UTF8String, s->screenCamera);
         return s;
     }
 }
@@ -547,6 +564,45 @@ bool macapk_cam_configure(MacapkCamSession* s, int width, int height, int fps) {
         CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(best.formatDescription);
         s->width  = d.width;
         s->height = d.height;
+        // Make the DELIVERED frames match the size reported above. On macOS,
+        // startRunning re-applies the session preset (High = the camera's
+        // largest format) over an activeFormat chosen while unlocked, so the
+        // camera kept delivering 1920x1080 while this session reported the
+        // 640x480 the app asked for -- measured 2026-11-12 on OurFamilyWizard's
+        // Twilio preview (WebRTC sizes its frames from the requested format,
+        // so the 16:9 image was squeezed into 4:3). Asking the output to scale
+        // to the chosen dimensions makes the delivered size right whatever the
+        // preset does. How a differently shaped capture is fitted is
+        // AVFoundation's default for a data output, which is not set here: on
+        // the measured camera the 640x480 frames kept the picture's
+        // proportions (the same preview, 2026-11-12). A camera where they do
+        // not would want AVVideoScalingModeKey here.
+        s->output.videoSettings = @{
+            (id)kCVPixelBufferPixelFormatTypeKey : @(wanted_pixel_format()),
+            (id)kCVPixelBufferWidthKey  : @(s->width),
+            (id)kCVPixelBufferHeightKey : @(s->height),
+        };
+        // The pixel buffers must be UNMIRRORED: the front camera's mirror is
+        // applied downstream, once, by the transform matrix that
+        // android.hardware.Camera / camera2 hand to SurfaceTexture consumers
+        // (MTX_FLIP_V_FRONT), as a device's front-camera stream transform
+        // does. If AVFoundation mirrored the buffers as well, the two would
+        // cancel. Measured 2026-11-12: on a MacBook Air's built-in camera the
+        // connection was already unmirrored (supported=1 auto=0 mirrored=0),
+        // so this is a guard, not the fix for a measured fault; it pins the
+        // state for cameras or macOS versions that default otherwise.
+        AVCaptureConnection* conn = [s->output connectionWithMediaType:AVMediaTypeVideo];
+        if (conn) {
+            if (trace_on())
+                std::fprintf(stderr, "[camera] connection mirroring before: supported=%d "
+                             "auto=%d mirrored=%d\n", (int)conn.isVideoMirroringSupported,
+                             (int)conn.automaticallyAdjustsVideoMirroring,
+                             (int)conn.isVideoMirrored);
+            if (conn.isVideoMirroringSupported) {
+                conn.automaticallyAdjustsVideoMirroring = NO;
+                conn.videoMirrored = NO;
+            }
+        }
         if (trace_on())
             std::fprintf(stderr, "[camera] configured %dx%d @%dfps (asked %dx%d)\n",
                          s->width, s->height, fps, width, height);
@@ -566,6 +622,7 @@ bool macapk_cam_start(MacapkCamSession* s) {
         // our frame lock. It does not need the main thread.
         [s->session startRunning];
         s->running = s->session.isRunning;
+        if (s->running && s->screenCamera) macapk_screencam_session_started();
         if (trace_on())
             std::fprintf(stderr, "[camera] start -> %s\n", s->running ? "running" : "FAILED");
         return s->running;
@@ -578,6 +635,7 @@ void macapk_cam_stop(MacapkCamSession* s) {
         if (!s->running) return;
         [s->session stopRunning];
         s->running = false;
+        if (s->screenCamera) macapk_screencam_session_stopped();
         // Drop any undrained frame so a restart does not hand out a stale one.
         // The latest-frame ref goes too: a stopped camera must not keep
         // serving its final frame to a SurfaceTexture latch as if live.

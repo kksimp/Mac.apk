@@ -24,6 +24,9 @@
 package android.view.accessibility;
 
 public class AccessibilityNodeProvider {
+    /** AOSP: the virtual view id that denotes the host View itself. */
+    public static final int HOST_VIEW_ID = -1;
+
     public AccessibilityNodeProvider() {}
 
     /** AOSP default (AccessibilityNodeProvider.java:198-200): no virtual

@@ -72,9 +72,43 @@ public final class ClassLoaderPathSmoke {
         }
         System.out.println("app-resources: PASS (append/prepend, original archive bytes, enumeration, removal)");
     }
+    // Both callers must reach findClass before either defines Choice. This
+    // exercises the upstream unlocked delegation with the PR's live path.
+    static final class RacingLoader extends PathClassLoader {
+        static { registerAsParallelCapable(); }
+        final java.util.concurrent.CyclicBarrier start = new java.util.concurrent.CyclicBarrier(2);
+        RacingLoader(String path) { super(path, ClassLoader.getPlatformClassLoader()); }
+        @Override protected Class<?> findClass(String name) throws ClassNotFoundException {
+            if (name.equals("Choice")) {
+                try { start.await(10, java.util.concurrent.TimeUnit.SECONDS); }
+                catch (Exception ex) { throw new AssertionError("class loading did not reach both callers", ex); }
+            }
+            return super.findClass(name);
+        }
+    }
+    static void concurrentMutatedPath(Path root) throws Exception {
+        if ("0".equals(System.getenv("MACAPK_UNLOCKED_DELEGATION"))) return;
+        Path a=jar(root,"race-original","old","RaceOldOnly"), b=jar(root,"race-patch","new","RaceNewOnly");
+        try (RacingLoader loader=new RacingLoader(a.toString())) {
+            Field pf=BaseDexClassLoader.class.getDeclaredField("pathList"); pf.setAccessible(true);
+            Object paths=pf.get(loader);
+            Field ef=paths.getClass().getDeclaredField("dexElements"); ef.setAccessible(true);
+            Method make=paths.getClass().getDeclaredMethod("makeDexElements",List.class,File.class,List.class,ClassLoader.class); make.setAccessible(true);
+            ef.set(paths,make.invoke(null,List.of(b.toFile()),root.toFile(),new ArrayList<IOException>(),loader));
+            var pool=java.util.concurrent.Executors.newFixedThreadPool(2);
+            try {
+                var first=pool.submit(() -> loader.loadClass("Choice"));
+                var second=pool.submit(() -> loader.loadClass("Choice"));
+                Class<?> winner=first.get(15,java.util.concurrent.TimeUnit.SECONDS);
+                check(winner==second.get(15,java.util.concurrent.TimeUnit.SECONDS),"racing lookups return the same class");
+                check("new".equals(winner.getMethod("value").invoke(null)),"racing lookup honors the changed path");
+            } finally { pool.shutdownNow(); }
+        }
+        System.out.println("loader-concurrency: PASS (parallel definition on mutated dex path)");
+    }
     public static void main(String[] args) throws Exception {
         Path root=Files.createTempDirectory("macapk-loader-smoke-");
-        try { loader(root); mainResources(root); }
+        try { loader(root); mainResources(root); concurrentMutatedPath(root); }
         finally { try(var paths=Files.walk(root)){for(Path p:paths.sorted(Comparator.reverseOrder()).toList())Files.deleteIfExists(p);} }
     }
 }

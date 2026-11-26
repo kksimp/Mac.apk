@@ -78,6 +78,7 @@
 #include <ifaddrs.h>       // getifaddrs -- backs the AF_NETLINK RTM_GETADDR emulation
 #include <net/if.h>        // if_nametoindex for the emulated netlink ifa_index
 #include <net/if_dl.h>     // sockaddr_dl / LLADDR for the Linux-shaped getifaddrs
+#include <sys/sockio.h>    // SIOCGIFFLAGS, translated from Linux's in macapk_ifreq_ioctl
 #include <arpa/inet.h>     // inet_ntop for the net-trace diagnostic
 #include <mach/mach.h>     // mach_vm_read_overwrite for tracer safe-read
 #include <mach/mach.h>     // mach_vm_read_overwrite for tracer safe-read
@@ -1046,6 +1047,81 @@ static void arena_unseal_range(uint32_t lo, uint32_t hi) {
 
 // SIGSEGV hook. Returns true when the fault was ours and has been
 // healed, meaning the handler should return and let the store retry.
+// v1.0.2393: the JNI proxy pages are READ-ONLY once installed
+// (MACAPK_JNI_PROXY_SEAL, default ON; =0 leaves them writable as before).
+//
+// The ARM32 guest's JNIEnv / JavaVM structs and their function tables are
+// plain guest memory at 0x38000000 / 0x3C000000 (kProxyEnvBase /
+// kVmProxyBase). ART's own table (art::gJniNativeInterface) is const data in
+// a RELRO segment, so on a device a stray store over it faults at the writer.
+// Ours was writable, so a wild guest store silently replaced JNI function
+// pointers and the damage surfaced much later as "indirect call through NULL
+// function pointer" at some innocent env->SetIntField (e-Anatomy: OpenSSL's
+// bsaes key schedule, handed a garbage round count, wrote round keys over the
+// table). Sealed, the same store faults HERE and this names it.
+//
+// The page is NOT re-opened: the line below is printed and the fault continues
+// to the ordinary handling of a fault in guest code (for a lifted ARM32
+// native that is the existing SEGV recovery, which abandons the native), so
+// the store never lands and the table stays intact for every other caller.
+constexpr uint32_t kJniSealEnvPage = 0x38000000u;
+constexpr uint32_t kJniSealVmPage  = 0x3C000000u;
+constexpr uint32_t kJniSealBytes   = 0x4000u;      // one 16 KiB host page each
+static std::atomic<bool> g_jni_proxy_sealed{false};
+static bool jni_proxy_seal_enabled() {
+    static const bool on = []() {
+        const char* v = std::getenv("MACAPK_JNI_PROXY_SEAL");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+static void jni_proxy_name_fault(void* fault_addr, void* ucontext) {
+    if (!g_jni_proxy_sealed.load(std::memory_order_relaxed) || !g_guest_base ||
+        !fault_addr) return;
+    const uintptr_t p = reinterpret_cast<uintptr_t>(fault_addr);
+    const uintptr_t b = reinterpret_cast<uintptr_t>(g_guest_base);
+    if (p < b || p - b > 0xffffffffull) return;
+    const uint32_t va = static_cast<uint32_t>(p - b);
+    const bool env_pg = va >= kJniSealEnvPage && va < kJniSealEnvPage + kJniSealBytes;
+    const bool vm_pg  = va >= kJniSealVmPage  && va < kJniSealVmPage  + kJniSealBytes;
+    if (!env_pg && !vm_pg) return;
+    void* pc = nullptr; unsigned long long lr = 0, r0 = 0, r1 = 0, gsp = 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (ucontext) {
+        auto* uc = static_cast<ucontext_t*>(ucontext);
+        if (uc->uc_mcontext) {
+            pc  = reinterpret_cast<void*>(uc->uc_mcontext->__ss.__pc);
+            lr  = uc->uc_mcontext->__ss.__lr;
+            r0  = uc->uc_mcontext->__ss.__x[0] & 0xffffffffull;
+            r1  = uc->uc_mcontext->__ss.__x[1] & 0xffffffffull;
+            gsp = uc->uc_mcontext->__ss.__x[27] & 0xffffffffull;   // arm32rc guest sp
+        }
+    }
+#else
+    (void)ucontext;
+#endif
+    const uint32_t off = va & (kJniSealBytes - 1);
+    char what[96];
+    if (env_pg && off >= 0x100 && off < 0x500)
+        std::snprintf(what, sizeof what, "JNIEnv function table, slot %u (offset 0x%x)",
+                      (off - 0x100) / 4, off - 0x100);
+    else if (env_pg)
+        std::snprintf(what, sizeof what, "a JNIEnv struct");
+    else if (off >= 0x100 && off < 0x200)
+        std::snprintf(what, sizeof what, "JavaVM function table, offset 0x%x", off - 0x100);
+    else
+        std::snprintf(what, sizeof what, "a JavaVM struct");
+    // No dladdr (see arena_wx_heal_fault): `atos -o <lib>.dylib <pc>` offline.
+    std::fprintf(stderr,
+        "[macapk-shim] STRAY GUEST WRITE to the read-only JNI proxy page: guest "
+        "vaddr 0x%x = %s. Writer: host pc=%p lr=0x%llx (guest r0=0x%llx "
+        "r1=0x%llx sp=0x%llx). Native code stored through a wild pointer; "
+        "the store is refused and the JNI table is intact. "
+        "MACAPK_JNI_PROXY_SEAL=0 leaves the page writable.\n",
+        va, what, pc, lr, r0, r1, gsp);
+    std::fflush(stderr);
+}
+
 static bool arena_wx_heal_fault(void* fault_addr, void* ucontext) {
     if (!g_arena_sealed_pages || !g_guest_base || !fault_addr) return false;
     const uintptr_t p = reinterpret_cast<uintptr_t>(fault_addr);
@@ -1413,12 +1489,29 @@ extern "C" void __macapk_capture_entry(uint32_t fn_vaddr,
         if (first_only && first_done) return;
         first_done = true;
     }
-    if (g_diff_captured.count(fn_vaddr)) return;    // first invocation only
-    g_diff_captured.insert(fn_vaddr);
+    // MACAPK_DIFF_EVERY=<n> (diagnostic): capture the first n invocations of a
+    // function instead of only the first, as entry_<vaddr>.<k>.txt /
+    // mem_<vaddr>.<k>.bin (k = 0..n-1). For a defect that shows on a LATER
+    // call (the state at the failing call is what an offline reader needs).
+    // No trace sink is armed in this mode.
+    static const int every_n = []() {
+        const char* e = std::getenv("MACAPK_DIFF_EVERY");
+        return (e && *e) ? std::atoi(e) : 0;
+    }();
+    static std::map<uint32_t, int> every_count;
+    char sfx[24] = "";
+    if (every_n > 0) {
+        int& k = every_count[fn_vaddr];
+        if (k >= every_n) return;
+        std::snprintf(sfx, sizeof(sfx), ".%d", k++);
+    } else {
+        if (g_diff_captured.count(fn_vaddr)) return;    // first invocation only
+        g_diff_captured.insert(fn_vaddr);
+    }
 
     char path[1100];
     // (1) registers + ISA mode.
-    std::snprintf(path, sizeof(path), "%s/entry_%08x.txt", dir, fn_vaddr);
+    std::snprintf(path, sizeof(path), "%s/entry_%08x%s.txt", dir, fn_vaddr, sfx);
     if (std::FILE* f = std::fopen(path, "w")) {
         std::fprintf(f,
             "vaddr 0x%08x\nthumb %u\nr0 0x%08x\nr1 0x%08x\nr2 0x%08x\n"
@@ -1435,7 +1528,7 @@ extern "C" void __macapk_capture_entry(uint32_t fn_vaddr,
     // (MAP_ANON) and the harness zero-fills on demand, so omission is
     // faithful, not lossy.
     if (g_guest_base) {
-        std::snprintf(path, sizeof(path), "%s/mem_%08x.bin", dir, fn_vaddr);
+        std::snprintf(path, sizeof(path), "%s/mem_%08x%s.bin", dir, fn_vaddr, sfx);
         if (std::FILE* f = std::fopen(path, "wb")) {
             const size_t pg = static_cast<size_t>(sysconf(_SC_PAGESIZE));
             const size_t chunk_pages = 4096;
@@ -2739,14 +2832,6 @@ extern "C" void* __macapk_pairip_run_resolver(void* realfn, void* env, void* cls
     return nullptr;
 }
 
-// v1.0.1582: the JVM's JNI String-family functions (jni_GetStringLength,
-// GetStringUTFLength, GetStringChars, ...), by their raw entry address. Captured
-// once from the JNIEnv vtable in __macapk_install_jni_bionic_variadic_bridge so
-// the SEGV handler can recognise a fault inside one WITHOUT a signal-unsafe
-// dladdr. See try_recover_jni_getstring_fault.
-static void* g_jni_string_fns[8] = {0};
-static int   g_jni_string_fn_count = 0;
-
 // ---- SAFE jstring PROBE (v1.0.1595) -- the fix for the fast-JNI GC deadlock ----
 //
 // THE BUG THIS REPLACES. Facebook's fast-JNI (Instagram/Threads/Messenger, via
@@ -2919,48 +3004,12 @@ static bool macapk_jstring_handle_ok(jstring s) {
     return ok;
 }
 
-// Recover a SIGSEGV that faulted INSIDE one of the JVM's JNI GetString* functions
-// on a garbage jstring, by returning 0/null to the guest caller (x0=0, pc=lr)
-// instead of aborting.
-//
-// WHY THIS IS SAFE and WHY IT UNBLOCKS. These functions start by resolving the
-// jstring handle to an oop and reading a field of it; a bad jstring faults on
-// THAT early deref, before any lock is taken or object allocated, so forcing an
-// immediate `return 0` leaves the JVM in a clean state (x0 is the return
-// register, lr the caller's return address; the callee-saved frame is untouched
-// because the fault is in the prologue/first load). The motivating caller is
-// Facebook's crash-reporter fast-JNI SELF-TEST (Instagram): it reads ART object
-// internals via Unsafe -- which HotSpot cannot provide, so MacApkUnsafe answers
-// EMPTY -- builds a bogus jstring, GetStringLengths it to check the fast path,
-// and on ART would get a length; here it faults. Returning 0 makes the self-test
-// see "fast-JNI is broken" and FALL BACK to standard JNI, which works. A genuine
-// GetStringLength on a valid jstring never faults, so this only ever fires on a
-// guest's own bad handle. Kill switch MACAPK_JNI_STRING_RECOVERY_OFF.
-static bool try_recover_jni_getstring_fault(siginfo_t* /*info*/, ucontext_t* uc) {
-    static const bool s_off = std::getenv("MACAPK_JNI_STRING_RECOVERY_OFF") != nullptr;
-    if (s_off || !uc || !uc->uc_mcontext || g_jni_string_fn_count == 0) return false;
-    uintptr_t pc = uc->uc_mcontext->__ss.__pc;
-    for (int i = 0; i < g_jni_string_fn_count; ++i) {
-        uintptr_t fn = reinterpret_cast<uintptr_t>(g_jni_string_fns[i]);
-        // The fault lands in the function's prologue/first oop deref -- measured
-        // at +0x60 for GetStringLength. 0x600 covers the whole small function
-        // while staying far short of the next JNI entry.
-        if (fn && pc >= fn && pc < fn + 0x600) {
-            uc->uc_mcontext->__ss.__x[0] = 0;                 // return 0 / null
-            uc->uc_mcontext->__ss.__pc  = uc->uc_mcontext->__ss.__lr;  // return to caller
-            static std::atomic<int> n{0};
-            if (n.fetch_add(1) < 8) {
-                std::fprintf(stderr,
-                    "[jni-str-recover] fault inside JVM JNI GetString* (fn#%d @%p, "
-                    "pc=%p) on a bad jstring -> returned 0 (guest fast-JNI probe will "
-                    "fall back to standard JNI)\n", i, (void*)fn, (void*)pc);
-                std::fflush(stderr);
-            }
-            return true;
-        }
-    }
-    return false;
-}
+// Never recover by jumping out of a HotSpot JNI entry. Its prologue can have
+// changed SP/LR and transitioned the thread into the VM; bypassing its epilogue
+// strands safepoints. A former +0x600 string-function PC range also matched
+// GetArrayLength and jumped back inside that function, spinning indefinitely.
+// Bad-string probing remains in the native wrappers before they enter the JVM.
+// Faults inside the JVM continue through the normal HotSpot signal chain.
 
 // A guest STORE into one of OUR host executable pages: an inline-hook install.
 // Measured on Instagram, libbreakpad (Google's crash reporter) mprotects a
@@ -3199,6 +3248,22 @@ static void macapk_fatal_reraise(int sig) {
 }
 
 #include "guest_rwx.h"
+
+extern "C" void* __macapk_arm64_memcpy(void* destination,const void* source,size_t length) {
+    void* result=nullptr;
+    if(macapk::rwx::copy(destination,source,length,false,result)) return result;
+    return std::memcpy(destination,source,length);
+}
+extern "C" void* __macapk_arm64_memmove(void* destination,const void* source,size_t length) {
+    void* result=nullptr;
+    if(macapk::rwx::copy(destination,source,length,true,result)) return result;
+    return std::memmove(destination,source,length);
+}
+extern "C" void* __macapk_arm64_memset(void* destination,int value,size_t length) {
+    void* result=nullptr;
+    if(macapk::rwx::fill(destination,value,length,result)) return result;
+    return std::memset(destination,value,length);
+}
 #include "guest_jit_pages.h"
 
 static void macapk_segv_handler(int sig, siginfo_t* info, void* ucontext) {
@@ -3247,6 +3312,7 @@ static void macapk_segv_handler(int sig, siginfo_t* info, void* ucontext) {
 
     if (info && ucontext && macapk::jitpages::handle_fault(info, static_cast<ucontext_t*>(ucontext))) return;
     if (info && ucontext && macapk::rwx::fault(info, static_cast<ucontext_t*>(ucontext))) return;
+    if (info) jni_proxy_name_fault(info->si_addr, ucontext);   // names it, never heals
     if (info && arena_wx_heal_fault(info->si_addr, ucontext)) return;
 
     // MACAPK_PAIRIP_PG page-guard (DIAGNOSTIC, default OFF). Distinct from the
@@ -3837,12 +3903,6 @@ static void macapk_segv_handler(int sig, siginfo_t* info, void* ucontext) {
         // A guest inline-hook store into our host code pages (breakpad/profilo
         // patching libc): skip it so the hook no-ops and our .text stays intact.
         if (try_recover_guest_host_write(
-                info, static_cast<ucontext_t*>(ucontext))) {
-            return;
-        }
-        // A fault INSIDE a JVM JNI GetString* on a guest's garbage jstring:
-        // return 0 to the caller (turns a fast-JNI probe crash into a fallback).
-        if (try_recover_jni_getstring_fault(
                 info, static_cast<ucontext_t*>(ucontext))) {
             return;
         }
@@ -14186,14 +14246,47 @@ chain:
 // Default ON so Breakpad/Crashpad apps (Minecraft, many games) run out of the
 // box; set MACAPK_TRAP_INLINE_SYSCALLS=0 to disable (kill switch).
 #if defined(__APPLE__) && defined(__aarch64__)
-static long macapk_forward_inline_syscall(uint64_t nr, uint64_t /*a0*/,
-        uint64_t /*a1*/, uint64_t /*a2*/, uint64_t /*a3*/, uint64_t /*a4*/,
-        uint64_t /*a5*/) {
+extern "C" int __macapk_arm64_faccessat(int, const char*, int, int);
+extern "C" int __macapk_arm64_openat(int, const char*, int, mode_t);
+extern "C" int __macapk_errno_mac2lin(int);
+static long macapk_forward_inline_syscall(uint64_t nr, uint64_t a0,
+        uint64_t a1, uint64_t a2, uint64_t a3, uint64_t /*a4*/,
+        uint64_t /*a5*/, bool arguments_intact) {
     // Linux arm64 generic-ABI syscall numbers (verified against
     // include/uapi/asm-generic/unistd.h, 2026-07-02). The Linux syscall return
     // convention is: >=0 on success, or the NEGATED errno on failure. So an
     // error must return -errno (Linux/Bionic numbering), NEVER 0 (0 = success).
     switch (nr) {
+        case 48: // faccessat(dirfd, pathname, mode); no flags in this syscall
+        case 56: { // openat(dirfd, pathname, flags, mode)
+            // An invalid negative Mach selector raises EXC_SYSCALL before
+            // changing the saved registers. A positive BSD selector instead
+            // overwrites return registers. Only the former retains the real
+            // dirfd/path/mode; never guess arguments from a BSD error return.
+            if (!arguments_intact) return -38; // Linux ENOSYS
+            if (nr == 48 && (static_cast<uint32_t>(a2) & ~7u)) return -22; // EINVAL
+            const int saved_errno = errno;
+            if (!a1) { errno = saved_errno; return -14; } // EFAULT
+            char pathname[4096];
+            size_t n = 0;
+            for (; n < sizeof(pathname); ++n) {
+                if (!macapk_diag_safe_read(reinterpret_cast<const void*>(a1 + n),
+                                          pathname + n, 1)) {
+                    errno = saved_errno;
+                    return -14; // Linux EFAULT
+                }
+                if (!pathname[n]) break;
+            }
+            if (n == sizeof(pathname)) { errno = saved_errno; return -36; } // ENAMETOOLONG
+            const int rc = nr == 48
+                ? __macapk_arm64_faccessat(static_cast<int>(a0), pathname,
+                                           static_cast<int>(a2), 0)
+                : __macapk_arm64_openat(static_cast<int>(a0), pathname,
+                                        static_cast<int>(a2), static_cast<mode_t>(a3));
+            const int error = errno;
+            errno = saved_errno;
+            return rc < 0 ? -__macapk_errno_mac2lin(error) : rc;
+        }
         case 132: // sigaltstack   -- neutralize the crash handler's alt stack
         case 134: // rt_sigaction  -- neutralize: keep OUR crash handlers in place
         case 135: // rt_sigprocmask
@@ -14315,7 +14408,8 @@ static void macapk_sigsys_handler(int sig, siginfo_t* info, void* ucontext) {
                         "-> forwarded\n",
                         (unsigned long long)ss.__x[8], (void*)pc, esr);
                 long ret = macapk_forward_inline_syscall(ss.__x[8], ss.__x[0],
-                        ss.__x[1], ss.__x[2], ss.__x[3], ss.__x[4], ss.__x[5]);
+                        ss.__x[1], ss.__x[2], ss.__x[3], ss.__x[4], ss.__x[5],
+                        static_cast<int32_t>(ss.__x[16]) < 0);
                 ss.__x[0] = (uint64_t)ret;   // Linux ABI returns in x0
                 ss.__pc  = resume;
                 return;
@@ -17243,7 +17337,8 @@ enum JniMethod : uint32_t {
     // returned in r0" -- Android's armeabi-v7a is the AAPCS32 BASE/softfp
     // variant: developer.android.com/ndk/guides/abis confirms float/double
     // are passed and returned via core registers, not VFP registers, for ABI
-    // compatibility). Long/Double deliberately have NO enum value here: see
+    // compatibility). (SUPERSEDED v1.0.2387: Long/Double are routed now, see
+    // MacapkRet2 and the JM_W_* values.) Long/Double deliberately have NO enum value here: see
     // the comment where 0x210/0x214/0x218/0x228/0x22C/0x230 fall through to
     // default in jni_method_for_offset() for why a 64-bit JNI return cannot
     // come back through this dispatcher's single-i32 channel.
@@ -17263,6 +17358,55 @@ enum JniMethod : uint32_t {
     JM_NewObject,
     JM_NewObjectV,
     JM_NewObjectA,
+    // v1.0.2385: slots that were unrouted or silently stubbed (see the block
+    // above Stub_NotImplemented).
+    JM_Throw, JM_FatalError, JM_GetSuperclass, JM_IsSameObject,
+    JM_EnsureLocalCapacity, JM_NewWeakGlobalRef, JM_DeleteWeakGlobalRef,
+    JM_GetStringChars, JM_ReleaseStringChars, JM_GetStringRegion,
+    JM_GetStringUTFRegion, JM_NewObjectArray, JM_GetObjectArrayElement,
+    JM_SetObjectArrayElement, JM_NewDoubleArray, JM_GetPrimArrayElements,
+    JM_ReleasePrimArrayElements, JM_GetDoubleArrayRegion, JM_SetDoubleArrayRegion,
+    JM_GetByteField, JM_GetCharField, JM_GetShortField,
+    JM_SetByteField, JM_SetCharField, JM_SetShortField, JM_SetLongField,
+    JM_SetFloatField, JM_SetDoubleField,
+    JM_GetStaticObjectField, JM_GetStaticBooleanField, JM_GetStaticByteField,
+    JM_GetStaticCharField, JM_GetStaticShortField, JM_GetStaticIntField,
+    JM_GetStaticFloatField,
+    JM_SetStaticObjectField, JM_SetStaticBooleanField, JM_SetStaticByteField,
+    JM_SetStaticCharField, JM_SetStaticShortField, JM_SetStaticIntField,
+    JM_SetStaticLongField, JM_SetStaticFloatField, JM_SetStaticDoubleField,
+    // v1.0.2387: 64-bit results and the remaining Call<T>Method families.
+    JM_W_CallByteMethod,
+    JM_W_CallByteMethodV,
+    JM_W_CallByteMethodA,
+    JM_W_CallCharMethod,
+    JM_W_CallCharMethodV,
+    JM_W_CallCharMethodA,
+    JM_W_CallShortMethod,
+    JM_W_CallShortMethodV,
+    JM_W_CallShortMethodA,
+    JM_W_CallLongMethod,
+    JM_W_CallLongMethodV,
+    JM_W_CallLongMethodA,
+    JM_W_CallFloatMethod,
+    JM_W_CallFloatMethodV,
+    JM_W_CallFloatMethodA,
+    JM_W_CallDoubleMethod,
+    JM_W_CallDoubleMethodV,
+    JM_W_CallDoubleMethodA,
+    JM_W_CallStaticByteMethod,
+    JM_W_CallStaticByteMethodV,
+    JM_W_CallStaticByteMethodA,
+    JM_W_CallStaticLongMethod,
+    JM_W_CallStaticLongMethodV,
+    JM_W_CallStaticLongMethodA,
+    JM_W_CallStaticDoubleMethod,
+    JM_W_CallStaticDoubleMethodV,
+    JM_W_CallStaticDoubleMethodA,
+    JM_W_GetLongField,
+    JM_W_GetDoubleField,
+    JM_W_GetStaticLongField,
+    JM_W_GetStaticDoubleField,
     JM_COUNT
 };
 
@@ -17403,6 +17547,9 @@ static JniMethod jni_method_for_offset(uint32_t off) {
         // this dispatcher returns, same as int/char/short/boolean.
         //
         // CallStaticLong/DoubleMethod{,V,A} (slots 132-134, 138-140, offsets
+        // SUPERSEDED v1.0.2387: __macapk_indirect_call now returns r0:r1
+        // (MacapkRet2), so these slots are routed below (JM_W_*). The text
+        // that follows is the history of why they were not.
         // 0x210-0x218 and 0x228-0x230) remain DELIBERATELY unrouted -- NOT an
         // oversight. Both are double-word (64-bit) under AAPCS32 6.4: "A
         // double-word sized Fundamental Data Type (e.g., long long, double...)
@@ -17470,6 +17617,103 @@ static JniMethod jni_method_for_offset(uint32_t off) {
         case 0x394:return JM_NewDirectByteBuffer;    // slot 229
         case 0x398:return JM_GetDirectBufferAddress; // slot 230
         case 0x39C:return JM_GetDirectBufferCapacity;// slot 231
+        // v1.0.2387: 64-bit results (r0:r1 via MacapkRet2) and the remaining
+        // Call<T>Method families.
+        case 0xA0: return JM_W_CallByteMethod;  // slot 40
+        case 0xA4: return JM_W_CallByteMethodV;  // slot 41
+        case 0xA8: return JM_W_CallByteMethodA;  // slot 42
+        case 0xAC: return JM_W_CallCharMethod;  // slot 43
+        case 0xB0: return JM_W_CallCharMethodV;  // slot 44
+        case 0xB4: return JM_W_CallCharMethodA;  // slot 45
+        case 0xB8: return JM_W_CallShortMethod;  // slot 46
+        case 0xBC: return JM_W_CallShortMethodV;  // slot 47
+        case 0xC0: return JM_W_CallShortMethodA;  // slot 48
+        case 0xD0: return JM_W_CallLongMethod;  // slot 52
+        case 0xD4: return JM_W_CallLongMethodV;  // slot 53
+        case 0xD8: return JM_W_CallLongMethodA;  // slot 54
+        case 0xDC: return JM_W_CallFloatMethod;  // slot 55
+        case 0xE0: return JM_W_CallFloatMethodV;  // slot 56
+        case 0xE4: return JM_W_CallFloatMethodA;  // slot 57
+        case 0xE8: return JM_W_CallDoubleMethod;  // slot 58
+        case 0xEC: return JM_W_CallDoubleMethodV;  // slot 59
+        case 0xF0: return JM_W_CallDoubleMethodA;  // slot 60
+        case 0x194: return JM_W_GetLongField;  // slot 101
+        case 0x19C: return JM_W_GetDoubleField;  // slot 103
+        case 0x1E0: return JM_W_CallStaticByteMethod;  // slot 120
+        case 0x1E4: return JM_W_CallStaticByteMethodV;  // slot 121
+        case 0x1E8: return JM_W_CallStaticByteMethodA;  // slot 122
+        case 0x210: return JM_W_CallStaticLongMethod;  // slot 132
+        case 0x214: return JM_W_CallStaticLongMethodV;  // slot 133
+        case 0x218: return JM_W_CallStaticLongMethodA;  // slot 134
+        case 0x228: return JM_W_CallStaticDoubleMethod;  // slot 138
+        case 0x22C: return JM_W_CallStaticDoubleMethodV;  // slot 139
+        case 0x230: return JM_W_CallStaticDoubleMethodA;  // slot 140
+        case 0x25C: return JM_W_GetStaticLongField;  // slot 151
+        case 0x264: return JM_W_GetStaticDoubleField;  // slot 153
+        // v1.0.2385 additions (slot = offset / 4; libnativehelper jni.h order).
+        case 0x28: return JM_GetSuperclass;  // slot 10
+        case 0x2C: return JM_IsAssignableFrom;  // slot 11
+        case 0x34: return JM_Throw;  // slot 13
+        case 0x38: return JM_ThrowNew;  // slot 14
+        case 0x48: return JM_FatalError;  // slot 18
+        case 0x60: return JM_IsSameObject;  // slot 24
+        case 0x68: return JM_EnsureLocalCapacity;  // slot 26
+        case 0x184: return JM_GetByteField;  // slot 97
+        case 0x188: return JM_GetCharField;  // slot 98
+        case 0x18C: return JM_GetShortField;  // slot 99
+        case 0x198: return JM_GetFloatField;  // slot 102
+        case 0x1A8: return JM_SetByteField;  // slot 106
+        case 0x1AC: return JM_SetCharField;  // slot 107
+        case 0x1B0: return JM_SetShortField;  // slot 108
+        case 0x1B8: return JM_SetLongField;  // slot 110
+        case 0x1BC: return JM_SetFloatField;  // slot 111
+        case 0x1C0: return JM_SetDoubleField;  // slot 112
+        case 0x244: return JM_GetStaticObjectField;  // slot 145
+        case 0x248: return JM_GetStaticBooleanField;  // slot 146
+        case 0x24C: return JM_GetStaticByteField;  // slot 147
+        case 0x250: return JM_GetStaticCharField;  // slot 148
+        case 0x254: return JM_GetStaticShortField;  // slot 149
+        case 0x258: return JM_GetStaticIntField;  // slot 150
+        case 0x260: return JM_GetStaticFloatField;  // slot 152
+        case 0x268: return JM_SetStaticObjectField;  // slot 154
+        case 0x26C: return JM_SetStaticBooleanField;  // slot 155
+        case 0x270: return JM_SetStaticByteField;  // slot 156
+        case 0x274: return JM_SetStaticCharField;  // slot 157
+        case 0x278: return JM_SetStaticShortField;  // slot 158
+        case 0x27C: return JM_SetStaticIntField;  // slot 159
+        case 0x280: return JM_SetStaticLongField;  // slot 160
+        case 0x284: return JM_SetStaticFloatField;  // slot 161
+        case 0x288: return JM_SetStaticDoubleField;  // slot 162
+        case 0x294: return JM_GetStringChars;  // slot 165
+        case 0x298: return JM_ReleaseStringChars;  // slot 166
+        case 0x2A0: return JM_GetStringUTFLength;  // slot 168
+        case 0x2B0: return JM_NewObjectArray;  // slot 172
+        case 0x2B4: return JM_GetObjectArrayElement;  // slot 173
+        case 0x2B8: return JM_SetObjectArrayElement;  // slot 174
+        case 0x2D8: return JM_NewDoubleArray;  // slot 182
+        case 0x2DC: return JM_GetPrimArrayElements;  // slot 183
+        case 0x2E4: return JM_GetPrimArrayElements;  // slot 185
+        case 0x2E8: return JM_GetPrimArrayElements;  // slot 186
+        case 0x2EC: return JM_GetPrimArrayElements;  // slot 187
+        case 0x2F0: return JM_GetPrimArrayElements;  // slot 188
+        case 0x2F4: return JM_GetPrimArrayElements;  // slot 189
+        case 0x2F8: return JM_GetPrimArrayElements;  // slot 190
+        case 0x2FC: return JM_ReleasePrimArrayElements;  // slot 191
+        case 0x300: return JM_ReleasePrimArrayElements;  // slot 192
+        case 0x304: return JM_ReleasePrimArrayElements;  // slot 193
+        case 0x308: return JM_ReleasePrimArrayElements;  // slot 194
+        case 0x30C: return JM_ReleasePrimArrayElements;  // slot 195
+        case 0x310: return JM_ReleasePrimArrayElements;  // slot 196
+        case 0x314: return JM_ReleasePrimArrayElements;  // slot 197
+        case 0x318: return JM_ReleasePrimArrayElements;  // slot 198
+        case 0x338: return JM_GetDoubleArrayRegion;  // slot 206
+        case 0x358: return JM_SetDoubleArrayRegion;  // slot 214
+        case 0x370: return JM_GetStringRegion;  // slot 220
+        case 0x374: return JM_GetStringUTFRegion;  // slot 221
+        case 0x380: return JM_GetStringChars;  // slot 224 (Critical: same copy contract)
+        case 0x384: return JM_ReleaseStringChars;  // slot 225 (Critical: same copy contract)
+        case 0x388: return JM_NewWeakGlobalRef;  // slot 226
+        case 0x38C: return JM_DeleteWeakGlobalRef;  // slot 227
 
         // (legacy 0x208 = JM_GetMethodID dropped: per offsetof, the
         // correct slot for that offset is CallStaticIntMethodV which
@@ -17543,7 +17787,10 @@ uint32_t __macapk_jni_env_handle(JNIEnv* real_env) {
     // the address of the shared vtable installed by
     // install_jni_vtable_in_guest_memory().
     uint32_t vtable_addr = kProxyEnvBase + 0x100;
-    std::memcpy(g_guest_base + addr, &vtable_addr, sizeof(uint32_t));
+    // Already written when the page was sealed (v1.0.2393); only an env past
+    // the sealed page, or a build with the seal off, still needs the store.
+    if (std::memcmp(g_guest_base + addr, &vtable_addr, sizeof(uint32_t)) != 0)
+        std::memcpy(g_guest_base + addr, &vtable_addr, sizeof(uint32_t));
     {
         std::lock_guard<std::mutex> g(g_env_handle_mutex);
         g_env_to_handle[real_env] = addr;
@@ -17582,6 +17829,20 @@ static void install_jni_vtable_in_guest_memory() {
             vtable[off / 4] = kTrampolineBase + m * 4;
         }
     }
+    // v1.0.2393: every JNIEnv struct this page can hold is the same one word
+    // (the table's address), so write them all now and seal the page; minting
+    // an env then needs no store. See jni_proxy_name_fault.
+    static_assert(kJniSealEnvPage == kProxyEnvBase, "seal page == proxy env page");
+    if (jni_proxy_seal_enabled()) {
+        const uint32_t vt = kProxyEnvBase + 0x100;
+        for (uint32_t off = 0x500; off + 4 <= kJniSealBytes; off += 8)
+            std::memcpy(g_guest_base + kProxyEnvBase + off, &vt, 4);
+        if (::mprotect(g_guest_base + kProxyEnvBase, kJniSealBytes, PROT_READ) == 0)
+            g_jni_proxy_sealed.store(true, std::memory_order_relaxed);
+        else
+            std::fprintf(stderr, "[macapk-shim] JNI proxy page seal failed (errno %d); "
+                                 "the JNIEnv table stays writable\n", errno);
+    }
 }
 
 // JavaVM (JNIInvokeInterface) vtable in guest memory. The vtable
@@ -17610,6 +17871,15 @@ static void install_jvm_vtable_in_guest_memory() {
     vtable[0x14 / 4] = kVmTrampolineBase + VM_DetachCurrentThread       * 4;
     vtable[0x18 / 4] = kVmTrampolineBase + VM_GetEnv                    * 4;
     vtable[0x1C / 4] = kVmTrampolineBase + VM_AttachCurrentThreadAsDaemon * 4;
+    // v1.0.2393: same seal as the JNIEnv page (jni_proxy_name_fault).
+    static_assert(kJniSealVmPage == kVmProxyBase, "seal page == proxy vm page");
+    if (jni_proxy_seal_enabled()) {
+        const uint32_t vt = kVmProxyBase + 0x100;
+        for (uint32_t off = 0x400; off + 4 <= kJniSealBytes; off += 8)
+            std::memcpy(g_guest_base + kVmProxyBase + off, &vt, 4);
+        if (::mprotect(g_guest_base + kVmProxyBase, kJniSealBytes, PROT_READ) != 0)
+            std::fprintf(stderr, "[macapk-shim] JavaVM proxy page seal failed (errno %d)\n", errno);
+    }
 }
 
 // Mint a 32-bit guest handle for a real JavaVM*. The handle points
@@ -17626,7 +17896,8 @@ uint32_t __macapk_jni_vm_handle(JavaVM* real_vm) {
     static std::atomic<uint32_t> next_vm{kVmProxyBase + 0x400};
     uint32_t addr = next_vm.fetch_add(8);
     uint32_t vtable_addr = kVmProxyBase + 0x100;
-    std::memcpy(g_guest_base + addr, &vtable_addr, sizeof(uint32_t));
+    if (std::memcmp(g_guest_base + addr, &vtable_addr, sizeof(uint32_t)) != 0)
+        std::memcpy(g_guest_base + addr, &vtable_addr, sizeof(uint32_t));
     {
         std::lock_guard<std::mutex> g(g_env_handle_mutex);
         g_vm_to_handle[real_vm] = addr;
@@ -17659,6 +17930,18 @@ namespace macapk_jni {
 // Captured by the JNI dispatcher so 5+-arg JNI calls (Get*ArrayRegion,
 // etc.) can pull stack-arg values from guest memory.
 thread_local uint32_t g_jni_dispatch_sp = 0;
+
+// v1.0.2387: the high word of a 64-bit result, for __macapk_indirect_call.
+// AAPCS32 returns a jlong / jdouble in r0:r1, and a forwarder's C return type
+// carries r0 only; a forwarder with a wide result calls jni_wide_return(),
+// which parks the high word here for the dispatcher to hand back as guest r1.
+thread_local uint32_t g_ret_r1 = 0;
+thread_local bool     g_ret_r1_valid = false;
+static inline uint32_t jni_wide_return(uint64_t v) {
+    g_ret_r1 = static_cast<uint32_t>(v >> 32);
+    g_ret_r1_valid = true;
+    return static_cast<uint32_t>(v);
+}
 
 // Forward decl: the process JavaVM captured at env-registration time.
 JNIEnv* env_for(uint32_t env_handle) {
@@ -19067,6 +19350,45 @@ static void log_variadic_call(const char* variant,
     }
 }
 
+// v1.0.2387: what happens to an exception a Java method throws when ARM32
+// native code called it through a Call*Method / NewObject forwarder.
+//
+// JNI (and ART, art/runtime/jni/jni_internal.cc: the Call* functions return
+// with the exception still set on the thread) leaves it PENDING: the native
+// tests it with ExceptionCheck / ExceptionOccurred and clears or returns, and
+// if it returns the exception propagates into the Java caller. These
+// forwarders used to ExceptionDescribe + ExceptionClear instead, so the native
+// saw "no exception, result 0" and a failing Java call was invisible to both
+// sides. Now it stays pending and the forwarder returns 0, as on a device.
+//
+// MACAPK_ARM32_JNI_EXC_PENDING (default ON; =0 restores describe-and-clear)
+// is the bisect lever for an app that turns out to have depended on the
+// swallowing. First few occurrences are logged so a newly visible exception
+// is easy to find in a run log.
+static bool a32_exc_pending_on() {
+    static const bool on = []() {
+        const char* v = std::getenv("MACAPK_ARM32_JNI_EXC_PENDING");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+static bool a32_java_threw(JNIEnv* e) {
+    if (!e->ExceptionCheck()) return false;
+    if (!a32_exc_pending_on()) {
+        e->ExceptionDescribe();
+        e->ExceptionClear();
+        return true;
+    }
+    static std::atomic<uint64_t> g_n{0};
+    const uint64_t k = g_n.fetch_add(1, std::memory_order_relaxed);
+    if (k < 8 || (k % 1000) == 0)
+        std::fprintf(stderr,
+            "[macapk-shim] JNI(arm32): a Java method called from native threw; "
+            "the exception stays pending for the native (count=%llu)\n",
+            static_cast<unsigned long long>(k));
+    return true;
+}
+
 uint32_t CallStaticBooleanMethodV(uint32_t env_h, uint32_t cls_h,
                                   uint32_t mid_h, uint32_t va_list_ptr) {
     JNIEnv* e = env_for(env_h);
@@ -19084,9 +19406,7 @@ uint32_t CallStaticBooleanMethodV(uint32_t env_h, uint32_t cls_h,
                                        int(sizeof(jv) / sizeof(jv[0])));
     }
     jboolean r = e->CallStaticBooleanMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return r ? 1u : 0u;
@@ -19129,9 +19449,7 @@ uint32_t CallStaticObjectMethod(uint32_t env_h, uint32_t cls_h,
             static_cast<int>(std::size(jv)));
     }
     jobject r = e->CallStaticObjectMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     if (!r) {
@@ -19194,9 +19512,7 @@ uint32_t CallStaticBooleanMethodA(uint32_t env_h, uint32_t cls_h,
                                      int(sizeof(jv) / sizeof(jv[0])));
     }
     jboolean r = e->CallStaticBooleanMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return r ? 1u : 0u;
@@ -19234,9 +19550,7 @@ uint32_t CallStaticIntMethod(uint32_t env_h, uint32_t cls_h,
             static_cast<int>(std::size(jv)));
     }
     jint r = e->CallStaticIntMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return static_cast<uint32_t>(r);
@@ -19260,9 +19574,7 @@ uint32_t CallStaticBooleanMethod(uint32_t env_h, uint32_t cls_h,
             static_cast<int>(std::size(jv)));
     }
     jboolean r = e->CallStaticBooleanMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return r ? 1u : 0u;
@@ -19312,7 +19624,7 @@ uint32_t CallStaticVoidMethod(uint32_t env_h, uint32_t cls_h,
             static_cast<int>(std::size(jv)));
     }
     e->CallStaticVoidMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) { e->ExceptionDescribe(); e->ExceptionClear(); }
+    (void)a32_java_threw(e);
     return 0;
 }
 
@@ -19333,7 +19645,7 @@ uint32_t CallStaticVoidMethodV(uint32_t env_h, uint32_t cls_h,
                                        int(sizeof(jv) / sizeof(jv[0])));
     }
     e->CallStaticVoidMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) { e->ExceptionDescribe(); e->ExceptionClear(); }
+    (void)a32_java_threw(e);
     return 0;
 }
 
@@ -19354,7 +19666,7 @@ uint32_t CallStaticVoidMethodA(uint32_t env_h, uint32_t cls_h,
                                      int(sizeof(jv) / sizeof(jv[0])));
     }
     e->CallStaticVoidMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) { e->ExceptionDescribe(); e->ExceptionClear(); }
+    (void)a32_java_threw(e);
     return 0;
 }
 
@@ -19397,9 +19709,7 @@ uint32_t CallStaticIntMethodV(uint32_t env_h, uint32_t cls_h,
                                        int(sizeof(jv) / sizeof(jv[0])));
     }
     jint r = e->CallStaticIntMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return static_cast<uint32_t>(r);
@@ -19422,9 +19732,7 @@ uint32_t CallStaticIntMethodA(uint32_t env_h, uint32_t cls_h,
                                      int(sizeof(jv) / sizeof(jv[0])));
     }
     jint r = e->CallStaticIntMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return static_cast<uint32_t>(r);
@@ -19453,9 +19761,7 @@ uint32_t CallStaticObjectMethodV(uint32_t env_h, uint32_t cls_h,
                                        int(sizeof(jv) / sizeof(jv[0])));
     }
     jobject r = e->CallStaticObjectMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     if (!r) return 0;
@@ -19499,9 +19805,7 @@ uint32_t CallStaticObjectMethodA(uint32_t env_h, uint32_t cls_h,
                                      int(sizeof(jv) / sizeof(jv[0])));
     }
     jobject r = e->CallStaticObjectMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     if (!r) return 0;
@@ -19549,9 +19853,7 @@ uint32_t CallObjectMethod(uint32_t env_h, uint32_t obj_h,
             static_cast<int>(std::size(jv)));
     }
     jobject r = e->CallObjectMethodA(o, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     if (!r) return 0;
@@ -19578,9 +19880,7 @@ uint32_t CallObjectMethodV(uint32_t env_h, uint32_t obj_h,
                                        int(sizeof(jv) / sizeof(jv[0])));
     }
     jobject r = e->CallObjectMethodA(o, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     if (!r) return 0;
@@ -19607,9 +19907,7 @@ uint32_t CallObjectMethodA(uint32_t env_h, uint32_t obj_h,
                                      int(sizeof(jv) / sizeof(jv[0])));
     }
     jobject r = e->CallObjectMethodA(o, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     if (!r) return 0;
@@ -19637,9 +19935,7 @@ uint32_t CallBooleanMethod(uint32_t env_h, uint32_t obj_h,
             static_cast<int>(std::size(jv)));
     }
     jboolean r = e->CallBooleanMethodA(o, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return r ? 1u : 0u;
@@ -19662,9 +19958,7 @@ uint32_t CallBooleanMethodV(uint32_t env_h, uint32_t obj_h,
                                        int(sizeof(jv) / sizeof(jv[0])));
     }
     jboolean r = e->CallBooleanMethodA(o, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return r ? 1u : 0u;
@@ -19687,9 +19981,7 @@ uint32_t CallBooleanMethodA(uint32_t env_h, uint32_t obj_h,
                                      int(sizeof(jv) / sizeof(jv[0])));
     }
     jboolean r = e->CallBooleanMethodA(o, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return r ? 1u : 0u;
@@ -19713,9 +20005,7 @@ uint32_t CallIntMethod(uint32_t env_h, uint32_t obj_h,
             static_cast<int>(std::size(jv)));
     }
     jint r = e->CallIntMethodA(o, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return static_cast<uint32_t>(r);
@@ -19738,9 +20028,7 @@ uint32_t CallIntMethodV(uint32_t env_h, uint32_t obj_h,
                                        int(sizeof(jv) / sizeof(jv[0])));
     }
     jint r = e->CallIntMethodA(o, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return static_cast<uint32_t>(r);
@@ -19763,9 +20051,7 @@ uint32_t CallIntMethodA(uint32_t env_h, uint32_t obj_h,
                                      int(sizeof(jv) / sizeof(jv[0])));
     }
     jint r = e->CallIntMethodA(o, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return static_cast<uint32_t>(r);
@@ -19789,7 +20075,7 @@ uint32_t CallVoidMethod(uint32_t env_h, uint32_t obj_h,
             static_cast<int>(std::size(jv)));
     }
     e->CallVoidMethodA(o, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) { e->ExceptionDescribe(); e->ExceptionClear(); }
+    (void)a32_java_threw(e);
     return 0;
 }
 
@@ -19810,7 +20096,7 @@ uint32_t CallVoidMethodV(uint32_t env_h, uint32_t obj_h,
                                        int(sizeof(jv) / sizeof(jv[0])));
     }
     e->CallVoidMethodA(o, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) { e->ExceptionDescribe(); e->ExceptionClear(); }
+    (void)a32_java_threw(e);
     return 0;
 }
 
@@ -19831,7 +20117,7 @@ uint32_t CallVoidMethodA(uint32_t env_h, uint32_t obj_h,
                                      int(sizeof(jv) / sizeof(jv[0])));
     }
     e->CallVoidMethodA(o, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) { e->ExceptionDescribe(); e->ExceptionClear(); }
+    (void)a32_java_threw(e);
     return 0;
 }
 
@@ -19863,9 +20149,7 @@ uint32_t CallStaticCharMethod(uint32_t env_h, uint32_t cls_h,
             static_cast<int>(std::size(jv)));
     }
     jchar r = e->CallStaticCharMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return static_cast<uint32_t>(r);
@@ -19888,9 +20172,7 @@ uint32_t CallStaticCharMethodV(uint32_t env_h, uint32_t cls_h,
                                        int(sizeof(jv) / sizeof(jv[0])));
     }
     jchar r = e->CallStaticCharMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return static_cast<uint32_t>(r);
@@ -19913,9 +20195,7 @@ uint32_t CallStaticCharMethodA(uint32_t env_h, uint32_t cls_h,
                                      int(sizeof(jv) / sizeof(jv[0])));
     }
     jchar r = e->CallStaticCharMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return static_cast<uint32_t>(r);
@@ -19939,9 +20219,7 @@ uint32_t CallStaticShortMethod(uint32_t env_h, uint32_t cls_h,
             static_cast<int>(std::size(jv)));
     }
     jshort r = e->CallStaticShortMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return static_cast<uint32_t>(r);
@@ -19964,9 +20242,7 @@ uint32_t CallStaticShortMethodV(uint32_t env_h, uint32_t cls_h,
                                        int(sizeof(jv) / sizeof(jv[0])));
     }
     jshort r = e->CallStaticShortMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return static_cast<uint32_t>(r);
@@ -19989,9 +20265,7 @@ uint32_t CallStaticShortMethodA(uint32_t env_h, uint32_t cls_h,
                                      int(sizeof(jv) / sizeof(jv[0])));
     }
     jshort r = e->CallStaticShortMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     return static_cast<uint32_t>(r);
@@ -20018,9 +20292,7 @@ uint32_t CallStaticFloatMethod(uint32_t env_h, uint32_t cls_h,
             static_cast<int>(std::size(jv)));
     }
     jfloat r = e->CallStaticFloatMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     uint32_t bits;
@@ -20045,9 +20317,7 @@ uint32_t CallStaticFloatMethodV(uint32_t env_h, uint32_t cls_h,
                                        int(sizeof(jv) / sizeof(jv[0])));
     }
     jfloat r = e->CallStaticFloatMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     uint32_t bits;
@@ -20072,9 +20342,7 @@ uint32_t CallStaticFloatMethodA(uint32_t env_h, uint32_t cls_h,
                                      int(sizeof(jv) / sizeof(jv[0])));
     }
     jfloat r = e->CallStaticFloatMethodA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     uint32_t bits;
@@ -20110,9 +20378,7 @@ uint32_t NewObject(uint32_t env_h, uint32_t cls_h,
             static_cast<int>(std::size(jv)));
     }
     jobject r = e->NewObjectA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     if (!r) return 0;
@@ -20139,9 +20405,7 @@ uint32_t NewObjectV(uint32_t env_h, uint32_t cls_h,
                                        int(sizeof(jv) / sizeof(jv[0])));
     }
     jobject r = e->NewObjectA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     if (!r) return 0;
@@ -20168,9 +20432,7 @@ uint32_t NewObjectA(uint32_t env_h, uint32_t cls_h,
                                      int(sizeof(jv) / sizeof(jv[0])));
     }
     jobject r = e->NewObjectA(c, m, args.empty() ? nullptr : jv);
-    if (e->ExceptionCheck()) {
-        e->ExceptionDescribe();
-        e->ExceptionClear();
+    if (a32_java_threw(e)) {
         return 0;
     }
     if (!r) return 0;
@@ -20381,6 +20643,570 @@ uint32_t UnregisterNatives(uint32_t env_h, uint32_t cls_h, uint32_t, uint32_t) {
     jint rc = e->UnregisterNatives(c);
     if (e->ExceptionCheck()) e->ExceptionClear();
     return static_cast<uint32_t>(rc);
+}
+
+// =====================================================================
+// v1.0.2385: JNIEnv slots the ARM32 proxy table did not route at all, or
+// routed to the silent return-0 stub. Slot numbers and prototypes are
+// libnativehelper's jni.h (struct JNINativeInterface, JNI 1.6 order;
+// platform/libnativehelper/include_jni/jni.h on AOSP main); behaviour is
+// ART's art/runtime/jni/jni_internal.cc unless a line says otherwise.
+//
+// The reason this block exists: net.sqlcipher's dbopen reports a failed
+// sqlite3_open by FindClass + ThrowNew. ThrowNew (slot 14) had an enum value
+// and no table entry, so the call returned 0 with nothing pending, the native
+// returned normally, and Java went on with a database that was never opened
+// ("database not open" much later, with the real SQLite message lost). A
+// native that throws has to leave the exception pending in the real JNIEnv so
+// the Java caller sees it when the native returns.
+//
+// Still NOT routed (they stay on the loud "JNI unimpl" marker): DefineClass,
+// the reflection converters, AllocObject, the CallNonvirtual family and
+// GetObjectRefType. (The 64-bit results were routed in v1.0.2387.)
+// =====================================================================
+
+// Throw (slot 13): jint Throw(JNIEnv*, jthrowable).
+uint32_t Throw(uint32_t env_h, uint32_t obj_h, uint32_t, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    jthrowable t = obj_for<jthrowable>(obj_h);
+    if (!e || !t) return static_cast<uint32_t>(JNI_ERR);
+    return static_cast<uint32_t>(e->Throw(t));
+}
+
+// ThrowNew (slot 14): jint ThrowNew(JNIEnv*, jclass, const char* msg). A NULL
+// msg is legal (ART then calls the no-arg constructor).
+uint32_t ThrowNew(uint32_t env_h, uint32_t cls_h, uint32_t msg_addr, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    jclass c = obj_for<jclass>(cls_h);
+    const char* msg = msg_addr
+        ? reinterpret_cast<const char*>(g_guest_base + msg_addr) : nullptr;
+    if (!e || !c) {
+        // The guest's FindClass missed (we returned 0 and said so) and it is
+        // throwing through the NULL class. ART aborts here (CheckJNI) or
+        // crashes; neither helps. Say what was lost and report failure.
+        std::fprintf(stderr,
+            "[macapk-shim] ThrowNew(arm32): %s (cls_h=0x%x) -- exception "
+            "NOT raised, message was: \"%s\"\n",
+            !e ? "env handle did not resolve" : "class handle did not resolve",
+            cls_h, msg ? msg : "(null)");
+        return static_cast<uint32_t>(JNI_ERR);
+    }
+    return static_cast<uint32_t>(e->ThrowNew(c, msg));
+}
+
+// ExceptionOccurred (slot 15). Was mapped but unwired: a guest that asks
+// "what is pending" got NULL even with an exception pending. The local ref
+// goes into the handle as it is: with an exception pending JNI allows only
+// the Exception*/Delete*/Release*/PopLocalFrame calls, so the usual
+// NewGlobalRef promotion would itself be a JNI violation here. The guest's
+// DeleteLocalRef releases it by its real ref type (macapk_jni_delete_ref).
+uint32_t ExceptionOccurred(uint32_t env_h, uint32_t, uint32_t, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    if (!e) return 0;
+    jthrowable t = e->ExceptionOccurred();
+    return t ? __macapk_jni_make_handle(t) : 0;
+}
+
+// ExceptionDescribe (slot 16). Was mapped but unwired.
+uint32_t ExceptionDescribe(uint32_t env_h, uint32_t, uint32_t, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    if (e) e->ExceptionDescribe();
+    return 0;
+}
+
+// FatalError (slot 18): does not return on a device either.
+uint32_t FatalError(uint32_t env_h, uint32_t msg_addr, uint32_t, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    const char* msg = msg_addr
+        ? reinterpret_cast<const char*>(g_guest_base + msg_addr) : "(null)";
+    std::fprintf(stderr, "[macapk-shim] JNI FatalError(arm32): %s\n", msg);
+    if (e) e->FatalError(msg);
+    std::abort();
+}
+
+// GetSuperclass (slot 10) / IsAssignableFrom (slot 11).
+uint32_t GetSuperclass(uint32_t env_h, uint32_t cls_h, uint32_t, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    jclass c = obj_for<jclass>(cls_h);
+    if (!e || !c) return 0;
+    jclass s = e->GetSuperclass(c);
+    if (!s) return 0;
+    jclass g = static_cast<jclass>(e->NewGlobalRef(s));
+    e->DeleteLocalRef(s);
+    return g ? __macapk_jni_make_handle(g) : 0;
+}
+uint32_t IsAssignableFrom(uint32_t env_h, uint32_t a_h, uint32_t b_h, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    jclass a = obj_for<jclass>(a_h);
+    jclass b = obj_for<jclass>(b_h);
+    if (!e || !a || !b) return 0;
+    return e->IsAssignableFrom(a, b) ? 1u : 0u;
+}
+
+// PushLocalFrame (19) / PopLocalFrame (20) / EnsureLocalCapacity (26).
+// Every object this proxy hands the guest is a handle over a JNI GLOBAL ref
+// (see macapk_jni_delete_ref), so a guest local frame owns nothing in the VM:
+// Push and Ensure succeed, and Pop returns the same reference it was given,
+// which stays valid -- "returns a local reference in the previous local
+// reference frame for the given result object". Pop used to return 0, i.e.
+// every `return env->PopLocalFrame(result)` returned NULL.
+uint32_t PushLocalFrame(uint32_t, uint32_t, uint32_t, uint32_t) { return 0; }
+uint32_t PopLocalFrame(uint32_t, uint32_t result_h, uint32_t, uint32_t) {
+    return result_h;
+}
+uint32_t EnsureLocalCapacity(uint32_t, uint32_t, uint32_t, uint32_t) { return 0; }
+
+// NewLocalRef (slot 25). Was mapped but unwired (returned NULL for a live
+// object). A new handle over a new ref, so deleting one does not kill the
+// other, as on a device.
+uint32_t NewLocalRef(uint32_t env_h, uint32_t obj_h, uint32_t, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    jobject o = obj_for<jobject>(obj_h);
+    if (!e || !o) return 0;
+    jobject g = e->NewGlobalRef(o);
+    return g ? __macapk_jni_make_handle(g) : 0;
+}
+
+// IsSameObject (slot 24). Two handles of one object are different numbers
+// (each is its own ref), exactly like two refs on a device, so this is the
+// only correct identity test and it has to reach the VM.
+uint32_t IsSameObject(uint32_t env_h, uint32_t a_h, uint32_t b_h, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    if (!e) return 0;
+    return e->IsSameObject(obj_for<jobject>(a_h), obj_for<jobject>(b_h)) ? 1u : 0u;
+}
+
+// NewWeakGlobalRef (226) / DeleteWeakGlobalRef (227). GetObjectRefType (232)
+// stays unrouted: every handle is backed by a global ref, so the VM cannot
+// tell us whether the GUEST holds it as a local or a global one.
+uint32_t NewWeakGlobalRef(uint32_t env_h, uint32_t obj_h, uint32_t, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    jobject o = obj_for<jobject>(obj_h);
+    if (!e || !o) return 0;
+    jweak w = e->NewWeakGlobalRef(o);
+    return w ? __macapk_jni_make_handle(w) : 0;
+}
+uint32_t DeleteWeakGlobalRef(uint32_t env_h, uint32_t obj_h, uint32_t, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    macapk_jni_delete_ref(e, obj_for<jobject>(obj_h));
+    if (obj_h) __macapk_jni_release_handle(obj_h);
+    return 0;
+}
+// ---- Strings ---------------------------------------------------------
+// NewString (163): jstring NewString(JNIEnv*, const jchar*, jsize). Was
+// mapped but unwired.
+uint32_t NewString(uint32_t env_h, uint32_t chars_addr, uint32_t len, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    if (!e || (!chars_addr && len)) return 0;
+    jstring s = e->NewString(
+        reinterpret_cast<const jchar*>(g_guest_base + chars_addr),
+        static_cast<jsize>(len));
+    if (!s) return 0;
+    jstring g = static_cast<jstring>(e->NewGlobalRef(s));
+    e->DeleteLocalRef(s);
+    return g ? __macapk_jni_make_handle(g) : 0;
+}
+// GetStringLength (164, was mapped but unwired) / GetStringUTFLength (168).
+uint32_t GetStringLength(uint32_t env_h, uint32_t s_h, uint32_t, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    jstring s = obj_for<jstring>(s_h);
+    if (!e || !s) return 0;
+    return static_cast<uint32_t>(e->GetStringLength(s));
+}
+uint32_t GetStringUTFLength(uint32_t env_h, uint32_t s_h, uint32_t, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    jstring s = obj_for<jstring>(s_h);
+    if (!e || !s) return 0;
+    return static_cast<uint32_t>(e->GetStringUTFLength(s));
+}
+
+// GetStringChars (165) / ReleaseStringChars (166) and the Critical pair
+// (224 / 225). The guest gets a copy in its own address space (it cannot
+// read a host pointer), which ART's contract allows: *isCopy = JNI_TRUE. The
+// copy is freed by the matching Release, and only a pointer handed out here
+// is freed. ART's copy is not NUL-terminated by contract, but ART's own
+// String storage is followed by padding and real code leans on a terminator
+// (the JNI spec warns against it; Dalvik always had one), so one is written.
+static std::mutex                   g_jchars_mutex;
+static std::unordered_set<uint32_t> g_jchars_copies;
+uint32_t GetStringChars(uint32_t env_h, uint32_t s_h, uint32_t isCopy_va, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    jstring s = obj_for<jstring>(s_h);
+    if (!e || !s || !g_guest_base) return 0;
+    const jsize n = e->GetStringLength(s);
+    uint32_t va = guest_alloc((static_cast<size_t>(n) + 1) * sizeof(jchar),
+                              /*guest_owned=*/true);
+    if (!va) return 0;
+    jchar* dst = reinterpret_cast<jchar*>(g_guest_base + va);
+    if (n > 0) e->GetStringRegion(s, 0, n, dst);
+    dst[n] = 0;
+    {
+        std::lock_guard<std::mutex> g(g_jchars_mutex);
+        g_jchars_copies.insert(va);
+    }
+    if (isCopy_va) g_guest_base[isCopy_va] = JNI_TRUE;
+    return va;
+}
+uint32_t ReleaseStringChars(uint32_t, uint32_t, uint32_t chars_va, uint32_t) {
+    if (!chars_va) return 0;
+    bool ours = false;
+    {
+        std::lock_guard<std::mutex> g(g_jchars_mutex);
+        ours = g_jchars_copies.erase(chars_va) != 0;
+    }
+    if (ours) guest_reclaim_free(chars_va);
+    return 0;
+}
+
+// GetStringRegion (220) / GetStringUTFRegion (221):
+//   void (JNIEnv*, jstring, jsize start, jsize len, T* buf)  -- buf is the
+// fifth argument, i.e. the first stack word (AAPCS32). A bad range raises
+// StringIndexOutOfBoundsException in the VM, and it stays pending.
+static uint32_t jni_stack_word(uint32_t idx) {
+    uint32_t v = 0;
+    if (g_jni_dispatch_sp && g_guest_base)
+        std::memcpy(&v, g_guest_base + g_jni_dispatch_sp + 4 * idx, 4);
+    return v;
+}
+uint32_t GetStringRegion(uint32_t env_h, uint32_t s_h, uint32_t start, uint32_t len) {
+    JNIEnv* e = env_for(env_h);
+    jstring s = obj_for<jstring>(s_h);
+    uint32_t buf = jni_stack_word(0);
+    if (!e || !s || !buf) return 0;
+    e->GetStringRegion(s, static_cast<jsize>(start), static_cast<jsize>(len),
+                       reinterpret_cast<jchar*>(g_guest_base + buf));
+    return 0;
+}
+uint32_t GetStringUTFRegion(uint32_t env_h, uint32_t s_h, uint32_t start, uint32_t len) {
+    JNIEnv* e = env_for(env_h);
+    jstring s = obj_for<jstring>(s_h);
+    uint32_t buf = jni_stack_word(0);
+    if (!e || !s || !buf) return 0;
+    e->GetStringUTFRegion(s, static_cast<jsize>(start), static_cast<jsize>(len),
+                          reinterpret_cast<char*>(g_guest_base + buf));
+    return 0;
+}
+
+// ---- Arrays ----------------------------------------------------------
+// NewObjectArray (172) / GetObjectArrayElement (173) / SetObjectArrayElement
+// (174). A bad index or a wrong element type raises in the VM and stays
+// pending, as on a device.
+uint32_t NewObjectArray(uint32_t env_h, uint32_t len, uint32_t cls_h, uint32_t init_h) {
+    JNIEnv* e = env_for(env_h);
+    jclass c = obj_for<jclass>(cls_h);
+    if (!e || !c) return 0;
+    return new_array_handle<jobjectArray>(
+        e, e->NewObjectArray(static_cast<jsize>(len), c, obj_for<jobject>(init_h)));
+}
+uint32_t GetObjectArrayElement(uint32_t env_h, uint32_t arr_h, uint32_t idx, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    jobjectArray a = obj_for<jobjectArray>(arr_h);
+    if (!e || !a) return 0;
+    jobject r = e->GetObjectArrayElement(a, static_cast<jsize>(idx));
+    if (!r) return 0;
+    jobject g = e->NewGlobalRef(r);
+    e->DeleteLocalRef(r);
+    return g ? __macapk_jni_make_handle(g) : 0;
+}
+uint32_t SetObjectArrayElement(uint32_t env_h, uint32_t arr_h, uint32_t idx, uint32_t val_h) {
+    JNIEnv* e = env_for(env_h);
+    jobjectArray a = obj_for<jobjectArray>(arr_h);
+    if (!e || !a) return 0;
+    e->SetObjectArrayElement(a, static_cast<jsize>(idx), obj_for<jobject>(val_h));
+    return 0;
+}
+// NewByteArray (176, was mapped but unwired) / NewDoubleArray (182).
+uint32_t NewByteArray(uint32_t env_h, uint32_t len, uint32_t, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    if (!e) return 0;
+    return new_array_handle<jbyteArray>(e, e->NewByteArray(static_cast<jsize>(len)));
+}
+uint32_t NewDoubleArray(uint32_t env_h, uint32_t len, uint32_t, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    if (!e) return 0;
+    return new_array_handle<jdoubleArray>(e, e->NewDoubleArray(static_cast<jsize>(len)));
+}
+
+// Get<Prim>ArrayElements (183-190) / Release<Prim>ArrayElements (191-198).
+// One body for all eight types: the element size comes from the array's own
+// class, and the guest gets a copy (*isCopy = JNI_TRUE) because it cannot read
+// host memory. Release follows ART's ReleasePrimitiveArray: 0 copies back and
+// frees, JNI_COMMIT copies back and keeps the copy, JNI_ABORT frees only. An
+// empty array still gets a non-NULL pointer, as ART returns one.
+// GetByteArrayElements was mapped but unwired (returned NULL).
+static std::mutex                             g_elems_mutex;
+static std::unordered_map<uint32_t, uint32_t> g_elems_bytes;   // guest va -> bytes
+uint32_t GetPrimArrayElements(uint32_t env_h, uint32_t arr_h, uint32_t isCopy_va, uint32_t) {
+    JNIEnv* e = env_for(env_h);
+    jarray a = obj_for<jarray>(arr_h);
+    if (!e || !a || !g_guest_base) return 0;
+    const int esz = prim_array_elem_size(e, a);
+    if (esz == 0) return 0;
+    const uint64_t bytes =
+        static_cast<uint64_t>(static_cast<uint32_t>(e->GetArrayLength(a))) *
+        static_cast<uint32_t>(esz);
+    if (bytes > 0x40000000ull) return 0;
+    uint32_t va = guest_alloc(bytes ? static_cast<size_t>(bytes) : 8, /*guest_owned=*/true);
+    if (!va) return 0;
+    if (bytes) {
+        void* src = e->GetPrimitiveArrayCritical(a, nullptr);
+        if (!src) { guest_reclaim_free(va); return 0; }
+        std::memcpy(g_guest_base + va, src, static_cast<size_t>(bytes));
+        e->ReleasePrimitiveArrayCritical(a, src, JNI_ABORT);
+    }
+    {
+        std::lock_guard<std::mutex> g(g_elems_mutex);
+        g_elems_bytes[va] = static_cast<uint32_t>(bytes);
+    }
+    if (isCopy_va) g_guest_base[isCopy_va] = JNI_TRUE;
+    return va;
+}
+uint32_t ReleasePrimArrayElements(uint32_t env_h, uint32_t arr_h, uint32_t elems_va, uint32_t mode) {
+    JNIEnv* e = env_for(env_h);
+    jarray a = obj_for<jarray>(arr_h);
+    uint32_t bytes = 0;
+    {
+        std::lock_guard<std::mutex> g(g_elems_mutex);
+        auto it = g_elems_bytes.find(elems_va);
+        if (it == g_elems_bytes.end()) return 0;      // not one of ours
+        bytes = it->second;
+        if (mode != JNI_COMMIT) g_elems_bytes.erase(it);
+    }
+    if (e && a && bytes && mode != JNI_ABORT) {
+        // Release* is one of the calls JNI allows with an exception pending,
+        // and GetPrimitiveArrayCritical is not: keep it across the copy-back.
+        jthrowable pending = nullptr;
+        if (e->ExceptionCheck()) { pending = e->ExceptionOccurred(); e->ExceptionClear(); }
+        const uint64_t now = static_cast<uint64_t>(static_cast<uint32_t>(e->GetArrayLength(a))) *
+                             static_cast<uint32_t>(prim_array_elem_size(e, a));
+        if (now >= bytes) {
+            if (void* dst = e->GetPrimitiveArrayCritical(a, nullptr)) {
+                std::memcpy(dst, g_guest_base + elems_va, bytes);
+                e->ReleasePrimitiveArrayCritical(a, dst, 0);
+            }
+        }
+        if (pending) { e->Throw(pending); e->DeleteLocalRef(pending); }
+    }
+    if (mode != JNI_COMMIT) guest_reclaim_free(elems_va);
+    return 0;
+}
+
+// Get/SetDoubleArrayRegion (206 / 214): same shape as the seven siblings
+// above (buf is the first stack word); only the double pair was missing.
+uint32_t GetDoubleArrayRegion(uint32_t env_h, uint32_t arr_h, uint32_t start, uint32_t len) {
+    JNIEnv* e = env_for(env_h);
+    jdoubleArray a = obj_for<jdoubleArray>(arr_h);
+    uint32_t buf = jni_stack_word(0);
+    if (!e || !a || !buf) return 0;
+    e->GetDoubleArrayRegion(a, static_cast<jsize>(start), static_cast<jsize>(len),
+                            reinterpret_cast<jdouble*>(g_guest_base + buf));
+    return 0;
+}
+uint32_t SetDoubleArrayRegion(uint32_t env_h, uint32_t arr_h, uint32_t start, uint32_t len) {
+    JNIEnv* e = env_for(env_h);
+    jdoubleArray a = obj_for<jdoubleArray>(arr_h);
+    uint32_t buf = jni_stack_word(0);
+    if (!e || !a || !buf) return 0;
+    e->SetDoubleArrayRegion(a, static_cast<jsize>(start), static_cast<jsize>(len),
+                            reinterpret_cast<const jdouble*>(g_guest_base + buf));
+    return 0;
+}
+
+// ---- Fields ----------------------------------------------------------
+// The instance Object/Boolean/Int accessors were wired on 2026-07-28; these
+// are the remaining types whose value fits the proxy's 32-bit channel, and
+// the whole static family (slots 145-162), none of which was routed. A jfloat
+// travels as its bit pattern in a core register (armeabi-v7a is softfp at
+// the ABI boundary -- see the CallStaticFloatMethod note). A jlong/jdouble
+// VALUE argument follows three word arguments, so AAPCS32 rule C.3 rounds the
+// register number up to r4: it is passed entirely on the stack, at [sp].
+// The jlong/jdouble getters are further down (v1.0.2387, 64-bit return).
+static inline jfieldID fid_for(uint32_t fid_h) {
+    return reinterpret_cast<jfieldID>(__macapk_jni_resolve_handle(fid_h));
+}
+static inline jfloat f32_from_bits(uint32_t b) { jfloat f; std::memcpy(&f, &b, 4); return f; }
+static inline uint32_t bits_from_f32(jfloat f) { uint32_t b; std::memcpy(&b, &f, 4); return b; }
+static inline uint64_t jni_stack_u64() {
+    return static_cast<uint64_t>(jni_stack_word(0)) |
+           (static_cast<uint64_t>(jni_stack_word(1)) << 32);
+}
+#define MACAPK_A32_FIELD_GET(Name, expr_inst, expr_static)                     \
+    uint32_t Get##Name##Field(uint32_t env_h, uint32_t obj_h, uint32_t fid_h,  \
+                              uint32_t) {                                      \
+        JNIEnv* e = env_for(env_h);                                            \
+        jobject o = obj_for<jobject>(obj_h);                                   \
+        jfieldID f = fid_for(fid_h);                                           \
+        if (!e || !o || !f) return 0;                                          \
+        return expr_inst;                                                      \
+    }                                                                          \
+    uint32_t GetStatic##Name##Field(uint32_t env_h, uint32_t cls_h,            \
+                                    uint32_t fid_h, uint32_t) {                \
+        JNIEnv* e = env_for(env_h);                                            \
+        jclass o = obj_for<jclass>(cls_h);                                     \
+        jfieldID f = fid_for(fid_h);                                           \
+        if (!e || !o || !f) return 0;                                          \
+        return expr_static;                                                    \
+    }
+MACAPK_A32_FIELD_GET(Byte,
+    static_cast<uint32_t>(static_cast<int32_t>(e->GetByteField(o, f))),
+    static_cast<uint32_t>(static_cast<int32_t>(e->GetStaticByteField(o, f))))
+MACAPK_A32_FIELD_GET(Char,
+    static_cast<uint32_t>(e->GetCharField(o, f)),
+    static_cast<uint32_t>(e->GetStaticCharField(o, f)))
+MACAPK_A32_FIELD_GET(Short,
+    static_cast<uint32_t>(static_cast<int32_t>(e->GetShortField(o, f))),
+    static_cast<uint32_t>(static_cast<int32_t>(e->GetStaticShortField(o, f))))
+MACAPK_A32_FIELD_GET(Float,
+    bits_from_f32(e->GetFloatField(o, f)),
+    bits_from_f32(e->GetStaticFloatField(o, f)))
+#undef MACAPK_A32_FIELD_GET
+uint32_t GetStaticBooleanField(uint32_t env_h, uint32_t cls_h, uint32_t fid_h, uint32_t) {
+    JNIEnv* e = env_for(env_h); jclass c = obj_for<jclass>(cls_h); jfieldID f = fid_for(fid_h);
+    if (!e || !c || !f) return 0;
+    return e->GetStaticBooleanField(c, f) ? 1u : 0u;
+}
+uint32_t GetStaticIntField(uint32_t env_h, uint32_t cls_h, uint32_t fid_h, uint32_t) {
+    JNIEnv* e = env_for(env_h); jclass c = obj_for<jclass>(cls_h); jfieldID f = fid_for(fid_h);
+    if (!e || !c || !f) return 0;
+    return static_cast<uint32_t>(e->GetStaticIntField(c, f));
+}
+uint32_t GetStaticObjectField(uint32_t env_h, uint32_t cls_h, uint32_t fid_h, uint32_t) {
+    JNIEnv* e = env_for(env_h); jclass c = obj_for<jclass>(cls_h); jfieldID f = fid_for(fid_h);
+    if (!e || !c || !f) return 0;
+    jobject r = e->GetStaticObjectField(c, f);
+    if (!r) return 0;
+    jobject g = e->NewGlobalRef(r);
+    e->DeleteLocalRef(r);
+    return g ? __macapk_jni_make_handle(g) : 0;
+}
+#define MACAPK_A32_FIELD_SET(Name, value_expr)                                 \
+    uint32_t Set##Name##Field(uint32_t env_h, uint32_t obj_h, uint32_t fid_h,  \
+                              uint32_t val) {                                  \
+        JNIEnv* e = env_for(env_h);                                            \
+        jobject o = obj_for<jobject>(obj_h);                                   \
+        jfieldID f = fid_for(fid_h);                                           \
+        (void)val;                                                             \
+        if (!e || !o || !f) return 0;                                          \
+        e->Set##Name##Field(o, f, value_expr);                                 \
+        return 0;                                                              \
+    }                                                                          \
+    uint32_t SetStatic##Name##Field(uint32_t env_h, uint32_t cls_h,            \
+                                    uint32_t fid_h, uint32_t val) {            \
+        JNIEnv* e = env_for(env_h);                                            \
+        jclass o = obj_for<jclass>(cls_h);                                     \
+        jfieldID f = fid_for(fid_h);                                           \
+        (void)val;                                                             \
+        if (!e || !o || !f) return 0;                                          \
+        e->SetStatic##Name##Field(o, f, value_expr);                           \
+        return 0;                                                              \
+    }
+MACAPK_A32_FIELD_SET(Byte,   static_cast<jbyte>(val))
+MACAPK_A32_FIELD_SET(Char,   static_cast<jchar>(val))
+MACAPK_A32_FIELD_SET(Short,  static_cast<jshort>(val))
+MACAPK_A32_FIELD_SET(Float,  f32_from_bits(val))
+MACAPK_A32_FIELD_SET(Long,   static_cast<jlong>(jni_stack_u64()))
+MACAPK_A32_FIELD_SET(Double, [] { uint64_t b = jni_stack_u64(); jdouble d;
+                                  std::memcpy(&d, &b, 8); return d; }())
+#undef MACAPK_A32_FIELD_SET
+uint32_t SetStaticBooleanField(uint32_t env_h, uint32_t cls_h, uint32_t fid_h, uint32_t val) {
+    JNIEnv* e = env_for(env_h); jclass c = obj_for<jclass>(cls_h); jfieldID f = fid_for(fid_h);
+    if (!e || !c || !f) return 0;
+    e->SetStaticBooleanField(c, f, val ? JNI_TRUE : JNI_FALSE);
+    return 0;
+}
+uint32_t SetStaticIntField(uint32_t env_h, uint32_t cls_h, uint32_t fid_h, uint32_t val) {
+    JNIEnv* e = env_for(env_h); jclass c = obj_for<jclass>(cls_h); jfieldID f = fid_for(fid_h);
+    if (!e || !c || !f) return 0;
+    e->SetStaticIntField(c, f, static_cast<jint>(val));
+    return 0;
+}
+uint32_t SetStaticObjectField(uint32_t env_h, uint32_t cls_h, uint32_t fid_h, uint32_t val_h) {
+    JNIEnv* e = env_for(env_h); jclass c = obj_for<jclass>(cls_h); jfieldID f = fid_for(fid_h);
+    if (!e || !c || !f) return 0;
+    e->SetStaticObjectField(c, f, obj_for<jobject>(val_h));
+    return 0;
+}
+
+
+// =====================================================================
+// v1.0.2387: the JNIEnv slots with a 64-bit result, and the Call<T>Method
+// families that were still unrouted. Possible now that
+// __macapk_indirect_call returns guest r0:r1 (see MacapkRet2): a jlong or
+// jdouble goes back through jni_wide_return(). A jdouble is returned as its
+// bit pattern in r0:r1 (armeabi-v7a is softfp at the ABI boundary), low word
+// in r0 (little-endian AAPCS32).
+//
+// One body per (return type, static?, argument form). The argument packers
+// are the ones the Int/Boolean/Object forwarders use. An exception the Java
+// method throws is LEFT PENDING, as ART leaves it: the native sees it with
+// ExceptionCheck / ExceptionOccurred, and it propagates when the native
+// returns. (Since v1.0.2387 the older Call* forwarders above do the same, see
+// a32_java_threw.) The result of a call that threw is 0.
+// =====================================================================
+template <char RT, bool STATIC, int FORM>   // FORM 0 = ..., 1 = va_list, 2 = jvalue[]
+uint32_t CallTyped(uint32_t env_h, uint32_t obj_h, uint32_t mid_h, uint32_t a3) {
+    JNIEnv* e = env_for(env_h);
+    jobject o = obj_for<jobject>(obj_h);
+    jmethodID m = reinterpret_cast<jmethodID>(__macapk_jni_resolve_handle(mid_h));
+    const JniMethodMeta* meta = lookup_method_meta(mid_h);
+    if (!e || !o || !m) return 0;
+    std::vector<char> args;
+    if (meta) args = parse_jni_arg_types(meta->sig);
+    jvalue jv[16];
+    if (!args.empty()) {
+        const int cap = static_cast<int>(std::size(jv));
+        if (FORM == 0)
+            pack_arm32_inline_args_into_jvalues(a3, macapk_jni::g_jni_dispatch_sp,
+                                                args, jv, cap);
+        else if (FORM == 1)
+            pack_arm32_valist_into_jvalues(a3, args, jv, cap);
+        else
+            pack_jvalue_array_from_guest(a3, args, jv, cap);
+    }
+    const jvalue* av = args.empty() ? nullptr : jv;
+    jclass c = static_cast<jclass>(o);
+    uint64_t wide = 0;
+    uint32_t narrow = 0;
+    switch (RT) {
+        case 'B': narrow = static_cast<uint32_t>(static_cast<int32_t>(
+                      STATIC ? e->CallStaticByteMethodA(c, m, av) : e->CallByteMethodA(o, m, av))); break;
+        case 'C': narrow = static_cast<uint32_t>(
+                      STATIC ? e->CallStaticCharMethodA(c, m, av) : e->CallCharMethodA(o, m, av)); break;
+        case 'S': narrow = static_cast<uint32_t>(static_cast<int32_t>(
+                      STATIC ? e->CallStaticShortMethodA(c, m, av) : e->CallShortMethodA(o, m, av))); break;
+        case 'F': { jfloat f = STATIC ? e->CallStaticFloatMethodA(c, m, av) : e->CallFloatMethodA(o, m, av);
+                    std::memcpy(&narrow, &f, 4); break; }
+        case 'J': wide = static_cast<uint64_t>(
+                      STATIC ? e->CallStaticLongMethodA(c, m, av) : e->CallLongMethodA(o, m, av)); break;
+        case 'D': { jdouble d = STATIC ? e->CallStaticDoubleMethodA(c, m, av) : e->CallDoubleMethodA(o, m, av);
+                    std::memcpy(&wide, &d, 8); break; }
+    }
+    const bool threw = e->ExceptionCheck();
+    if (RT == 'J' || RT == 'D') return jni_wide_return(threw ? 0 : wide);
+    return threw ? 0 : narrow;
+}
+
+uint32_t GetLongField(uint32_t env_h, uint32_t obj_h, uint32_t fid_h, uint32_t) {
+    JNIEnv* e = env_for(env_h); jobject o = obj_for<jobject>(obj_h); jfieldID f = fid_for(fid_h);
+    if (!e || !o || !f) return jni_wide_return(0);
+    return jni_wide_return(static_cast<uint64_t>(e->GetLongField(o, f)));
+}
+uint32_t GetDoubleField(uint32_t env_h, uint32_t obj_h, uint32_t fid_h, uint32_t) {
+    JNIEnv* e = env_for(env_h); jobject o = obj_for<jobject>(obj_h); jfieldID f = fid_for(fid_h);
+    if (!e || !o || !f) return jni_wide_return(0);
+    jdouble d = e->GetDoubleField(o, f); uint64_t b; std::memcpy(&b, &d, 8);
+    return jni_wide_return(b);
+}
+uint32_t GetStaticLongField(uint32_t env_h, uint32_t cls_h, uint32_t fid_h, uint32_t) {
+    JNIEnv* e = env_for(env_h); jclass c = obj_for<jclass>(cls_h); jfieldID f = fid_for(fid_h);
+    if (!e || !c || !f) return jni_wide_return(0);
+    return jni_wide_return(static_cast<uint64_t>(e->GetStaticLongField(c, f)));
+}
+uint32_t GetStaticDoubleField(uint32_t env_h, uint32_t cls_h, uint32_t fid_h, uint32_t) {
+    JNIEnv* e = env_for(env_h); jclass c = obj_for<jclass>(cls_h); jfieldID f = fid_for(fid_h);
+    if (!e || !c || !f) return jni_wide_return(0);
+    jdouble d = e->GetStaticDoubleField(c, f); uint64_t b; std::memcpy(&b, &d, 8);
+    return jni_wide_return(b);
 }
 
 uint32_t Stub_NotImplemented(uint32_t env_h, uint32_t a, uint32_t b, uint32_t c) {
@@ -23541,6 +24367,40 @@ int64_t __macapk_shim_strtoll(uint32_t s, uint32_t endptr_addr,
 }
 int64_t __macapk_shim_strtoull(uint32_t s, uint32_t endptr_addr,
                                 uint32_t base, uint32_t /*pad*/) {
+    if (!s) return 0;
+    char* end = nullptr;
+    unsigned long long v = std::strtoull(gptr(s), &end, static_cast<int>(base));
+    if (endptr_addr && end) {
+        uint32_t guest_end = static_cast<uint32_t>(s + (end - gptr(s)));
+        std::memcpy(g_guest_base + endptr_addr, &guest_end, sizeof(guest_end));
+    }
+    return static_cast<int64_t>(v);
+}
+// strtoimax / strtoumax (GitHub #140, Minion Rush's libDespicableMe.so:
+// `[arm32-link] cannot locate symbol "strtoumax"` / "strtoimax"). Neither had
+// a shim, so an ARM32 guest's call reached the unresolved stub. On LP32 Bionic
+// intmax_t / uintmax_t are 64 bits, and Bionic defines the pair as the same
+// template instantiation shape as strtoll / strtoull
+// (bionic/libc/bionic/strtol.cpp: `intmax_t strtoimax(const char* s, char**
+// end, int base) { return StrToI<intmax_t, INTMAX_MIN, INTMAX_MAX, char>(s,
+// end, base); }`, and the uintmax_t twin), so the guest-facing contract is
+// strtoll / strtoull's exactly: 64-bit result in r0:r1 (kSoftFloatDoubleImports
+// in main.cpp), string translated in, endptr translated back out. The host
+// calls are strtoll / strtoull: 64 bits on both sides, so there is no range
+// difference to bridge and no extra header is needed.
+int64_t __macapk_shim_strtoimax(uint32_t s, uint32_t endptr_addr,
+                                 uint32_t base, uint32_t /*pad*/) {
+    if (!s) return 0;
+    char* end = nullptr;
+    long long v = std::strtoll(gptr(s), &end, static_cast<int>(base));
+    if (endptr_addr && end) {
+        uint32_t guest_end = static_cast<uint32_t>(s + (end - gptr(s)));
+        std::memcpy(g_guest_base + endptr_addr, &guest_end, sizeof(guest_end));
+    }
+    return static_cast<int64_t>(v);
+}
+int64_t __macapk_shim_strtoumax(uint32_t s, uint32_t endptr_addr,
+                                 uint32_t base, uint32_t /*pad*/) {
     if (!s) return 0;
     char* end = nullptr;
     unsigned long long v = std::strtoull(gptr(s), &end, static_cast<int>(base));
@@ -28163,6 +29023,41 @@ static inline bool macapk_arm64_mutex_ensure_valid(int32_t* m) {
             == kMacApkMutexMagic) {
         return true;
     }
+    // Bionic NON-ZERO static initializers (LP64, libc/include/pthread.h):
+    //   PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP  { { ((1 & 3) << 14) } } == 0x4000
+    //   PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP { { ((2 & 3) << 14) } } == 0x8000
+    // GNU libstdc++'s std::recursive_mutex is statically initialised this way
+    // (__GTHREAD_RECURSIVE_MUTEX_INIT), so the guest hands us word0 = 0x4000 and
+    // nine zero words. The all-zero lazy stamp below rejects that shape -> EINVAL
+    // -> std::system_error("Invalid argument") -> std::terminate (measured:
+    // Honor of Kings 12.1.1.1, libMSDKPIXCore during MSDK OnCreate). The ARM32
+    // path already honours the pattern (bionic_static_mutex_type). Translate it
+    // into this layout: the type slot is the claim (CAS 0 -> type), then the
+    // futex word becomes free (0), then the magic is stamped. A racing first
+    // locker that loses the claim waits for the magic.
+    {
+        const uint32_t w0 = uint32_t(__atomic_load_n(&m[0], __ATOMIC_ACQUIRE));
+        const int32_t stype = int32_t((w0 >> 14) & 3u);
+        if (w0 != 0u && (w0 & ~0xc000u) == 0u && (stype == 1 || stype == 2)) {
+            bool rest_zero = true;
+            for (int i = 1; i < 10; ++i)
+                if (__atomic_load_n(&m[i], __ATOMIC_RELAXED) != 0) { rest_zero = false; break; }
+            if (rest_zero) {
+                int32_t e = 0;
+                if (__atomic_compare_exchange_n(&m[kMutexTypeSlot], &e, stype, false,
+                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                    int32_t ew = int32_t(w0);
+                    __atomic_compare_exchange_n(&m[0], &ew, 0, false,
+                                                __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+                    int32_t em = 0;
+                    __atomic_compare_exchange_n(&m[kMutexMagicSlot], &em,
+                                                int32_t(kMacApkMutexMagic), false,
+                                                __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+                    return true;
+                }
+            }
+        }
+    }
     if (!macapk_arm64_mutex_all_zero(m)) {
         // CONCURRENT-FIRST-LOCK RACE (v1.0.590): two threads lock a fresh
         // (all-zero) std::mutex for the FIRST time at once. The winner lazy-stamps
@@ -28177,8 +29072,25 @@ static inline bool macapk_arm64_mutex_ensure_valid(int32_t* m) {
         // the magic with ACQUIRE ordering before giving up: if a concurrent
         // stamper set it, the mutex IS ours and valid. (The CAS-stamp path below
         // already handles the symmetric race via its `expected` readback.)
-        return uint32_t(__atomic_load_n(&m[kMutexMagicSlot], __ATOMIC_ACQUIRE))
-                   == kMacApkMutexMagic;
+        if (uint32_t(__atomic_load_n(&m[kMutexMagicSlot], __ATOMIC_ACQUIRE))
+                == kMacApkMutexMagic)
+            return true;
+        // A static-initializer conversion (above) claimed by another thread is
+        // in flight: type slot set, futex word still the initializer or already
+        // 0. Wait for its magic instead of reporting EINVAL.
+        {
+            const int32_t t = __atomic_load_n(&m[kMutexTypeSlot], __ATOMIC_ACQUIRE);
+            const uint32_t w = uint32_t(__atomic_load_n(&m[0], __ATOMIC_RELAXED));
+            if ((t == 1 || t == 2) && (w & ~0xc000u) == 0u) {
+                for (int spin = 0; spin < 200000; ++spin) {
+                    if (uint32_t(__atomic_load_n(&m[kMutexMagicSlot], __ATOMIC_ACQUIRE))
+                            == kMacApkMutexMagic)
+                        return true;
+                    sched_yield();
+                }
+            }
+        }
+        return false;
     }
     // Try once to claim this slot via CAS so concurrent lazy-stampers
     // don't race.
@@ -39249,9 +40161,9 @@ extern "C" void* __macapk_arm64_dlvsym(void* handle, const char* symbol, const c
 // snapshot invalid and could not be inferred from settings" before its first
 // frame (Feeel 2.4.1, Ente Auth). So the redirect remembers which library a
 // handle stands for, and a host-dlsym miss on that handle asks the loaded ELF
-// image itself (__macapk_arm64_native_lookup_latest). Function lookups are
-// unchanged: the host dlsym answers them first. =0 restores the host-only
-// answer.
+// image itself (__macapk_arm64_native_lookup_latest). Function lookups
+// keep the wrapper's own exports; inherited dependency functions are adapted
+// below when they require a Bionic ABI. =0 disables only the data fallback.
 extern "C" void* __macapk_arm64_native_lookup_latest(const char* soname,
                                                      const char* sym);
 static bool macapk_wrapper_data_dlsym_on() {
@@ -39270,7 +40182,7 @@ static std::unordered_map<void*, std::string>& macapk_wrapper_handles() {
 // <dir>/lib_native/libX.dylib -> "libX.so", the name the wrapper's
 // constructor registers its ELF image under.
 static void macapk_note_wrapper_handle(void* h, const std::string& dylib_path) {
-    if (!h || !macapk_wrapper_data_dlsym_on()) return;
+    if (!h) return;
     std::string base = dylib_path.substr(dylib_path.rfind('/') + 1);
     static const char kExt[] = ".dylib";
     const size_t n = sizeof(kExt) - 1;
@@ -39511,7 +40423,33 @@ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
             name, p);
         return p;
     }
-    if (void* p = dlsym(handle, name)) return p;
+    if (void* p = dlsym(handle, name)) {
+        std::string wrapper_soname;
+        {
+            std::lock_guard<std::mutex> lk(macapk_wrapper_handles_mu());
+            auto it = macapk_wrapper_handles().find(handle);
+            if (it != macapk_wrapper_handles().end()) wrapper_soname = it->second;
+        }
+        if (!wrapper_soname.empty()) {
+            // dyld searches a translated wrapper's Mach-O dependencies too.
+            // A guest which dlopens itself can therefore receive libSystem's
+            // pthread/stdio/varargs ABI instead of the Bionic adapter used by
+            // its ordinary ELF imports. Preserve guest dependency exports;
+            // adapt only definitions actually owned by the host's libSystem.
+            std::string ours = std::string("__macapk_arm64_") + name;
+            if (void* adapted = dlsym(RTLD_DEFAULT, ours.c_str())) {
+                Dl_info provider{};
+                if (!::dladdr(p, &provider) || !provider.dli_fname) return p;
+                const std::string image = provider.dli_fname;
+                const bool host_libc = image.compare(0, 19, "/usr/lib/system/lib") == 0
+                    || image == "/usr/lib/libSystem.B.dylib";
+                if (!host_libc) return p;
+                if (void* defined = macapk_wrapper_elf_dlsym(handle, name)) return defined;
+                return adapted;
+            }
+        }
+        return p;
+    }
     return macapk_wrapper_elf_dlsym(handle, name);
 }
 
@@ -43411,6 +44349,31 @@ static int macapk_bionic_to_macos_oflags(int b) {
     if (b & 0x80000) m |= 0x1000000;   // O_CLOEXEC   (lin 0x80000-> mac 0x1000000)
     return m;
 }
+// ARM32 (armeabi-v7a) Linux O_* -> macOS O_*. 32-bit ARM does NOT use the
+// asm-generic values for four flags (linux arch/arm/include/uapi/asm/fcntl.h):
+//   O_DIRECTORY 040000 (0x4000)   O_NOFOLLOW 0100000 (0x8000)
+//   O_DIRECT    0200000 (0x10000) O_LARGEFILE 0400000 (0x20000)
+// whereas the table above (arm64/asm-generic) reads 0x10000 as O_DIRECTORY and
+// 0x20000 as O_NOFOLLOW. Every other bit is shared. Without any translation the
+// ARM32 open shim handed the raw word to macOS: O_CREAT (0x40) became macOS
+// O_ASYNC so no file was ever created, and a SQLite open (O_RDWR|O_CREAT|
+// O_NOFOLLOW|O_LARGEFILE|O_CLOEXEC) set macOS O_EVTONLY (0x8000), an fd that
+// cannot be read. Bits with no macOS analogue (O_DIRECT, O_LARGEFILE, ...) drop.
+int macapk_arm32_to_macos_oflags(int b) {
+    int m = macapk_bionic_to_macos_oflags(b & ~(0x10000 | 0x20000));
+    if (b & 0x4000) m |= 0x100000;     // O_DIRECTORY (arm 0x4000 -> mac 0x100000)
+    if (b & 0x8000) m |= 0x100;        // O_NOFOLLOW  (arm 0x8000 -> mac 0x100)
+    return m;
+}
+// Inverse for fcntl(F_GETFL) on an ARM32 guest: macOS status flags -> ARM Linux.
+int macapk_macos_to_arm32_fflags(int m) {
+    int b = m & 0x3;
+    if (m & 0x8)       b |= 0x400;     // O_APPEND
+    if (m & 0x4)       b |= 0x800;     // O_NONBLOCK
+    if (m & 0x100)     b |= 0x8000;    // O_NOFOLLOW (arm 0x8000)
+    if (m & 0x1000000) b |= 0x80000;   // O_CLOEXEC
+    return b;
+}
 // macOS file-status flags -> Bionic/Linux (used by fcntl(F_GETFL) so the guest
 // reads the values it expects). Inverse of the table above for the status bits.
 static int macapk_macos_to_bionic_fflags(int m) {
@@ -45759,11 +46722,77 @@ extern "C" void* __macapk_arm64___mempcpy_chk(void* dst, const void* src,
                                               size_t count, size_t /*dst_len*/) {
     return __macapk_arm64_mempcpy(dst, src, count);
 }
+// MACAPK_POLL_DEVICE_READY (default ON; =0 is libSystem's answer unchanged).
+//
+// macOS poll(2) does not support device files: for /dev/urandom, /dev/random
+// and /dev/null it reports POLLNVAL (measured on this host: poll({fd,POLLIN})
+// = revents 0x20), although the descriptor is open and readable. On Linux a
+// file whose driver has no poll method is ALWAYS ready -- fs/select.c
+// vfs_poll(): `if (unlikely(!file->f_op->poll)) return DEFAULT_POLLMASK;`,
+// DEFAULT_POLLMASK = EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM
+// (include/linux/poll.h) -- and that covers regular files, directories, block
+// devices and the memory devices.
+//
+// OpenSSL 1.0.x seeds its PRNG exactly this way (crypto/rand/rand_unix.c
+// RAND_poll: open /dev/urandom O_NONBLOCK, poll(POLLIN, 10 ms), read only if
+// POLLIN came back). With POLLNVAL it read nothing from /dev/urandom,
+// /dev/random or /dev/srandom, RAND_bytes failed with PRNG_NOT_SEEDED, and
+// SQLCipher could not create or re-key an encrypted database
+// ("out of memory", its codec's error for any cipher failure).
+//
+// So an entry libSystem marks POLLNVAL whose descriptor is in fact open on a
+// character / block device, regular file or directory gets Linux's answer:
+// the requested subset of the default mask. If that leaves it with nothing
+// (the caller asked for neither read nor write), the other descriptors are
+// polled again without it, since libSystem returned early because of it.
+static int macapk_poll_linux(struct pollfd* fds, nfds_t n, int tmo) {
+    int rc = ::poll(fds, n, tmo);
+    static const bool on = []() {
+        const char* e = std::getenv("MACAPK_POLL_DEVICE_READY");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    if (!on || rc <= 0 || !fds) return rc;
+    const int saved = errno;
+    const short kDefault = POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM;
+    bool fixed = false, emptied = false;
+    for (nfds_t i = 0; i < n; ++i) {
+        if (!(fds[i].revents & POLLNVAL) || fds[i].fd < 0) continue;
+        struct stat st{};
+        if (::fstat(fds[i].fd, &st) != 0) continue;          // really invalid
+        if (!(S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode) || S_ISREG(st.st_mode) ||
+              S_ISDIR(st.st_mode))) continue;
+        fds[i].revents = static_cast<short>(fds[i].events & kDefault);
+        fixed = true;
+        if (fds[i].revents == 0) emptied = true;
+    }
+    if (!fixed) { errno = saved; return rc; }
+    int ready = 0;
+    for (nfds_t i = 0; i < n; ++i) if (fds[i].revents) ++ready;
+    if (ready == 0 && emptied) {
+        // Only never-ready device entries came back: wait on the rest.
+        std::vector<int> keep(n);
+        for (nfds_t i = 0; i < n; ++i) {
+            keep[i] = fds[i].fd;
+            struct stat st{};
+            if (fds[i].fd >= 0 && ::fstat(fds[i].fd, &st) == 0 &&
+                (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode) || S_ISREG(st.st_mode) ||
+                 S_ISDIR(st.st_mode)) && (fds[i].events & kDefault) == 0)
+                fds[i].fd = -1;                               // poll ignores a negative fd
+        }
+        rc = ::poll(fds, n, tmo);
+        const int e2 = errno;
+        for (nfds_t i = 0; i < n; ++i) fds[i].fd = keep[i];
+        errno = e2;
+        return rc;
+    }
+    errno = saved;
+    return ready;
+}
 // int __poll_chk(pollfd* fds, nfds_t fd_count, int timeout, size_t fds_size)
 // poll() is ABI-identical to libSystem -> forward.
 extern "C" int __macapk_arm64___poll_chk(struct pollfd* fds, nfds_t fd_count,
                                          int timeout, size_t /*fds_size*/) {
-    return ::poll(fds, fd_count, timeout);
+    return macapk_poll_linux(fds, fd_count, timeout);
 }
 // int __ppoll_chk(pollfd* fds, nfds_t fd_count, const timespec* timeout,
 //                 const sigset_t* mask, size_t fds_size). macOS libSystem has
@@ -45789,11 +46818,11 @@ extern "C" int __macapk_arm64___ppoll_chk(struct pollfd* fds, nfds_t fd_count,
         if (t > INT_MAX) t = INT_MAX;
         ms = (int)t;
     }
-    if (!mask) return ::poll(fds, fd_count, ms);
+    if (!mask) return macapk_poll_linux(fds, fd_count, ms);
     sigset_t want = bionic_to_mac_sigset(*mask);
     sigset_t saved;
     pthread_sigmask(SIG_SETMASK, &want, &saved);
-    int rc = ::poll(fds, fd_count, ms);
+    int rc = macapk_poll_linux(fds, fd_count, ms);
     int e = errno;
     pthread_sigmask(SIG_SETMASK, &saved, nullptr);
     errno = e;
@@ -46844,11 +47873,15 @@ extern "C" int __macapk_arm64_scandirat(int parent_fd, const char* path,
     if (!macapk_path_shims_on()) {   // MACAPK_PATH_SHIMS=0: the pre-shim binding
         // Darwin's scandirat is macOS 26.4+ (dirent.h:191); below that the import
         // had nothing to bind to, and ENOSYS is the honest stand-in.
+        // An SDK older than 26.4 does not DECLARE scandirat at all, so the call
+        // must be compiled out there (the default shim path above is unaffected).
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
         if (__builtin_available(macOS 26.4, *)) {
             return ::scandirat(parent_fd, path, reinterpret_cast<struct dirent***>(namelist),
                 reinterpret_cast<int (*)(const struct dirent*)>(filter),
                 reinterpret_cast<int (*)(const struct dirent**, const struct dirent**)>(compar));
         }
+#endif
         errno = 38;
         return -1;
     }
@@ -49180,7 +50213,7 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         case 38:  return (long)__macapk_arm64_renameat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, (const char*)macapk_untag_ptr((void*)a4));  // renameat
         case 43:  return (long)__macapk_arm64_statfs((const char*)macapk_untag_ptr((void*)a1), (void*)macapk_untag_ptr((void*)a2));  // statfs
         case 44:  return (long)__macapk_arm64_fstatfs((int)a1, (void*)macapk_untag_ptr((void*)a2));  // fstatfs
-        case 48:  return (long)__macapk_arm64_faccessat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, (int)a4);  // faccessat
+        case 48:  return (long)__macapk_arm64_faccessat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, 0);  // raw faccessat has three arguments
         case 53:  return (long)__macapk_arm64_fchmodat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (mode_t)a3, (int)a4);  // fchmodat
         case 56:  return (long)__macapk_arm64_openat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (int)a3, (mode_t)a4);  // openat
         // 36/37/45/49/54/88 added with the S0 path shims (2026-09-26), by this
@@ -51023,8 +52056,10 @@ uint32_t __macapk_shim_open(uint32_t path, uint32_t flags,
             "[open] #%d \"%s\" flags=0x%x mode=0x%x\n",
             n, p.c_str(), flags, mode);
     }
-    int fd = ::open(p.c_str(), static_cast<int>(flags),
-                    static_cast<mode_t>(mode));
+    const int mflags = macapk_arm32_to_macos_oflags(static_cast<int>(flags));
+    int fd = (flags & 0x40 /* ARM Linux O_CREAT */)
+        ? ::open(p.c_str(), mflags, static_cast<mode_t>(mode))
+        : ::open(p.c_str(), mflags);
     if (n < 30) {
         std::fprintf(stderr,
             "[open] #%d -> fd=%d (errno=%d=%s)\n",
@@ -51695,6 +52730,303 @@ uint32_t __macapk_shim_remove(uint32_t path, uint32_t,
     return static_cast<uint32_t>(rc);
 }
 
+// =================================================================
+// ARM32 fd / path / lock / misc libc twins (v1.0.2380): ftruncate, fcntl,
+// fchmod, fchown, unlink, rmdir, readlink, geteuid, mremap, sysconf,
+// gmtime_r, utimes, mlock, munlock, sigprocmask.
+// =================================================================
+//
+// None of these had a __macapk_shim_ body, so tier_of (main.cpp) bound each
+// to libSystem's bare name: an AAPCS64 function handed 32-bit guest vaddrs,
+// Linux command numbers and ILP32 struct layouts. Two consequences:
+//  (1) A DIRECT call reached the host function with the wrong contract
+//      (fcntl is variadic on Apple arm64, so its third argument was read
+//      from the stack; unlink/rmdir/readlink/utimes dereferenced a guest
+//      vaddr as a host pointer; gmtime_r read an 8-byte time_t and wrote a
+//      56-byte struct tm into a 44-byte guest one; sysconf saw Bionic's
+//      _SC_* numbers).
+//  (2) A function POINTER to one of them never bound at all: the ARM32
+//      data-import link only gives an STT_FUNC import a host fallback when
+//      the name is one we provide as a system-library function
+//      (arm32rc_driver.cpp "(b) host-function fallback thunks"), so the slot
+//      kept its in-place word (0 for an R_ARM_ABS32 in .data). SQLite's unix
+//      VFS calls EVERY syscall through such a table (os_unix.c aSyscall[]:
+//      osFtruncate, osFcntl, osFchmod, osUnlink, osRmdir, osFchown,
+//      osGeteuid, osMremap, osReadlink), so in SQLCipher's ARM32
+//      libsqlcipher.so nine of its entries were NULL.
+// Layouts and numbers are Bionic's 32-bit ARM ones, cited at each shim.
+
+// int ftruncate(int fd, off_t length). Bionic LP32 off_t is 32-bit SIGNED
+// (libc/include/sys/types.h: `typedef __kernel_off_t off_t` unless
+// _FILE_OFFSET_BITS=64, which renames the call to ftruncate64), so r1 is
+// the whole length and a negative one must stay negative (EINVAL).
+uint32_t __macapk_shim_ftruncate(uint32_t fd, uint32_t length,
+                                 uint32_t, uint32_t) {
+    return static_cast<uint32_t>(::ftruncate(
+        static_cast<int>(fd), static_cast<off_t>(static_cast<int32_t>(length))));
+}
+
+// int fchmod(int fd, mode_t mode). mode_t is 2 bytes on armeabi-v7a (see the
+// mkdir note above); the caller widens it, so mask rather than trust r1's
+// high half.
+uint32_t __macapk_shim_fchmod(uint32_t fd, uint32_t mode, uint32_t, uint32_t) {
+    return static_cast<uint32_t>(::fchmod(
+        static_cast<int>(fd), static_cast<mode_t>(mode & 07777u)));
+}
+
+// int fchown(int fd, uid_t owner, gid_t group). uid_t / gid_t are 32-bit on
+// both sides and (uid_t)-1 means "leave unchanged" on both. The ids are the
+// HOST's: getuid / geteuid answer with the host's too, so a guest that hands
+// back what it was told round-trips.
+uint32_t __macapk_shim_fchown(uint32_t fd, uint32_t owner, uint32_t group,
+                              uint32_t) {
+    return static_cast<uint32_t>(::fchown(
+        static_cast<int>(fd), static_cast<uid_t>(owner),
+        static_cast<gid_t>(group)));
+}
+
+// uid_t geteuid(void). No pointers; a body exists so a function POINTER to
+// it binds (see (2) above). Same answer the bare bind gave a direct call.
+uint32_t __macapk_shim_geteuid(uint32_t, uint32_t, uint32_t, uint32_t) {
+    return static_cast<uint32_t>(::geteuid());
+}
+
+// int unlink(const char* path) / int rmdir(const char* path): the same
+// Android-root remap and write scope as __macapk_shim_remove / _mkdir, so a
+// file the guest created through open()/mkdir() is the file it deletes.
+uint32_t __macapk_shim_unlink(uint32_t path, uint32_t, uint32_t, uint32_t) {
+    if (!path) { errno = EFAULT; return static_cast<uint32_t>(-1); }
+    const char* raw = gptr(path);
+    const MacapkPathWriteScope wi(true);   // mutates: the .apk fallback is read-only
+    std::string p = remap_asset_path(raw);
+    int rc = ::unlink(p.c_str());
+    macapk_shim_log_path_op("unlink", raw, p, rc);
+    return static_cast<uint32_t>(rc);
+}
+uint32_t __macapk_shim_rmdir(uint32_t path, uint32_t, uint32_t, uint32_t) {
+    if (!path) { errno = EFAULT; return static_cast<uint32_t>(-1); }
+    const char* raw = gptr(path);
+    const MacapkPathWriteScope wi(true);   // mutates: the .apk fallback is read-only
+    std::string p = remap_asset_path(raw);
+    int rc = ::rmdir(p.c_str());
+    macapk_shim_log_path_op("rmdir", raw, p, rc);
+    return static_cast<uint32_t>(rc);
+}
+
+// ssize_t readlink(const char* path, char* buf, size_t bufsiz). Remap the
+// path in, and map the TARGET back to the Android path a device would show
+// (macapk_readlink_finish, shared with __macapk_arm64_readlink).
+uint32_t __macapk_shim_readlink(uint32_t path, uint32_t buf, uint32_t n,
+                                uint32_t) {
+    if (!path || !buf) { errno = EFAULT; return static_cast<uint32_t>(-1); }
+    char* hb = gptr(buf);
+    ssize_t rc = ::readlink(remap_asset_path(gptr(path)).c_str(), hb, n);
+    rc = macapk_readlink_finish(hb, n, rc);
+    return static_cast<uint32_t>(rc);
+}
+
+// int fcntl(int fd, int cmd, ...). Bionic LP32 (libc/bionic/fcntl.cpp) issues
+// fcntl64 with the command unchanged, so BOTH lock families reach the kernel:
+//   F_GETLK/F_SETLK/F_SETLKW       = 5/6/7     struct flock   (16 bytes)
+//     { short l_type@0; short l_whence@2; off_t l_start@4; off_t l_len@8;
+//       pid_t l_pid@12 }                        (32-bit off_t)
+//   F_GETLK64/F_SETLK64/F_SETLKW64 = 12/13/14  struct flock64 (32 bytes)
+//     { short l_type@0; short l_whence@2; loff_t l_start@8; loff_t l_len@16;
+//       pid_t l_pid@24 }   (AAPCS32 aligns a 64-bit member to 8, so 4 bytes of
+//       padding follow l_whence; this is the layout __macapk_arm64_fcntl's
+//       macapk_bionic_flock already has)
+// (uapi asm-generic/fcntl.h; arch/arm/include/uapi/asm/fcntl.h only overrides
+// O_DIRECTORY/O_NOFOLLOW/O_DIRECT/O_LARGEFILE, to the SAME values arm64 uses,
+// so the arm64 O_* translators serve F_GETFL/F_SETFL here too.)
+// macOS: F_GETLK/F_SETLK/F_SETLKW = 7/8/9 and Linux's 5/6 are macOS
+// F_GETOWN/F_SETOWN, struct flock is { off_t l_start; off_t l_len; pid_t
+// l_pid; short l_type; short l_whence }, and F_RDLCK/F_WRLCK/F_UNLCK are
+// 1/3/2 against Linux's 0/1/2 (sys/fcntl.h). The third argument is in r2
+// (AAPCS32 passes variadic arguments like named ones).
+uint32_t __macapk_shim_fcntl(uint32_t ufd, uint32_t ucmd, uint32_t arg,
+                             uint32_t) {
+    const int fd = static_cast<int>(ufd);
+    const int cmd = static_cast<int>(ucmd);
+    const int iarg = static_cast<int>(arg);
+    switch (cmd) {
+        case 0: { int r = ::fcntl(fd, F_DUPFD, iarg);                      // F_DUPFD
+                  macapk_efd_dup(fd, r); return static_cast<uint32_t>(r); }
+        case 1: return static_cast<uint32_t>(::fcntl(fd, F_GETFD));        // F_GETFD
+        case 2: return static_cast<uint32_t>(::fcntl(fd, F_SETFD, iarg));  // F_SETFD
+        case 3: { int r = ::fcntl(fd, F_GETFL);                            // F_GETFL
+                  return static_cast<uint32_t>(
+                      r < 0 ? r : macapk_macos_to_bionic_fflags(r)); }
+        case 4: return static_cast<uint32_t>(::fcntl(                      // F_SETFL
+                    fd, F_SETFL, macapk_bionic_to_macos_oflags(iarg)));
+        case 8: return static_cast<uint32_t>(::fcntl(fd, F_SETOWN, iarg)); // F_SETOWN
+        case 9: return static_cast<uint32_t>(::fcntl(fd, F_GETOWN));       // F_GETOWN
+        case 1030: { int r = ::fcntl(fd, F_DUPFD_CLOEXEC, iarg);           // F_DUPFD_CLOEXEC
+                     macapk_efd_dup(fd, r); return static_cast<uint32_t>(r); }
+        case 5: case 6: case 7:                                            // struct flock
+        case 12: case 13: case 14: {                                       // struct flock64
+            if (!arg) { errno = EFAULT; return static_cast<uint32_t>(-1); }
+            const bool wide = cmd >= 12;
+            const int base = wide ? cmd - 12 : cmd - 5;   // 0 get, 1 set, 2 setw
+            uint8_t* g = reinterpret_cast<uint8_t*>(gptr(arg));
+            int16_t l_type = 0, l_whence = 0;
+            std::memcpy(&l_type, g, 2);
+            std::memcpy(&l_whence, g + 2, 2);
+            struct flock mf;
+            std::memset(&mf, 0, sizeof(mf));
+            int32_t pid = 0;
+            if (wide) {
+                int64_t st = 0, ln = 0;
+                std::memcpy(&st, g + 8, 8);
+                std::memcpy(&ln, g + 16, 8);
+                std::memcpy(&pid, g + 24, 4);
+                mf.l_start = st; mf.l_len = ln;
+            } else {
+                int32_t st = 0, ln = 0;
+                std::memcpy(&st, g + 4, 4);
+                std::memcpy(&ln, g + 8, 4);
+                std::memcpy(&pid, g + 12, 4);
+                mf.l_start = st; mf.l_len = ln;
+            }
+            mf.l_pid = static_cast<pid_t>(pid);
+            mf.l_type = macapk_lin_to_mac_locktype(l_type);
+            mf.l_whence = l_whence;                // SEEK_SET/CUR/END are 0/1/2 on both
+            const int mc = base == 0 ? F_GETLK : base == 1 ? F_SETLK : F_SETLKW;
+            int r = ::fcntl(fd, mc, &mf);
+            if (base == 0 && r == 0) {             // F_GETLK reports the conflicting lock
+                l_type = macapk_mac_to_lin_locktype(mf.l_type);
+                l_whence = mf.l_whence;
+                pid = static_cast<int32_t>(mf.l_pid);
+                std::memcpy(g, &l_type, 2);
+                std::memcpy(g + 2, &l_whence, 2);
+                if (wide) {
+                    int64_t st = mf.l_start, ln = mf.l_len;
+                    std::memcpy(g + 8, &st, 8);
+                    std::memcpy(g + 16, &ln, 8);
+                    std::memcpy(g + 24, &pid, 4);
+                } else {
+                    int32_t st = static_cast<int32_t>(mf.l_start);
+                    int32_t ln = static_cast<int32_t>(mf.l_len);
+                    std::memcpy(g + 4, &st, 4);
+                    std::memcpy(g + 8, &ln, 4);
+                    std::memcpy(g + 12, &pid, 4);
+                }
+            }
+            return static_cast<uint32_t>(r);
+        }
+        default: errno = EINVAL; return static_cast<uint32_t>(-1);   // honest: unsupported cmd
+    }
+}
+
+// void* mremap(void* old, size_t old_size, size_t new_size, int flags, ...).
+// macOS has no mremap. Same size and shrink are done in place. GROWING is
+// refused with ENOMEM, which mremap(2) documents for "the memory area cannot
+// be expanded": the Stage 6 twin's mmap+copy would hand an ARM32 guest a
+// mapping outside its 32-bit window, and a copy silently turns a MAP_SHARED
+// file mapping (SQLite's unixRemapfile, the one corpus caller) into private
+// memory that never reaches the file. Every caller must already handle
+// MAP_FAILED; SQLite falls back to munmap + mmap.
+uint32_t __macapk_shim_mremap(uint32_t old_addr, uint32_t old_size,
+                              uint32_t new_size, uint32_t flags) {
+    if (!old_addr || new_size == 0 || (flags & 2u /*MREMAP_FIXED*/)) {
+        errno = EINVAL;
+        return 0xffffffffu;   // MAP_FAILED
+    }
+    if (new_size == old_size) return old_addr;
+    if (new_size < old_size) {
+        const uint32_t pg = static_cast<uint32_t>(::sysconf(_SC_PAGESIZE));
+        const uint32_t keep = (new_size + pg - 1) & ~(pg - 1);
+        if (keep < old_size)
+            ::munmap(static_cast<void*>(g_guest_base + old_addr + keep),
+                     old_size - keep);
+        return old_addr;
+    }
+    errno = ENOMEM;
+    return 0xffffffffu;
+}
+
+// long sysconf(int name). Bionic's _SC_* numbering (libc/include/bits/
+// sysconf.h, the same on every ABI) is not Darwin's: _SC_PAGESIZE is 0x27
+// there and 29 here. __macapk_arm64_sysconf already answers in Bionic's.
+uint32_t __macapk_shim_sysconf(uint32_t name, uint32_t, uint32_t, uint32_t) {
+    return static_cast<uint32_t>(__macapk_arm64_sysconf(static_cast<int>(name)));
+}
+
+// struct tm* gmtime_r(const time_t* t, struct tm* out). Bionic LP32: time_t
+// is a 32-bit long, struct tm is 44 bytes: nine ints, `long tm_gmtoff` @36,
+// `const char* tm_zone` @40 (libc/include/time.h). Darwin's is 56 bytes with
+// an 8-byte time_t. Returns `out`, or NULL on failure.
+uint32_t __macapk_shim_gmtime_r(uint32_t timep_addr, uint32_t tm_addr,
+                                uint32_t, uint32_t) {
+    if (!timep_addr || !tm_addr) return 0;
+    int32_t t32;
+    std::memcpy(&t32, g_guest_base + timep_addr, sizeof(t32));
+    time_t t = t32;
+    struct tm h{};
+    if (!::gmtime_r(&t, &h)) return 0;
+    static std::atomic<uint32_t> g_gmt{0};   // guest "GMT" for tm_zone
+    uint32_t zone = g_gmt.load(std::memory_order_relaxed);
+    if (!zone) {
+        zone = guest_alloc(8);
+        if (zone) {
+            std::memcpy(g_guest_base + zone, "GMT", 4);
+            g_gmt.store(zone, std::memory_order_relaxed);
+        }
+    }
+    const int32_t f[11] = { h.tm_sec, h.tm_min, h.tm_hour, h.tm_mday, h.tm_mon,
+                            h.tm_year, h.tm_wday, h.tm_yday, h.tm_isdst,
+                            0 /*tm_gmtoff*/, static_cast<int32_t>(zone) };
+    std::memcpy(g_guest_base + tm_addr, f, sizeof(f));
+    return tm_addr;
+}
+
+// int utimes(const char* path, const struct timeval tv[2]). Bionic LP32
+// timeval is { long tv_sec; long tv_usec }, 8 bytes; NULL means "now".
+uint32_t __macapk_shim_utimes(uint32_t path, uint32_t tv_addr,
+                              uint32_t, uint32_t) {
+    if (!path) { errno = EFAULT; return static_cast<uint32_t>(-1); }
+    const MacapkPathWriteScope wi(true);   // mutates: the .apk fallback is read-only
+    std::string p = remap_asset_path(gptr(path));
+    struct timeval h[2];
+    if (tv_addr) {
+        int32_t w[4];
+        std::memcpy(w, g_guest_base + tv_addr, sizeof(w));
+        h[0].tv_sec = w[0]; h[0].tv_usec = w[1];
+        h[1].tv_sec = w[2]; h[1].tv_usec = w[3];
+    }
+    return static_cast<uint32_t>(::utimes(p.c_str(), tv_addr ? h : nullptr));
+}
+
+// int mlock(const void* addr, size_t len) / int munlock(...): the address is
+// a guest vaddr.
+uint32_t __macapk_shim_mlock(uint32_t addr, uint32_t len, uint32_t, uint32_t) {
+    return static_cast<uint32_t>(::mlock(g_guest_base + addr, len));
+}
+uint32_t __macapk_shim_munlock(uint32_t addr, uint32_t len, uint32_t, uint32_t) {
+    return static_cast<uint32_t>(::munlock(g_guest_base + addr, len));
+}
+
+// int sigprocmask(int how, const sigset_t* set, sigset_t* old). Bionic LP32
+// sigset_t is ONE unsigned long (32 signals, libc/include/signal.h); the
+// Stage 6 twin takes Bionic's 64-bit set in the same Linux numbering, so
+// widen in and narrow out.
+uint32_t __macapk_shim_sigprocmask(uint32_t how, uint32_t set_addr,
+                                   uint32_t old_addr, uint32_t) {
+    uint64_t set64 = 0, old64 = 0;
+    if (set_addr) {
+        uint32_t s32;
+        std::memcpy(&s32, g_guest_base + set_addr, 4);
+        set64 = s32;
+    }
+    int r = __macapk_arm64_sigprocmask(static_cast<int>(how),
+                                       set_addr ? &set64 : nullptr,
+                                       old_addr ? &old64 : nullptr);
+    if (r == 0 && old_addr) {
+        const uint32_t o32 = static_cast<uint32_t>(old64);
+        std::memcpy(g_guest_base + old_addr, &o32, 4);
+    }
+    return static_cast<uint32_t>(r);
+}
+
 uint32_t __macapk_shim_rename(uint32_t oldp, uint32_t newp,
                                 uint32_t, uint32_t) {
     if (!oldp || !newp) { errno = EFAULT; return static_cast<uint32_t>(-1); }
@@ -51873,7 +53205,7 @@ uint32_t __macapk_shim_poll(uint32_t fds, uint32_t nfds, uint32_t timeout,
     // Copy rather than poll in place: an app that reuses the array
     // across calls would otherwise see its `events` field rewritten
     // with host bits and get double-translated on the next call.
-    int rc = ::poll(host.data(), nfds, tmo);
+    int rc = macapk_poll_linux(host.data(), nfds, tmo);
     int saved = errno;
     for (uint32_t i = 0; i < nfds; ++i) {
         int16_t rev = host_pollev_to_bionic(host[i].revents);
@@ -51906,6 +53238,8 @@ uint32_t __macapk_shim_poll(uint32_t fds, uint32_t nfds, uint32_t timeout,
 //                            Linux 0x5413 <-> macOS 0x40087468
 //   TIOCSWINSZ  struct winsize
 //                            Linux 0x5414 <-> macOS 0x80087467
+// SIOCGIFFLAGS (Linux 0x8913) is translated too, but its struct ifreq and
+// flag bits differ, so it has its own handler: macapk_ifreq_ioctl below.
 // Linux values from bionic's vendored uapi asm-generic/ioctls.h; macOS
 // values are the host macros, not literals, so they cannot be mistyped.
 //
@@ -51919,10 +53253,67 @@ constexpr uint32_t kLinuxTIOCGWINSZ = 0x5413;
 constexpr uint32_t kLinuxTIOCSWINSZ = 0x5414;
 constexpr uint32_t kLinuxFIONBIO    = 0x5421;
 constexpr uint32_t kLinuxFIOASYNC   = 0x5452;
+constexpr uint32_t kLinuxSIOCGIFFLAGS = 0x8913;   // uapi linux/sockios.h
+constexpr short    kLinuxIFF_MULTICAST = 0x1000;  // uapi linux/if.h
+constexpr int      kLinuxENODEV = 19;             // uapi asm-generic/errno-base.h
 }  // namespace
+
+// SIOCGIFFLAGS: an interface's flags, by name. Unlike the requests above, its
+// payload (struct ifreq) and its flag bits differ between the two systems, so
+// it is rebuilt rather than passed through.
+//
+// THE CALLER THAT NEEDS IT is WebRTC's own interface enumerator
+// (rtc_base/ifaddrs_android.cc): for every address the netlink dump returns
+// (see the AF_NETLINK emulation), set_flags() opens an AF_INET datagram socket
+// and asks ioctl(SIOCGIFFLAGS) -- and ONE failure discards the whole list.
+// Refused with ENOTTY, WebRTC logged "getifaddrs failed to gather interface
+// data" and saw no networks at all, so it gathered no ICE candidates of its
+// own: measured 2026-11-13 on Signal 8.35.2 (RingRTC), whose outgoing call
+// reached the other phone but never connected: it never rang there, and
+// hanging up left a missed call. 16 refusals of 0x8913 in the log.
+//
+//   Linux struct ifreq (uapi linux/if.h): char ifr_name[16]; union { ...;
+//       short ifru_flags; ...; struct ifmap } -- 40 bytes on arm64 (32 on arm32)
+//   macOS struct ifreq (net/if.h):        char ifr_name[16]; union { ...;
+//       short ifru_flags; ... }           -- 32 bytes
+// The name and the flags sit at the same offsets (0 and 16) in both, so only
+// those two fields are copied. IFF_* bits 0x1..0x200 (UP, BROADCAST, DEBUG,
+// LOOPBACK, POINTOPOINT, NOTRAILERS, RUNNING, NOARP, PROMISC, ALLMULTI) mean
+// the same on both; above that they do not (macOS IFF_MULTICAST is 0x8000,
+// Linux's is 0x1000, and macOS 0x400..0x4000 are OACTIVE, SIMPLEX and LINK0-2
+// where Linux has MASTER, SLAVE, MULTICAST, PORTSEL and AUTOMEDIA), so the
+// shared bits are kept and MULTICAST is moved; the macOS-only bits have no
+// Linux meaning and are dropped.
+static bool macapk_ifreq_ioctl(int fd, uint32_t op, void* argp, int* rc) {
+    if (op != kLinuxSIOCGIFFLAGS) return false;
+    if (!argp) { errno = EFAULT; *rc = -1; return true; }
+    struct ifreq host;
+    std::memset(&host, 0, sizeof host);
+    std::memcpy(host.ifr_name, argp, IFNAMSIZ - 1);   // NUL-terminated by the memset
+    if (::ioctl(fd, SIOCGIFFLAGS, &host) != 0) {
+        // An unknown name is ENXIO on macOS but ENODEV (19) from a Linux
+        // kernel, which is what an Android caller is written against.
+        errno = (errno == ENXIO) ? kLinuxENODEV : errno_mac2lin(errno);
+        *rc = -1;
+        return true;
+    }
+    const unsigned short mac = static_cast<unsigned short>(host.ifr_flags);
+    short linux_flags = static_cast<short>(mac & 0x03ff);   // the shared bits
+    if (mac & IFF_MULTICAST) linux_flags |= kLinuxIFF_MULTICAST;
+    std::memcpy(static_cast<char*>(argp) + IFNAMSIZ, &linux_flags, sizeof linux_flags);
+    *rc = 0;
+    return true;
+}
 
 uint32_t __macapk_shim_ioctl(uint32_t fd, uint32_t op, uint32_t argp,
                                uint32_t) {
+    {
+        // A null argp reaches the handler too, so a null SIOCGIFFLAGS gets
+        // EFAULT here as it does on the arm64 path.
+        int irc = 0;
+        if (macapk_ifreq_ioctl(static_cast<int>(fd), op, argp ? gptr(argp) : nullptr, &irc))
+            return static_cast<uint32_t>(irc);
+    }
     unsigned long host_op = 0;
     switch (op) {
         case kLinuxFIONREAD:   host_op = FIONREAD;   break;
@@ -51988,6 +53379,7 @@ static bool macapk_ashmem_ioctl(int fd, uint32_t op, void* argp, int* rc) {
 }
 extern "C" int __macapk_arm64_ioctl(int fd, int op, void* argp) {
     { int arc = 0; if (macapk_ashmem_ioctl(fd, static_cast<uint32_t>(op), argp, &arc)) return arc; }
+    { int irc = 0; if (macapk_ifreq_ioctl(fd, static_cast<uint32_t>(op), argp, &irc)) return irc; }
     unsigned long host_op = 0;
     switch (static_cast<uint32_t>(op)) {
         case kLinuxFIONREAD:   host_op = FIONREAD;   break;
@@ -55079,6 +56471,99 @@ static void init_forwarders() {
     // docs/arm32-registernatives_2026-07-28.md.
     g_forwarders[JM_RegisterNatives]         = &RegisterNatives;
     g_forwarders[JM_UnregisterNatives]       = &UnregisterNatives;
+    // v1.0.2387: 64-bit results and the remaining Call<T>Method families.
+    g_forwarders[JM_W_CallByteMethod] = &CallTyped<'B', false, 0>;
+    g_forwarders[JM_W_CallByteMethodV] = &CallTyped<'B', false, 1>;
+    g_forwarders[JM_W_CallByteMethodA] = &CallTyped<'B', false, 2>;
+    g_forwarders[JM_W_CallCharMethod] = &CallTyped<'C', false, 0>;
+    g_forwarders[JM_W_CallCharMethodV] = &CallTyped<'C', false, 1>;
+    g_forwarders[JM_W_CallCharMethodA] = &CallTyped<'C', false, 2>;
+    g_forwarders[JM_W_CallShortMethod] = &CallTyped<'S', false, 0>;
+    g_forwarders[JM_W_CallShortMethodV] = &CallTyped<'S', false, 1>;
+    g_forwarders[JM_W_CallShortMethodA] = &CallTyped<'S', false, 2>;
+    g_forwarders[JM_W_CallLongMethod] = &CallTyped<'J', false, 0>;
+    g_forwarders[JM_W_CallLongMethodV] = &CallTyped<'J', false, 1>;
+    g_forwarders[JM_W_CallLongMethodA] = &CallTyped<'J', false, 2>;
+    g_forwarders[JM_W_CallFloatMethod] = &CallTyped<'F', false, 0>;
+    g_forwarders[JM_W_CallFloatMethodV] = &CallTyped<'F', false, 1>;
+    g_forwarders[JM_W_CallFloatMethodA] = &CallTyped<'F', false, 2>;
+    g_forwarders[JM_W_CallDoubleMethod] = &CallTyped<'D', false, 0>;
+    g_forwarders[JM_W_CallDoubleMethodV] = &CallTyped<'D', false, 1>;
+    g_forwarders[JM_W_CallDoubleMethodA] = &CallTyped<'D', false, 2>;
+    g_forwarders[JM_W_CallStaticByteMethod] = &CallTyped<'B', true, 0>;
+    g_forwarders[JM_W_CallStaticByteMethodV] = &CallTyped<'B', true, 1>;
+    g_forwarders[JM_W_CallStaticByteMethodA] = &CallTyped<'B', true, 2>;
+    g_forwarders[JM_W_CallStaticLongMethod] = &CallTyped<'J', true, 0>;
+    g_forwarders[JM_W_CallStaticLongMethodV] = &CallTyped<'J', true, 1>;
+    g_forwarders[JM_W_CallStaticLongMethodA] = &CallTyped<'J', true, 2>;
+    g_forwarders[JM_W_CallStaticDoubleMethod] = &CallTyped<'D', true, 0>;
+    g_forwarders[JM_W_CallStaticDoubleMethodV] = &CallTyped<'D', true, 1>;
+    g_forwarders[JM_W_CallStaticDoubleMethodA] = &CallTyped<'D', true, 2>;
+    g_forwarders[JM_W_GetLongField] = &GetLongField;
+    g_forwarders[JM_W_GetDoubleField] = &GetDoubleField;
+    g_forwarders[JM_W_GetStaticLongField] = &GetStaticLongField;
+    g_forwarders[JM_W_GetStaticDoubleField] = &GetStaticDoubleField;
+    // v1.0.2385: exceptions raised by a native reach Java, plus the slots that
+    // were unrouted or mapped to the silent stub (block above
+    // Stub_NotImplemented).
+    g_forwarders[JM_DeleteWeakGlobalRef] = &DeleteWeakGlobalRef;
+    g_forwarders[JM_EnsureLocalCapacity] = &EnsureLocalCapacity;
+    g_forwarders[JM_FatalError] = &FatalError;
+    g_forwarders[JM_GetByteField] = &GetByteField;
+    g_forwarders[JM_GetCharField] = &GetCharField;
+    g_forwarders[JM_GetDoubleArrayRegion] = &GetDoubleArrayRegion;
+    g_forwarders[JM_GetFloatField] = &GetFloatField;
+    g_forwarders[JM_GetObjectArrayElement] = &GetObjectArrayElement;
+    g_forwarders[JM_GetPrimArrayElements] = &GetPrimArrayElements;
+    g_forwarders[JM_GetShortField] = &GetShortField;
+    g_forwarders[JM_GetStaticBooleanField] = &GetStaticBooleanField;
+    g_forwarders[JM_GetStaticByteField] = &GetStaticByteField;
+    g_forwarders[JM_GetStaticCharField] = &GetStaticCharField;
+    g_forwarders[JM_GetStaticFloatField] = &GetStaticFloatField;
+    g_forwarders[JM_GetStaticIntField] = &GetStaticIntField;
+    g_forwarders[JM_GetStaticObjectField] = &GetStaticObjectField;
+    g_forwarders[JM_GetStaticShortField] = &GetStaticShortField;
+    g_forwarders[JM_GetStringChars] = &GetStringChars;
+    g_forwarders[JM_GetStringRegion] = &GetStringRegion;
+    g_forwarders[JM_GetStringUTFLength] = &GetStringUTFLength;
+    g_forwarders[JM_GetStringUTFRegion] = &GetStringUTFRegion;
+    g_forwarders[JM_GetSuperclass] = &GetSuperclass;
+    g_forwarders[JM_IsAssignableFrom] = &IsAssignableFrom;
+    g_forwarders[JM_IsSameObject] = &IsSameObject;
+    g_forwarders[JM_NewDoubleArray] = &NewDoubleArray;
+    g_forwarders[JM_NewObjectArray] = &NewObjectArray;
+    g_forwarders[JM_NewWeakGlobalRef] = &NewWeakGlobalRef;
+    g_forwarders[JM_ReleasePrimArrayElements] = &ReleasePrimArrayElements;
+    g_forwarders[JM_ReleaseStringChars] = &ReleaseStringChars;
+    g_forwarders[JM_SetByteField] = &SetByteField;
+    g_forwarders[JM_SetCharField] = &SetCharField;
+    g_forwarders[JM_SetDoubleArrayRegion] = &SetDoubleArrayRegion;
+    g_forwarders[JM_SetDoubleField] = &SetDoubleField;
+    g_forwarders[JM_SetFloatField] = &SetFloatField;
+    g_forwarders[JM_SetLongField] = &SetLongField;
+    g_forwarders[JM_SetObjectArrayElement] = &SetObjectArrayElement;
+    g_forwarders[JM_SetShortField] = &SetShortField;
+    g_forwarders[JM_SetStaticBooleanField] = &SetStaticBooleanField;
+    g_forwarders[JM_SetStaticByteField] = &SetStaticByteField;
+    g_forwarders[JM_SetStaticCharField] = &SetStaticCharField;
+    g_forwarders[JM_SetStaticDoubleField] = &SetStaticDoubleField;
+    g_forwarders[JM_SetStaticFloatField] = &SetStaticFloatField;
+    g_forwarders[JM_SetStaticIntField] = &SetStaticIntField;
+    g_forwarders[JM_SetStaticLongField] = &SetStaticLongField;
+    g_forwarders[JM_SetStaticObjectField] = &SetStaticObjectField;
+    g_forwarders[JM_SetStaticShortField] = &SetStaticShortField;
+    g_forwarders[JM_Throw] = &Throw;
+    g_forwarders[JM_ThrowNew] = &ThrowNew;
+    g_forwarders[JM_ExceptionOccurred] = &ExceptionOccurred;
+    g_forwarders[JM_ExceptionDescribe] = &ExceptionDescribe;
+    g_forwarders[JM_PushLocalFrame] = &PushLocalFrame;
+    g_forwarders[JM_PopLocalFrame] = &PopLocalFrame;
+    g_forwarders[JM_NewLocalRef] = &NewLocalRef;
+    g_forwarders[JM_NewString] = &NewString;
+    g_forwarders[JM_GetStringLength] = &GetStringLength;
+    g_forwarders[JM_NewByteArray] = &NewByteArray;
+    g_forwarders[JM_GetByteArrayElements] = &GetPrimArrayElements;
+    g_forwarders[JM_ReleaseByteArrayElements] = &ReleasePrimArrayElements;
 
     for (int i = 0; i < static_cast<int>(VM_COUNT); ++i) g_vm_forwarders[i] = &Stub_NotImplemented;
     g_vm_forwarders[VM_DestroyJavaVM]              = &VmDestroyJavaVM;
@@ -55149,7 +56634,46 @@ extern "C" int32_t __macapk_dlsym_tramp_dispatch(uint32_t idx, uint32_t r0,
 extern "C" int32_t __macapk_dlsym_tramp_dispatch_ns(uint32_t idx, uint32_t r0, uint32_t r1,
                                                     uint32_t r2, uint32_t r3, uint32_t sp);
 
-int32_t __macapk_indirect_call(uint32_t target,
+// v1.0.2387: the dispatcher returns guest r0 AND r1.
+//
+// AAPCS32 (IHI 0042, 6.4 Result Return): "A double-word sized Fundamental
+// Data Type (e.g., long long, double and 64-bit containerized vectors) is
+// returned in r0 and r1." arm32rc keeps guest r0-r3 in host x0-x3, so a
+// translated callee that returns to a translated caller hands r1 back in x1
+// by construction. An INDIRECT call goes through this C function, and a C
+// function returning int32_t promises nothing about x1: the guest's r1 was
+// whatever the dispatcher last left there. That is why every JNIEnv slot with
+// a jlong / jdouble result (GetLongField, CallLongMethod, ...) was unrouted,
+// and it also lost the high word of any guest function pointer call that
+// returns long long or a soft-float double.
+//
+// AAPCS64 (IHI 0055, 6.9 Result Return) returns a 16-byte composite of two
+// 64-bit integers in x0 and x1, so declaring the dispatcher to return
+// MacapkRet2 puts guest r0 in w0 and guest r1 in w1 with no change to the
+// translated code: every existing `bl __macapk_indirect_call` site already
+// reads its result from those two registers. Translated bodies are called
+// through the same type, which captures the x1 they return.
+// When the callee is a C forwarder with a 32-bit result, r1 comes back as the
+// caller passed it (r1 is caller-saved, so any value is conforming).
+struct MacapkRet2 { uint64_t x0; uint64_t x1; };
+static int32_t macapk_indirect_call_core(uint32_t target,
+                                uint32_t r0, uint32_t r1,
+                                uint32_t r2, uint32_t r3,
+                                uint32_t sp, uint32_t from_vaddr);
+extern "C" MacapkRet2 __macapk_indirect_call(uint32_t target,
+                                uint32_t r0, uint32_t r1,
+                                uint32_t r2, uint32_t r3,
+                                uint32_t sp, uint32_t from_vaddr) {
+    macapk_jni::g_ret_r1_valid = false;
+    const int32_t lo = macapk_indirect_call_core(target, r0, r1, r2, r3, sp,
+                                                 from_vaddr);
+    MacapkRet2 r;
+    r.x0 = static_cast<uint32_t>(lo);
+    r.x1 = macapk_jni::g_ret_r1_valid ? macapk_jni::g_ret_r1 : r1;
+    macapk_jni::g_ret_r1_valid = false;
+    return r;
+}
+static int32_t macapk_indirect_call_core(uint32_t target,
                                 uint32_t r0, uint32_t r1,
                                 uint32_t r2, uint32_t r3,
                                 uint32_t sp,
@@ -55330,7 +56854,16 @@ int32_t __macapk_indirect_call(uint32_t target,
         // below as the only path. It does: the deleted branch called exactly
         // the same LiftedFn with the same arguments and returned its result,
         // adding only logging, so behaviour for every app is unchanged.
-        return reinterpret_cast<LiftedFn>(host_fn)(r0, r1, r2, r3, sp);
+        // v1.0.2387: take the callee's x1 too (guest r1, the high word of a
+        // 64-bit result); see MacapkRet2 above.
+        (void)sizeof(LiftedFn);
+        using LiftedFn2 = MacapkRet2(*)(uint32_t, uint32_t, uint32_t,
+                                        uint32_t, uint32_t);
+        const MacapkRet2 rr =
+            reinterpret_cast<LiftedFn2>(host_fn)(r0, r1, r2, r3, sp);
+        macapk_jni::g_ret_r1 = static_cast<uint32_t>(rr.x1);
+        macapk_jni::g_ret_r1_valid = true;
+        return static_cast<int32_t>(static_cast<uint32_t>(rr.x0));
     }
     // Rate-limit "indirect call to garbage": cocos2d-x's resource
     // tables in .data.rel.ro contain function pointers that ELF's
@@ -55736,8 +57269,7 @@ int __macapk_arm64___android_log_print(int /*prio*/, const char* /*tag*/,
         "ret\n"
     );
 }
-__attribute__((naked))
-[[noreturn]] void __macapk_arm64___android_log_assert(const char* /*cond*/,
+__attribute__((naked, noreturn)) void __macapk_arm64___android_log_assert(const char* /*cond*/,
                                                          const char* /*tag*/,
                                                          const char* /*fmt*/,
                                                          ...) {
@@ -61513,6 +63045,54 @@ static jclass macapk_findclass_onload_ctx_noinit(JNIEnv* env, const char* name) 
     return static_cast<jclass>(cls);
 }
 
+// ★ FindClass from JNI_OnLoad, take 2 (2026-11-05): the guest's class may be
+// defined by a CHILD ClassLoader -- an app-embedded dex loaded by a custom
+// loader -- rather than by ActivityHost's main app loader. AppClassLoader
+// deliberately loads the native against an AppClassLoader, so both
+// NativeLibraries.getFromClass() and the onload-context pass above name that
+// loader, and the guest's own class (o.getViewByDomId in Binance) is invisible
+// to it. MacApkNativeLoad.loadFrom records the caller's ACTUAL loader in a
+// thread-local around the load; resolve through it here, still WITHOUT
+// initializing, exactly as ART's FindClass does.
+// Returns null (no pending exception) when there is no context, it is one of
+// the loaders already tried, or the class is a genuine miss.
+static jclass macapk_findclass_threadctx_noinit(JNIEnv* env, const char* name) {
+    static jclass s_class_cls = nullptr;    // java/lang/Class (global ref)
+    static jclass s_mnl_cls = nullptr;      // MacApkNativeLoad (global ref)
+    static jmethodID s_ctx = nullptr;       // currentJniOnLoadContext()
+    static jmethodID s_for_name = nullptr;  // Class.forName(String,Z,ClassLoader)
+    static bool s_failed = false;
+    if (s_failed) return nullptr;
+    if (!s_class_cls) {
+        jclass cc = g_orig_FindClass_slot(env, "java/lang/Class");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        jclass mnl = g_orig_FindClass_slot(env, "com/macapk/loader/MacApkNativeLoad");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (!cc || !mnl) { s_failed = true; return nullptr; }
+        s_ctx = g_orig_GetStaticMethodID(env, mnl, "currentJniOnLoadContext",
+                                         "()Ljava/lang/ClassLoader;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        s_for_name = g_orig_GetStaticMethodID(env, cc, "forName",
+            "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (!s_ctx || !s_for_name) { s_failed = true; return nullptr; }
+        s_class_cls = static_cast<jclass>(env->NewGlobalRef(cc));
+        s_mnl_cls = static_cast<jclass>(env->NewGlobalRef(mnl));
+    }
+    jobject loader = env->CallStaticObjectMethod(s_mnl_cls, s_ctx);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return nullptr; }
+    if (!loader) return nullptr;
+    std::string dotted(name ? name : "");
+    for (char& ch : dotted) if (ch == '/') ch = '.';
+    jstring jn = env->NewStringUTF(dotted.c_str());
+    if (!jn) { env->DeleteLocalRef(loader); env->ExceptionClear(); return nullptr; }
+    jobject cls = env->CallStaticObjectMethod(s_class_cls, s_for_name, jn, JNI_FALSE, loader);
+    env->DeleteLocalRef(jn);
+    env->DeleteLocalRef(loader);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return nullptr; }
+    return static_cast<jclass>(cls);
+}
+
 jclass macapk_jni_FindClass_guard(JNIEnv* env, const char* name) {
     if (env->ExceptionCheck()) {
         jthrowable pend = env->ExceptionOccurred();
@@ -61536,6 +63116,10 @@ jclass macapk_jni_FindClass_guard(JNIEnv* env, const char* name) {
         if (env->ExceptionCheck()) env->ExceptionClear();  // forName's CNFE is not the guest's
         if (!ni) {
             ni = macapk_findclass_onload_ctx_noinit(env, name);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+        if (!ni) {
+            ni = macapk_findclass_threadctx_noinit(env, name);
             if (env->ExceptionCheck()) env->ExceptionClear();
         }
         if (ni) return ni;
@@ -61608,6 +63192,20 @@ jint macapk_RegisterNatives_wrap(JNIEnv* env, jclass clazz,
             n,
             (n > 0 && methods && methods[0].name) ? methods[0].name : "?",
             (n > 0 && methods && methods[0].signature) ? methods[0].signature : "");
+    }
+    // A NULL jclass reaches HotSpot's jni_RegisterNatives when the caller's
+    // FindClass missed and the guest did not check the result (Binance's
+    // protected liba8357a.so does exactly this). HotSpot dereferences it and
+    // SIGSEGVs the whole VM; ART fails the call. Return JNI_ERR and leave any
+    // pending exception with its owner instead of crashing.
+    if (!clazz) {
+        std::fprintf(stderr,
+            "[jni-reg] ⚠ RegisterNatives(NULL jclass, n=%d first=%s%s) -> "
+            "JNI_ERR (guest did not check FindClass)\n",
+            n,
+            (n > 0 && methods && methods[0].name) ? methods[0].name : "?",
+            (n > 0 && methods && methods[0].signature) ? methods[0].signature : "");
+        return JNI_ERR;
     }
     bool wrapped = false;
     std::vector<JNINativeMethod> copy(methods, methods + (n > 0 ? n : 0));
@@ -63338,18 +64936,6 @@ extern "C" void __macapk_install_jni_bionic_variadic_bridge(JNIEnv* env) {
     // Save originals BEFORE patching. We need both V (for Apple-compiled
     // callers we forward unchanged) and A (for Bionic-compiled callers
     // we repack into).
-    // v1.0.1582: record the JNI String-family entry addresses so the SEGV
-    // handler can recognise (and recover from) a fault inside one on a garbage
-    // jstring without a signal-unsafe dladdr. See try_recover_jni_getstring_fault.
-    {
-        int k = 0;
-        g_jni_string_fns[k++] = reinterpret_cast<void*>(vtable->GetStringLength);
-        g_jni_string_fns[k++] = reinterpret_cast<void*>(vtable->GetStringUTFLength);
-        g_jni_string_fns[k++] = reinterpret_cast<void*>(vtable->GetStringChars);
-        g_jni_string_fns[k++] = reinterpret_cast<void*>(vtable->GetStringUTFChars);
-        g_jni_string_fns[k++] = reinterpret_cast<void*>(vtable->GetStringCritical);
-        g_jni_string_fn_count = k;
-    }
     // v1.0.1595: the same family, saved as callable originals so the handle-probe
     // guards can front them (see macapk_jstring_handle_ok).
     g_orig_GetStringLength         = vtable->GetStringLength;

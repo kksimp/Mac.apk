@@ -9,7 +9,7 @@
 
 ### 📱 [Which apps work? See the compatibility list →](COMPATIBILITY.md)
 
-[![Apps tested: 76](https://img.shields.io/badge/apps%20tested-76-6c5ce7)](COMPATIBILITY.md) [![Fully playable: 62](https://img.shields.io/badge/fully%20playable-62-2ea44f)](COMPATIBILITY.md) [![Partly works: 9](https://img.shields.io/badge/partly%20works-9-dfb317)](COMPATIBILITY.md) [![Not yet: 5](https://img.shields.io/badge/not%20yet-5-e05d44)](COMPATIBILITY.md)
+[![Apps tested: 78](https://img.shields.io/badge/apps%20tested-78-6c5ce7)](COMPATIBILITY.md) [![Fully playable: 57](https://img.shields.io/badge/fully%20playable-57-2ea44f)](COMPATIBILITY.md) [![Partly works: 14](https://img.shields.io/badge/partly%20works-14-dfb317)](COMPATIBILITY.md) [![Not yet: 7](https://img.shields.io/badge/not%20yet-7-e05d44)](COMPATIBILITY.md) [![Not tested yet: 1](https://img.shields.io/badge/not%20tested%20yet-1-9f9f9f)](COMPATIBILITY.md)
 
 ---
 
@@ -76,14 +76,19 @@ stores are in the [Installation](https://github.com/kksimp/Mac.apk/wiki/Installa
 > in the Mac.apk window cleans it up and can keep your saves for a reinstall.
 > [More →](https://github.com/kksimp/Mac.apk/wiki/Managing-Apps)
 
-## Known issues in v1.0.2379
+## Known issues in v1.0.2404
 
-See [Known issues](https://github.com/kksimp/Mac.apk/wiki/Known-Issues) for this release, and the
+- FluffyChat shows a white screen and Saber a black screen when they start.
+- NewPipe video can stall and buffer, as in other apps.
+- In Minecraft (looking around), Subway Surfers, Alto's Adventure, Fruit Ninja and Temple Run 2 the mouse does not act as touch. A planned optional control will fix this.
+- SmartTube has not been tested on this release.
+
+These are on the list to fix. See [Known issues](https://github.com/kksimp/Mac.apk/wiki/Known-Issues) for this release, and the
 [compatibility list](COMPATIBILITY.md) for every app tested by hand.
 
 ## Contributors
 
-Mac.apk has had a lot of help from people outside the project: @5566brs, @defia, @chuenlok, @Mistarille224, @m9rco, @wishbone305, @kushu7, @YuKongA, @hlwhl, @lxy2500798479 and @blueagler. Thank you. See [CONTRIBUTORS.md](CONTRIBUTORS.md) for who did what, and [CONTRIBUTING.md](CONTRIBUTING.md) if you would like to join in.
+Mac.apk has had a lot of help from people outside the project: @5566brs, @defia, @chuenlok, @ThePhilDiamond, @Rengwang, @Ye-Yu-Mo, @Enderfga, @joshiste, @Mistarille224, @m9rco, @wishbone305, @kushu7, @YuKongA, @hlwhl, @lxy2500798479 and @blueagler. Thank you. See [CONTRIBUTORS.md](CONTRIBUTORS.md) for who did what, and [CONTRIBUTING.md](CONTRIBUTING.md) if you would like to join in.
 
 ## Reporting problems
 

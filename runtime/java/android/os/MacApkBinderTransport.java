@@ -297,6 +297,8 @@ public final class MacApkBinderTransport {
         int status;
         long[] prev = Binder.sCallingIdentity.get();
         Binder.sCallingIdentity.set(new long[] { callingPid, callingUid });
+        int prevTx = Binder.sTransactionDepth.get();
+        Binder.sTransactionDepth.set(prevTx + 1);
         try {
             unflatten(in, data, offsets, ports, kinds);
             if (target == null) {
@@ -337,6 +339,8 @@ public final class MacApkBinderTransport {
             System.err.println("[binder] dispatch failed on port " + port + ": " + t);
             return new Object[] { new int[] { FAILED_TRANSACTION }, null, null, null, null };
         } finally {
+            if (prevTx == 0) Binder.sTransactionDepth.remove();
+            else Binder.sTransactionDepth.set(prevTx);
             if (prev != null) Binder.sCallingIdentity.set(prev);
             else Binder.sCallingIdentity.remove();
             in.recycle();

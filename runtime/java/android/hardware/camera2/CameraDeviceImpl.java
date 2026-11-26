@@ -54,7 +54,9 @@ import android.view.Surface;
 import com.macapk.loader.CameraBridge;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executor;
 
 final class CameraDeviceImpl extends CameraDevice {
@@ -204,7 +206,7 @@ final class CameraDeviceImpl extends CameraDevice {
     public void createCaptureSession(List<Surface> outputs,
             CameraCaptureSession.StateCallback callback, Handler handler)
             throws CameraAccessException {
-        createSessionInternal(outputs, callback, CameraDispatch.of(handler));
+        createSessionInternal(outputs, null, callback, CameraDispatch.of(handler));
     }
 
     /**
@@ -216,7 +218,8 @@ final class CameraDeviceImpl extends CameraDevice {
     public void createCaptureSessionByOutputConfigurations(List<OutputConfiguration> outputs,
             CameraCaptureSession.StateCallback callback, Handler handler)
             throws CameraAccessException {
-        createSessionInternal(surfacesOf(outputs), callback, CameraDispatch.of(handler));
+        createSessionInternal(surfacesOf(outputs), mirrorModesOf(outputs), callback,
+                CameraDispatch.of(handler));
     }
 
     /**
@@ -254,7 +257,8 @@ final class CameraDeviceImpl extends CameraDevice {
             d.run(() -> callback.onConfigureFailed(null));
             return;
         }
-        createSessionInternal(surfacesOf(config.getOutputConfigurations()), callback,
+        createSessionInternal(surfacesOf(config.getOutputConfigurations()),
+                mirrorModesOf(config.getOutputConfigurations()), callback,
                 CameraDispatch.of(executor));
     }
 
@@ -262,20 +266,44 @@ final class CameraDeviceImpl extends CameraDevice {
         if (configs == null) return null;
         List<Surface> out = new ArrayList<>(configs.size());
         for (OutputConfiguration c : configs) {
-            if (c == null) continue;
-            // getSurfaces() covers the shared-surface form; getSurface() is the
-            // common single-surface one and is already the head of that list.
-            List<Surface> shared = c.getSurfaces();
-            if (shared != null && !shared.isEmpty()) {
-                out.addAll(shared);
-            } else if (c.getSurface() != null) {
-                out.add(c.getSurface());
-            }
+            if (c != null) out.addAll(surfacesOf(c));
         }
         return out;
     }
 
-    private void createSessionInternal(List<Surface> outputs,
+    private static List<Surface> surfacesOf(OutputConfiguration c) {
+        // getSurfaces() covers the shared-surface form; getSurface() is the
+        // common single-surface one and is already the head of that list.
+        List<Surface> shared = c.getSurfaces();
+        if (shared != null && !shared.isEmpty()) return shared;
+        return c.getSurface() != null
+                ? java.util.Collections.singletonList(c.getSurface())
+                : java.util.Collections.emptyList();
+    }
+
+    /**
+     * Each output Surface's OutputConfiguration mirror mode (API 33), so the
+     * session can honour it; outputs not listed get MIRROR_MODE_AUTO, the
+     * default. A per-surface mode (API 36, shared surfaces) wins over the
+     * configuration-wide one when it was set. As AOSP's setMirrorMode javadoc
+     * says, the mode reaches SurfaceTexture consumers through the transform
+     * matrix and has no effect on ImageReader outputs.
+     */
+    private static Map<Surface, Integer> mirrorModesOf(List<OutputConfiguration> configs) {
+        Map<Surface, Integer> modes = new HashMap<>();
+        if (configs == null) return modes;
+        for (OutputConfiguration c : configs) {
+            if (c == null) continue;
+            for (Surface s : surfacesOf(c)) {
+                int perSurface = c.getMirrorMode(s);
+                modes.put(s, perSurface != OutputConfiguration.MIRROR_MODE_AUTO
+                        ? perSurface : c.getMirrorMode());
+            }
+        }
+        return modes;
+    }
+
+    private void createSessionInternal(List<Surface> outputs, Map<Surface, Integer> mirrorModes,
             CameraCaptureSession.StateCallback callback, CameraDispatch dispatch)
             throws CameraAccessException {
         checkNotClosed();
@@ -299,7 +327,8 @@ final class CameraDeviceImpl extends CameraDevice {
         synchronized (mLock) {
             handle = mHandle;
             previous = mSession;
-            created = new CameraCaptureSessionImpl(this, handle, outputs, callback, dispatch);
+            created = new CameraCaptureSessionImpl(this, handle, outputs, mirrorModes,
+                    callback, dispatch);
             mSession = created;
         }
         if (previous != null) {

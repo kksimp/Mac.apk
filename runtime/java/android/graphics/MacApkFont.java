@@ -728,6 +728,30 @@ public final class MacApkFont {
     public static boolean isEmojiPresentation(int cp) { return Character.isEmojiPresentation(cp); }
     public static boolean isEmojiCodepoint(int cp)    { return Character.isEmoji(cp); }
 
+    /** The face an emoji cluster is painted with, at the primary's size:
+     *  Apple Color Emoji, macOS's colour emoji font and the counterpart of
+     *  Android's NotoColorEmoji, which the JDK draws in colour. If the Mac has
+     *  no such family, the logical SansSerif fallback, whose composite reaches
+     *  whatever emoji face macOS has. Plain style: an emoji is a picture, and
+     *  a synthetic bold or oblique of it is not what Android draws. Null when
+     *  there is no primary to take the size from. Measuring is unchanged:
+     *  the advance stays emojiAdvance(), NotoColorEmoji's own metric. */
+    public static Font emojiFontFor(Font primary) {
+        if (primary == null) return null;
+        Font base = sEmojiBase;
+        if (base == null) {
+            Font f = new Font("Apple Color Emoji", Font.PLAIN, 1);
+            // new Font(name) quietly answers Dialog for a family that is missing.
+            if (!"Apple Color Emoji".equals(f.getFamily(java.util.Locale.ROOT))) {
+                ensureFallbacks();
+                f = sLogicalFallback;
+            }
+            sEmojiBase = base = f;
+        }
+        return base.deriveFont(Font.PLAIN, primary.getSize2D());
+    }
+    private static volatile Font sEmojiBase;
+
     /** The whole-pixel advance one emoji cluster gets at this size. */
     public static float emojiAdvance(float sizePx) {
         return (float) Math.floor(EMOJI_ADVANCE_EM * sizePx + 0.5);

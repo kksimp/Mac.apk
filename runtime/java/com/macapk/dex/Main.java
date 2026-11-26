@@ -104,8 +104,6 @@ public final class Main {
         "                            <cls> (internal name, e.g. com/example/MyUnsafe)",
         "  --redirect-exit <cls>     route System.exit / Runtime.exit / Runtime.halt to",
         "                            static methods on <cls>",
-        "  --redirect-native-load <cls>  route System.mapLibraryName / System.load /",
-        "                            Runtime.load to static methods on <cls>",
         "  -h, --help                show this help",
         "",
         "exit: 0 ok, 1 bad input, 2 usage, 3 no dex in input, 4 conversion failed");
@@ -177,9 +175,6 @@ public final class Main {
                     break;
                 case "--redirect-unsafe":
                     Options.unsafeRedirect = value(args, ++i, a);
-                    break;
-                case "--redirect-native-load":
-                    Options.nativeLoadRedirect = value(args, ++i, a);
                     break;
                 case "--redirect-exit":
                     Options.exitRedirect = value(args, ++i, a);

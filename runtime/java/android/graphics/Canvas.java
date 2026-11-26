@@ -2696,6 +2696,140 @@ public class Canvas {
         }
     }
 
+    /** Paint one emoji cluster with its colour font (g's font is already `ef`).
+     *
+     *  ⚠ Java2D drops colour glyphs (Apple Color Emoji's bitmaps) SILENTLY in
+     *  two cases, measured 2026-11-14 with the bundled JRE: under a clip that
+     *  is not a rectangle (a RoundRectangle2D clip drew zero coloured pixels;
+     *  a Rectangle or float-rect clip drew all of them), and with any
+     *  transparency (a colour alpha of 0xDE, or SRC_OVER at 0.99). Compose
+     *  clips a card to its rounded shape, which is how OurFamilyWizard's
+     *  "Calls are now available!" banner lost its party popper.
+     *
+     *  So: the plain case (opaque Color, SRC_OVER at 1.0, no clip or a
+     *  rectangular one) draws the glyph directly, as before. Otherwise the
+     *  cluster is rendered once, opaque, at device resolution into a cached
+     *  image (EmojiImages), and the image is laid down through g's own clip
+     *  and composite with the paint's alpha folded in: an image draws under
+     *  every clip and composite, and a cached image is a plain blit, the same
+     *  kind of work the glyph cache does for the direct draw (the font stores
+     *  these emoji as bitmaps, not outlines). Android ignores the paint's RGB
+     *  for a colour glyph and applies its alpha, which this matches. */
+    private void macapkDrawEmoji(String ec, Font ef, float x, float y) {
+        java.awt.Paint gp = g.getPaint();
+        java.awt.Composite comp = g.getComposite();
+        Shape clip = g.getClip();
+        int paintAlpha = (gp instanceof Color) ? ((Color) gp).getAlpha() : 255;
+        boolean plainComposite = comp instanceof AlphaComposite
+                && ((AlphaComposite) comp).getRule() == AlphaComposite.SRC_OVER
+                && ((AlphaComposite) comp).getAlpha() >= 1f;
+        boolean direct = gp instanceof Color && paintAlpha == 255 && plainComposite
+                && (clip == null || clip instanceof Rectangle2D);
+        // An AlphaComposite other than SRC_OVER (SRC, DST_IN, XOR, CLEAR...)
+        // keeps the glyph draw: an image would apply the rule to its whole
+        // padded box, where a glyph touches only its own coverage.
+        if (!direct && comp instanceof AlphaComposite
+                && ((AlphaComposite) comp).getRule() != AlphaComposite.SRC_OVER) {
+            direct = true;
+        }
+        if (sEmojiTraceLeft > 0) {
+            sEmojiTraceLeft--;
+            android.util.Log.i("Mac.apk.Emoji", "draw U+" + Integer.toHexString(ec.codePointAt(0))
+                    + " font=" + ef.getFontName() + " size=" + ef.getSize2D()
+                    + " paint=" + (gp == null ? "null" : gp.getClass().getSimpleName())
+                    + " alpha=" + paintAlpha + " composite=" + comp
+                    + " clip=" + (clip == null ? "none" : clip.getClass().getSimpleName())
+                    + " -> " + (direct ? "glyph" : "cached image"));
+        }
+        if (direct) { g.drawString(ec, x, y); return; }
+        if (paintAlpha == 0) return;
+        AffineTransform t = g.getTransform();
+        // Rendered at the device scale rounded to an eighth, so an animated
+        // scale reuses a handful of images rather than making one per frame.
+        double sx = EmojiImages.quantize(Math.hypot(t.getScaleX(), t.getShearY()));
+        double sy = EmojiImages.quantize(Math.hypot(t.getShearX(), t.getScaleY()));
+        EmojiImage im = EmojiImages.get(ec, ef, sx, sy, g.getFontRenderContext());
+        if (im == null) return;
+        Graphics2D e = (Graphics2D) g.create();
+        try {
+            if (paintAlpha < 255) {
+                float a = paintAlpha / 255f;
+                if (comp instanceof AlphaComposite) {
+                    AlphaComposite ac = (AlphaComposite) comp;
+                    e.setComposite(AlphaComposite.getInstance(ac.getRule(), ac.getAlpha() * a));
+                } else if (comp instanceof BlendComposite && MACAPK_BLEND_PAINT_ALPHA) {
+                    e.setComposite(((BlendComposite) comp).withAlpha(paintAlpha));
+                }
+            }
+            // Back to user space: the image's pixel (1, 1 + ascent*sy) is the pen.
+            e.translate(x - 1 / sx, y - im.ascent - 1 / sy);
+            e.scale(1 / sx, 1 / sy);
+            e.drawImage(im.img, 0, 0, null);
+        } finally { e.dispose(); }
+    }
+    /** The first few emoji draws of a process are logged with the state that
+     *  chose the path, so a missing emoji can be diagnosed from a user's log. */
+    private static int sEmojiTraceLeft = 3;
+
+    /** One emoji cluster rendered opaque at one size and device scale. */
+    private static final class EmojiImage {
+        final BufferedImage img; final float ascent;
+        EmojiImage(BufferedImage img, float ascent) { this.img = img; this.ascent = ascent; }
+    }
+    /** Rendered emoji, least recently used dropped once they hold more than
+     *  16 MB: a screen shows a handful of emoji at a few sizes, so each is
+     *  rendered once, and a large emoji at a large scale cannot pile up. */
+    private static final class EmojiImages {
+        private static final long BUDGET_BYTES = 16L << 20;
+        private static long sBytes;   // guarded by CACHE
+        private static final java.util.LinkedHashMap<String, EmojiImage> CACHE =
+            new java.util.LinkedHashMap<String, EmojiImage>(64, 0.75f, true);
+        static double quantize(double s) {
+            return Math.max(0.125, Math.round(s * 8) / 8.0);
+        }
+        private static long bytesOf(EmojiImage e) {
+            return 4L * e.img.getWidth() * e.img.getHeight();
+        }
+        static EmojiImage get(String ec, Font ef, double sx, double sy,
+                              java.awt.font.FontRenderContext frc) {
+            String key = ec + '\u0000' + ef.getFontName() + '\u0000' + ef.getSize2D()
+                    + '\u0000' + sx + '\u0000' + sy;
+            synchronized (CACHE) {
+                EmojiImage hit = CACHE.get(key);
+                if (hit != null) return hit;
+            }
+            Rectangle2D b = ef.getStringBounds(ec, frc);
+            java.awt.font.LineMetrics lm = ef.getLineMetrics(ec, frc);
+            int w = (int) Math.ceil(b.getWidth() * sx) + 2;
+            int h = (int) Math.ceil((lm.getAscent() + lm.getDescent()) * sy) + 2;
+            if (w <= 2 || h <= 2) return null;
+            BufferedImage off = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB_PRE);
+            Graphics2D og = off.createGraphics();
+            try {
+                og.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING,
+                                    RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                og.scale(sx, sy);
+                og.setFont(ef);
+                og.setColor(Color.BLACK);
+                og.drawString(ec, (float) (1 / sx), (float) (lm.getAscent() + 1 / sy));
+            } finally { og.dispose(); }
+            EmojiImage made = new EmojiImage(off, lm.getAscent());
+            synchronized (CACHE) {
+                EmojiImage old = CACHE.put(key, made);
+                if (old != null) sBytes -= bytesOf(old);
+                sBytes += bytesOf(made);
+                java.util.Iterator<EmojiImage> it = CACHE.values().iterator();
+                while (sBytes > BUDGET_BYTES && it.hasNext()) {
+                    EmojiImage e = it.next();
+                    if (e == made) continue;
+                    sBytes -= bytesOf(e);
+                    it.remove();
+                }
+            }
+            return made;
+        }
+    }
+
     /** Draw text split into runs by RESOLVED FONT, mirroring Android's
      *  per-codepoint font itemization (Minikin's FontCollection): each maximal
      *  run of characters resolving to the same chain font draws with that font
@@ -2740,14 +2874,19 @@ public class Canvas {
         while (i < n) {
             // Mirror of Paint.macapkMeasureRuns: an emoji cluster advances the
             // pen by the measured emoji advance, so the glyphs AFTER it land
-            // where measureText said they would. The cluster itself is still
-            // painted by the JDK composite (we rasterize no colour font), so it
-            // may sit narrow inside its box -- a far smaller defect than every
-            // emoji-bearing string wrapping at the wrong point.
+            // where measureText said they would. The cluster is painted with
+            // macOS's colour emoji face (MacApkFont.emojiFontFor), as Android
+            // paints it with NotoColorEmoji. It used to be painted with
+            // whatever font was current, normally the primary: Roboto, a
+            // physical font with no fallback and no emoji, so every emoji came
+            // out as Roboto's missing-glyph box (OurFamilyWizard's "Calls are
+            // now available!" banner, 2026-11-14).
             int ee = MacApkFont.emojiClusterEnd(text, i, n);
             if (ee > i) {
                 String ec = text.substring(i, ee);
-                g.drawString(ec, cx, y);
+                Font ef = MacApkFont.emojiFontFor(primary);
+                if (ef != null) { g.setFont(ef); macapkDrawEmoji(ec, ef, cx, y); }
+                else g.drawString(ec, cx, y);
                 cx += MacApkFont.emojiAdvance(sizePx);
                 i = ee;
                 continue;

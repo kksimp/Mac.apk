@@ -128,6 +128,8 @@ public class Camera {
     // ---- instance state --------------------------------------------------
 
     private final int mCameraId;
+    /** Read once at open: the facing never changes, and the frame loop needs it. */
+    private final boolean mFrontFacing;
     private long mSession = CameraBridge.NO_SESSION;
     private volatile boolean mReleased;
 
@@ -193,6 +195,7 @@ public class Camera {
             throw new RuntimeException("Fail to connect to camera service");
         }
         mCameraId = cameraId;
+        mFrontFacing = CameraBridge.getDeviceFacing(cameraId) == CameraBridge.FACING_FRONT;
         mSession = session;
         populateBag(cameraId);
     }
@@ -918,7 +921,8 @@ public class Camera {
                     long pts = CameraBridge.latestFrameTimestamp(mSession);
                     if (pts != 0 && pts != lastTexturePts) {
                         lastTexturePts = pts;
-                        st.macapkQueueFrame(pts, MTX_FLIP_V, 0);
+                        st.macapkQueueFrame(pts,
+                                mFrontFacing ? MTX_FLIP_V_FRONT : MTX_FLIP_V, 0);
                     }
                 }
 
@@ -974,13 +978,33 @@ public class Camera {
     /** Transform for SurfaceTexture consumers. Identical to
      *  CameraCaptureSessionImpl's MTX_FLIP_V and for the same reason: the
      *  capture buffer is top-down where GL is bottom-up, the Mac's sensor is
-     *  unrotated, and there is no crop, so pure flip-V is exact. Column-major
+     *  unrotated, and there is no crop, so pure flip-V is exact for a
+     *  back-facing camera (front-facing: MTX_FLIP_V_FRONT below). Column-major
      *  for glUniformMatrix4fv. */
     private static final float[] MTX_FLIP_V = {
         1f,  0f, 0f, 0f,
         0f, -1f, 0f, 0f,
         0f,  0f, 1f, 0f,
         0f,  1f, 0f, 1f,
+    };
+
+    /** FRONT-facing cameras: flip-V plus the horizontal flip Android applies
+     *  to a front camera's preview stream. On a device, the SurfaceTexture
+     *  transform for a front camera mirrors the image (Camera.setDisplayOrientation
+     *  documents the mirrored front preview), and consumers rely on it: WebRTC's
+     *  Camera1Session/Camera2Session apply a second mirror to "undo the mirror
+     *  that the OS 'helps' us with", and an app that wants a selfie-style view
+     *  mirrors again in its renderer. With flip-V alone, that undo became a real
+     *  mirror and cancelled the app's -- measured 2026-11-12 on OurFamilyWizard's
+     *  Twilio preview (setMirror(true), shown unmirrored). camera2 applies the
+     *  same matrix (CameraCaptureSessionImpl.MTX_FLIP_V_MIRROR_H) to front
+     *  cameras under MIRROR_MODE_AUTO. Column-major:
+     *  s' = 1 - s, t' = 1 - t. */
+    private static final float[] MTX_FLIP_V_FRONT = {
+        -1f,  0f, 0f, 0f,
+         0f, -1f, 0f, 0f,
+         0f,  0f, 1f, 0f,
+         1f,  1f, 0f, 1f,
     };
 
     private void blitToHolder(SurfaceHolder holder, Bitmap frame) {

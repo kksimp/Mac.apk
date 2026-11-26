@@ -528,8 +528,13 @@ public abstract class Window {
     //       java.lang.NoSuchMethodError: 'int android.view.Window.getNavigationBarDividerColor()'
     // Aegis 3.4.2's preflight lists the SETTER as missing too, so this is a
     // two-app hit already and generic to any edge-to-edge app.
-    public void setNavigationBarDividerColor(int dividerColor) {}
-    public int getNavigationBarDividerColor() { return 0; }
+    protected int mNavigationBarDividerColor;
+    public void setNavigationBarDividerColor(int dividerColor) {
+        mNavigationBarDividerColor = dividerColor;
+    }
+    public int getNavigationBarDividerColor() {
+        return mNavigationBarDividerColor;
+    }
 
     /** AOSP Window.getContext() -- the Context the window runs in (the Activity).
      *  androidx ComposeView reads it in onMeasure/onAttachedToWindow (Wikipedia hit
@@ -762,38 +767,93 @@ public abstract class Window {
         return decor;
     }
 
-    // Activity content-transition surface (API 21+). Apps that opt into
-    // shared-element / window transitions configure them on the Window in
-    // onCreate -- e.g. Reddit's IntroductionActivity (the welcome/login
-    // screen) calls setSharedElementsUseOverlay(false) in onCreate; without
-    // the method its onCreate throws NoSuchMethodError and the Compose login
-    // UI never sets up. Mac.apk renders inside an NSWindow with no Android
-    // activity-transition framework, so these are no-ops (the transitions are
-    // purely cosmetic; their absence doesn't change WHICH content shows).
-    public void setSharedElementsUseOverlay(boolean sharedElementsUseOverlay) {}
-    public boolean getSharedElementsUseOverlay() { return true; }
-    public void setEnterTransition(android.transition.Transition transition) {}
-    public void setReturnTransition(android.transition.Transition transition) {}
-    public void setExitTransition(android.transition.Transition transition) {}
-    public void setReenterTransition(android.transition.Transition transition) {}
-    public android.transition.Transition getEnterTransition() { return null; }
-    public android.transition.Transition getReturnTransition() { return null; }
-    public android.transition.Transition getExitTransition() { return null; }
-    public android.transition.Transition getReenterTransition() { return null; }
-    public void setSharedElementEnterTransition(android.transition.Transition transition) {}
-    public void setSharedElementReturnTransition(android.transition.Transition transition) {}
-    public void setSharedElementExitTransition(android.transition.Transition transition) {}
-    public void setSharedElementReenterTransition(android.transition.Transition transition) {}
-    public android.transition.Transition getSharedElementEnterTransition() { return null; }
-    public android.transition.Transition getSharedElementReturnTransition() { return null; }
-    public android.transition.Transition getSharedElementExitTransition() { return null; }
-    public android.transition.Transition getSharedElementReenterTransition() { return null; }
-    public void setAllowEnterTransitionOverlap(boolean allow) {}
-    public boolean getAllowEnterTransitionOverlap() { return true; }
-    public void setAllowReturnTransitionOverlap(boolean allow) {}
-    public boolean getAllowReturnTransitionOverlap() { return true; }
-    public void setTransitionBackgroundFadeDuration(long fadeDurationMillis) {}
-    public long getTransitionBackgroundFadeDuration() { return 0L; }
+    // Activity content-transition surface (API 21+). Apps configure window
+    // and shared-element transitions in onCreate and query them back through
+    // PhoneWindow; store the state per Window matching AOSP defaults.
+    private boolean mSharedElementsUseOverlay = true;
+    private boolean mAllowEnterTransitionOverlap = true;
+    private boolean mAllowReturnTransitionOverlap = true;
+    // PhoneWindow.DEFAULT_BACKGROUND_FADE_DURATION_MS: getter answers 300 until set.
+    private long mTransitionBackgroundFadeDuration = 300L;
+    // Sentinel compared by reference, as PhoneWindow does: "never set" falls back
+    // to the paired transition (return -> enter, reenter -> exit), while an
+    // explicit set(null) stays null.
+    private static final android.transition.Transition USE_DEFAULT_TRANSITION =
+            new android.transition.TransitionSet();
+    private android.transition.Transition mEnterTransition;
+    private android.transition.Transition mReturnTransition = USE_DEFAULT_TRANSITION;
+    private android.transition.Transition mExitTransition;
+    private android.transition.Transition mReenterTransition = USE_DEFAULT_TRANSITION;
+    private android.transition.Transition mSharedElementEnterTransition;
+    private android.transition.Transition mSharedElementReturnTransition = USE_DEFAULT_TRANSITION;
+    private android.transition.Transition mSharedElementExitTransition;
+    private android.transition.Transition mSharedElementReenterTransition = USE_DEFAULT_TRANSITION;
+
+    public void setSharedElementsUseOverlay(boolean sharedElementsUseOverlay) {
+        mSharedElementsUseOverlay = sharedElementsUseOverlay;
+    }
+    public boolean getSharedElementsUseOverlay() { return mSharedElementsUseOverlay; }
+    public void setEnterTransition(android.transition.Transition transition) {
+        mEnterTransition = transition;
+    }
+    public void setReturnTransition(android.transition.Transition transition) {
+        mReturnTransition = transition;
+    }
+    public void setExitTransition(android.transition.Transition transition) {
+        mExitTransition = transition;
+    }
+    public void setReenterTransition(android.transition.Transition transition) {
+        mReenterTransition = transition;
+    }
+    public android.transition.Transition getEnterTransition() { return mEnterTransition; }
+    public android.transition.Transition getReturnTransition() {
+        return mReturnTransition == USE_DEFAULT_TRANSITION ? getEnterTransition() : mReturnTransition;
+    }
+    public android.transition.Transition getExitTransition() { return mExitTransition; }
+    public android.transition.Transition getReenterTransition() {
+        return mReenterTransition == USE_DEFAULT_TRANSITION ? getExitTransition() : mReenterTransition;
+    }
+    public void setSharedElementEnterTransition(android.transition.Transition transition) {
+        mSharedElementEnterTransition = transition;
+    }
+    public void setSharedElementReturnTransition(android.transition.Transition transition) {
+        mSharedElementReturnTransition = transition;
+    }
+    public void setSharedElementExitTransition(android.transition.Transition transition) {
+        mSharedElementExitTransition = transition;
+    }
+    public void setSharedElementReenterTransition(android.transition.Transition transition) {
+        mSharedElementReenterTransition = transition;
+    }
+    public android.transition.Transition getSharedElementEnterTransition() {
+        return mSharedElementEnterTransition;
+    }
+    public android.transition.Transition getSharedElementReturnTransition() {
+        return mSharedElementReturnTransition == USE_DEFAULT_TRANSITION
+                ? getSharedElementEnterTransition() : mSharedElementReturnTransition;
+    }
+    public android.transition.Transition getSharedElementExitTransition() {
+        return mSharedElementExitTransition;
+    }
+    public android.transition.Transition getSharedElementReenterTransition() {
+        return mSharedElementReenterTransition == USE_DEFAULT_TRANSITION
+                ? getSharedElementExitTransition() : mSharedElementReenterTransition;
+    }
+    public void setAllowEnterTransitionOverlap(boolean allow) {
+        mAllowEnterTransitionOverlap = allow;
+    }
+    public boolean getAllowEnterTransitionOverlap() { return mAllowEnterTransitionOverlap; }
+    public void setAllowReturnTransitionOverlap(boolean allow) {
+        mAllowReturnTransitionOverlap = allow;
+    }
+    public boolean getAllowReturnTransitionOverlap() { return mAllowReturnTransitionOverlap; }
+    public void setTransitionBackgroundFadeDuration(long fadeDurationMillis) {
+        if (fadeDurationMillis < 0) {
+            throw new IllegalArgumentException("negative durations are not allowed");
+        }
+        mTransitionBackgroundFadeDuration = fadeDurationMillis;
+    }
+    public long getTransitionBackgroundFadeDuration() { return mTransitionBackgroundFadeDuration; }
 
     // API 29 (Android 10) edge-to-edge / contrast enforcement. AOSP doc:
     // "If set, the system will ensure that the status bar / navigation bar
@@ -1327,10 +1387,12 @@ public abstract class Window {
     }
     /** AOSP Window.getContentScene():2352 `return null`. */
     public android.transition.Scene getContentScene() { return null; }
-    /** AOSP Window.getMediaController():2253 `return null` /
-     *  setMediaController:2243 empty on the base class. */
-    public android.media.session.MediaController getMediaController() { return null; }
-    public void setMediaController(android.media.session.MediaController controller) { }
+    /** AOSP Window.getMediaController() / setMediaController(). */
+    private android.media.session.MediaController mMediaController;
+    public android.media.session.MediaController getMediaController() { return mMediaController; }
+    public void setMediaController(android.media.session.MediaController controller) {
+        mMediaController = controller;
+    }
     /** AOSP Window.setUiOptions(int):2261 and (int,int):2269, both empty on the
      *  base class. */
     public void setUiOptions(int uiOptions) { }
@@ -1339,12 +1401,11 @@ public abstract class Window {
     public void setLocalFocus(boolean hasFocus, boolean inTouchMode) { }
     /** AOSP Window.injectInputEvent:2317, empty on the base class. */
     public void injectInputEvent(InputEvent event) { }
-    /** AOSP Window.setElevation:1896 and setClipToOutline:1916, both empty on
-     *  the base class (PhoneWindow forwards them to the decor). */
-    public void setElevation(float elevation) { }
-    /** AOSP Window.getElevation (android14 :1738-1740): 0.0f on the base class;
-     *  PhoneWindow (here Dialog.DialogWindow) answers its mElevation. */
-    public float getElevation() { return 0.0f; }
+    protected float mElevation;
+    /** Window elevation stored per Window; DialogWindow overrides with its
+     *  theme-aware mMacapkElevation. */
+    public void setElevation(float elevation) { mElevation = elevation; }
+    public float getElevation() { return mElevation; }
     public void setClipToOutline(boolean clipToOutline) { }
     /** AOSP Window.registerScrollCaptureCallback:2920 /
      *  unregisterScrollCaptureCallback:2928, both empty on the base class. */

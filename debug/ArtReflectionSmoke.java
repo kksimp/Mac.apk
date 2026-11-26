@@ -20,6 +20,9 @@ public class ArtReflectionSmoke {
                             if(lock.get(null)!=LOCK || !Long.valueOf(42).equals(number.get(null))) throw new AssertionError("native field reads");
                         } catch(Exception ex) {throw new RuntimeException(ex);}
                     }
+                    public static boolean directBufferHasArray() {
+                        return java.nio.ByteBuffer.allocateDirect(8).hasArray();
+                    }
                     public static boolean check() throws Exception {
                         if(LOCK==null || NUMBER!=42) return false;
                         FieldsFixture obj=new FieldsFixture();
@@ -40,6 +43,9 @@ public class ArtReflectionSmoke {
             try(AppClassLoader loader=new AppClassLoader(new URL[]{dir.toUri().toURL()},ArtReflectionSmoke.class.getClassLoader(),null,dir.toFile(),null,null)) {
                 Class<?> fixture = loader.loadClass("FieldsFixture");
                 if(!Boolean.TRUE.equals(fixture.getMethod("check").invoke(null)))throw new AssertionError("field compatibility");
+                if(!"0".equals(System.getenv("MACAPK_DIRECT_BUFFER_HAS_ARRAY"))
+                        && !Boolean.TRUE.equals(fixture.getMethod("directBufferHasArray").invoke(null)))
+                    throw new AssertionError("direct buffer and reflection rewrites must coexist");
                 java.lang.reflect.Field privateField = fixture.getDeclaredField("ordinary");
                 Object receiver = fixture.getConstructor().newInstance();
                 try { com.macapk.loader.ArtReflection.get(privateField, receiver); throw new AssertionError("cached getter crossed caller boundary"); }

@@ -18,15 +18,35 @@ public class AccessibilityNodeInfo implements android.os.Parcelable {
     // AOSP pools nodes; obtain()/recycle() are referenced widely (RecyclerView,
     // Compose semantics, custom onInitializeAccessibilityNodeInfo). A fresh
     // instance is observably identical since a11y is disabled. Was absent.
+    private static final long UNDEFINED_NODE_ID = -1L;
+    private long mSourceNodeId = UNDEFINED_NODE_ID;
+    private int mWindowId = -1;
+    private long mParentNodeId = UNDEFINED_NODE_ID;
+    private long mTraversalBefore = UNDEFINED_NODE_ID;
+    private long mTraversalAfter = UNDEFINED_NODE_ID;
+    private long mLabelForId = UNDEFINED_NODE_ID;
+    private long mLabeledById = UNDEFINED_NODE_ID;
+
     public static AccessibilityNodeInfo obtain() { return new AccessibilityNodeInfo(); }
     public static AccessibilityNodeInfo obtain(android.view.View source) {
-        return new AccessibilityNodeInfo();
+        return new AccessibilityNodeInfo(source, AccessibilityNodeProvider.HOST_VIEW_ID);
     }
     public static AccessibilityNodeInfo obtain(android.view.View root, int virtualDescendantId) {
-        return new AccessibilityNodeInfo();
+        return new AccessibilityNodeInfo(root, virtualDescendantId);
     }
     public static AccessibilityNodeInfo obtain(AccessibilityNodeInfo info) {
-        return new AccessibilityNodeInfo();
+        AccessibilityNodeInfo copy = new AccessibilityNodeInfo();
+        if (info != null) {
+            copy.mSourceNodeId = info.mSourceNodeId;
+            copy.mWindowId = info.mWindowId;
+            copy.mParentNodeId = info.mParentNodeId;
+            copy.mTraversalBefore = info.mTraversalBefore;
+            copy.mTraversalAfter = info.mTraversalAfter;
+            copy.mLabelForId = info.mLabelForId;
+            copy.mLabeledById = info.mLabeledById;
+            copy.mLabeledByList.addAll(info.mLabeledByList);
+        }
+        return copy;
     }
     public void recycle() {}
 
@@ -641,16 +661,16 @@ public class AccessibilityNodeInfo implements android.os.Parcelable {
     // The child COUNT is real bookkeeping (the app adds children itself), but
     // resolving a child or parent to a node needs a live connection, which we
     // do not have; AOSP returns null there too.
-    // AOSP addChild(View) = addChildInternal(child, UNDEFINED_ITEM_ID, true), and
+    // AOSP addChild(View) = addChildInternal(child, AccessibilityNodeProvider.HOST_VIEW_ID, true), and
     // a duplicate id is ignored (the `checked` branch, :1392-1394).
     public void addChild(android.view.View child) {
-        if (child != null) addChildId(makeNodeId(accessibilityViewIdOf(child), UNDEFINED_ITEM_ID));
+        if (child != null) addChildId(makeNodeId(accessibilityViewIdOf(child), AccessibilityNodeProvider.HOST_VIEW_ID));
     }
     public void addChild(android.view.View root, int virtualDescendantId) {
         addChildId(makeNodeId(accessibilityViewIdOf(root), virtualDescendantId));
     }
     public boolean removeChild(android.view.View child) {
-        return removeChildId(makeNodeId(accessibilityViewIdOf(child), UNDEFINED_ITEM_ID));
+        return removeChildId(makeNodeId(accessibilityViewIdOf(child), AccessibilityNodeProvider.HOST_VIEW_ID));
     }
     public boolean removeChild(android.view.View root, int virtualDescendantId) {
         return removeChildId(makeNodeId(accessibilityViewIdOf(root), virtualDescendantId));
@@ -707,23 +727,46 @@ public class AccessibilityNodeInfo implements android.os.Parcelable {
     public AccessibilityNodeInfo getParent() { return null; }
     public AccessibilityNodeInfo getParent(int prefetchingStrategy) { return null; }
 
-    public void setParent(android.view.View parent) { }
-    public void setParent(android.view.View root, int virtualDescendantId) { }
-    public void setSource(android.view.View source) { }
-    public void setSource(android.view.View root, int virtualDescendantId) { }
+    private static long nodeIdOf(android.view.View view, int virtualDescendantId) {
+        return view == null ? UNDEFINED_NODE_ID : makeNodeId(accessibilityViewIdOf(view), virtualDescendantId);
+    }
+    public void setParent(android.view.View parent) { setParent(parent, AccessibilityNodeProvider.HOST_VIEW_ID); }
+    public void setParent(android.view.View root, int virtualDescendantId) {
+        mParentNodeId = nodeIdOf(root, virtualDescendantId);
+    }
+    public void setSource(android.view.View source) { setSource(source, AccessibilityNodeProvider.HOST_VIEW_ID); }
+    public void setSource(android.view.View root, int virtualDescendantId) {
+        mSourceNodeId = nodeIdOf(root, virtualDescendantId);
+    }
 
-    public void setTraversalBefore(android.view.View view) { }
-    public void setTraversalBefore(android.view.View root, int virtualDescendantId) { }
+    public void setTraversalBefore(android.view.View view) {
+        setTraversalBefore(view, AccessibilityNodeProvider.HOST_VIEW_ID);
+    }
+    public void setTraversalBefore(android.view.View root, int virtualDescendantId) {
+        mTraversalBefore = nodeIdOf(root, virtualDescendantId);
+    }
     public AccessibilityNodeInfo getTraversalBefore() { return null; }
-    public void setTraversalAfter(android.view.View view) { }
-    public void setTraversalAfter(android.view.View root, int virtualDescendantId) { }
+    public void setTraversalAfter(android.view.View view) {
+        setTraversalAfter(view, AccessibilityNodeProvider.HOST_VIEW_ID);
+    }
+    public void setTraversalAfter(android.view.View root, int virtualDescendantId) {
+        mTraversalAfter = nodeIdOf(root, virtualDescendantId);
+    }
     public AccessibilityNodeInfo getTraversalAfter() { return null; }
 
-    public void setLabelFor(android.view.View labeled) { }
-    public void setLabelFor(android.view.View root, int virtualDescendantId) { }
+    public void setLabelFor(android.view.View labeled) {
+        setLabelFor(labeled, AccessibilityNodeProvider.HOST_VIEW_ID);
+    }
+    public void setLabelFor(android.view.View root, int virtualDescendantId) {
+        mLabelForId = nodeIdOf(root, virtualDescendantId);
+    }
     public AccessibilityNodeInfo getLabelFor() { return null; }
-    public void setLabeledBy(android.view.View label) { }
-    public void setLabeledBy(android.view.View root, int virtualDescendantId) { }
+    public void setLabeledBy(android.view.View label) {
+        setLabeledBy(label, AccessibilityNodeProvider.HOST_VIEW_ID);
+    }
+    public void setLabeledBy(android.view.View root, int virtualDescendantId) {
+        mLabeledById = nodeIdOf(root, virtualDescendantId);
+    }
     public AccessibilityNodeInfo getLabeledBy() { return null; }
 
     public java.util.List<AccessibilityNodeInfo> findAccessibilityNodeInfosByText(String text) {
@@ -738,7 +781,7 @@ public class AccessibilityNodeInfo implements android.os.Parcelable {
     /** No connection to re-read from; AOSP returns false when unrefreshable. */
     public boolean refresh() { return false; }
 
-    public int getWindowId() { return -1; }
+    public int getWindowId() { return mWindowId; }
     public AccessibilityWindowInfo getWindow() { return null; }
 
     // ---- structured sub-info --------------------------------------------
@@ -985,15 +1028,7 @@ public class AccessibilityNodeInfo implements android.os.Parcelable {
     public int getChecked() { return mChecked; }
     public void setChecked(int checked) { mChecked = checked; }
 
-    public void addLabeledBy(android.view.View labeledBy, int virtualDescendantId) { }
-
-    private final java.util.ArrayList<android.view.View> mLabeledByViews = new java.util.ArrayList<>();
-    public java.util.List<android.view.accessibility.AccessibilityNodeInfo> getLabeledByList() {
-        return java.util.Collections.emptyList();
-    }
-    public boolean removeLabeledBy(android.view.View labeledBy, int virtualDescendantId) {
-        return false;
-    }
+    // Consolidated into mLabeledByList + addLabeledBy/removeLabeledBy/getLabeledByList below.
 
     // ======================================================================
     //  AOSP API-36 surface completion (Mac.apk API-gap lane, android.view).
@@ -1017,19 +1052,46 @@ public class AccessibilityNodeInfo implements android.os.Parcelable {
     }
     public boolean isGranularScrollingSupported() { return mGranularScrollingSupported; }
 
-    /** AOSP AccessibilityNodeInfo.addLabeledBy(View) / removeLabeledBy(View)
-     *  (API 36): the multi-label replacement for setLabeledBy. AOSP keeps a list
-     *  and reports it through getLabeledByList(); removeLabeledBy returns
-     *  whether the view was actually in it. */
+    /** AOSP AccessibilityNodeInfo.addLabeledBy(View[, int]) /
+     *  removeLabeledBy(View[, int]) / getLabeledByList() (API 36): the
+     *  multi-label replacement for setLabeledBy. */
     private final java.util.ArrayList<AccessibilityNodeInfo> mLabeledByList =
             new java.util.ArrayList<AccessibilityNodeInfo>();
+    public java.util.List<AccessibilityNodeInfo> getLabeledByList() {
+        return java.util.Collections.unmodifiableList(
+                new java.util.ArrayList<AccessibilityNodeInfo>(mLabeledByList));
+    }
     public void addLabeledBy(android.view.View label) {
-        if (label == null) return;
-        mLabeledByList.add(new AccessibilityNodeInfo(label, -1));
+        addLabeledBy(label, AccessibilityNodeProvider.HOST_VIEW_ID);
+    }
+    public void addLabeledBy(android.view.View labeledBy, int virtualDescendantId) {
+        // AOSP: Preconditions.checkNotNull(root, "%s must not be null", root), and
+        // the id goes onto a LongArray with no duplicate check.
+        if (labeledBy == null) throw new NullPointerException("null must not be null");
+        mLabeledByList.add(new AccessibilityNodeInfo(labeledBy, virtualDescendantId));
     }
     public boolean removeLabeledBy(android.view.View label) {
-        if (label == null) return false;
-        return mLabeledByList.remove(new AccessibilityNodeInfo(label, -1));
+        return removeLabeledBy(label, AccessibilityNodeProvider.HOST_VIEW_ID);
+    }
+    public boolean removeLabeledBy(android.view.View labeledBy, int virtualDescendantId) {
+        if (labeledBy == null) return false;
+        return mLabeledByList.remove(new AccessibilityNodeInfo(labeledBy, virtualDescendantId));
+    }
+
+    @Override public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        AccessibilityNodeInfo other = (AccessibilityNodeInfo) o;
+        return mSourceNodeId == other.mSourceNodeId && mWindowId == other.mWindowId;
+    }
+    @Override public int hashCode() {
+        // AOSP: prime 31 over getAccessibilityViewId, getVirtualDescendantId, mWindowId.
+        final int prime = 31;
+        int result = 1;
+        result = prime * result + getAccessibilityViewId(mSourceNodeId);
+        result = prime * result + getVirtualDescendantId(mSourceNodeId);
+        result = prime * result + mWindowId;
+        return result;
     }
 
     // ---- Parcelable ---------------------------------------------------------

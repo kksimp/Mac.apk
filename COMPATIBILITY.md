@@ -1,8 +1,8 @@
 # Mac.apk App Compatibility
 
-Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-11-04.
+Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-11-25.
 
-**76 apps tested:** ✅ 62 work · ⚠️ 9 partly work · ❌ 5 don't work yet
+**79 apps tested:** ✅ 57 work · ⚠️ 14 partly work · ❌ 7 don't work yet · ❔ 1 not tested yet
 
 **Legend:** ✅ yes · ⚠️ partly · ❌ not yet · ❔ not tested yet. **Works** means you can use the app or play the game; **Sound** means its audio plays. An app tested at more than one version has a row for each, newest first.
 
@@ -10,7 +10,7 @@ Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-11-04.
 |:----|:--------|:-----:|:-----:|:------|
 | **1010! Klooni** | 0.8.6 | ✅ | ✅ |  |
 | **Aegis** | 3.4.2 | ⚠️ | ❔ | Camera access does not work. Photo access can pick a file but not process it. |
-| **Alto's Adventure** | 1.8.27 | ✅ | ✅ |  |
+| **Alto's Adventure** | 1.8.27 | ⚠️ | ✅ | Known issue: the mouse does not act as touch in game; a planned optional control will make it do so. |
 | **Among Us** | 2026.6.5 | ✅ | ✅ | Turn on Controls → Arrow Keys as D-pad to move with the arrow keys; the on-screen joystick (click and drag) also works. |
 | **Anarch RE** | 4 | ✅ | ✅ |  |
 | **AnkiDroid** | 2.24.0 | ⚠️ | ❔ | Draws its screen: ⚠️. Asks for file access correctly; some screens draw with visual glitches. |
@@ -36,8 +36,9 @@ Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-11-04.
 | **F-Droid** | 1.23.2 | ✅ | ❔ | Updating Mindustry from F-Droid and then opening it from F-Droid WORKS (install + cross-app launch). |
 | **Feudal Tactics** | 1.5.2 | ✅ | ✅ |  |
 | **Flappy Bird** | 1.3 | ✅ | ✅ |  |
+| **FluffyChat** | 2.10.0 | ❌ | ❔ | Icon: ❔. Draws its screen: ❌. Known issue: white screen on launch, fix planned. |
 | **Frozen Bubble** | 4.4 | ✅ | ✅ |  |
-| **Fruit Ninja** | 3.95.5 | ✅ | ✅ |  |
+| **Fruit Ninja** | 3.95.5 | ⚠️ | ✅ | Known issue: the mouse does not act as touch in game; a planned optional control will make it do so. |
 | **Gallery** | 1.13.1 | ❌ | ❔ | Needs file permissions fixed. |
 | **Geometry Dash Lite** | 2.2.147 | ✅ | ✅ |  |
 | **Geometry Dash Lite** | 2.2.11 | ✅ | ✅ |  |
@@ -62,10 +63,10 @@ Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-11-04.
 | **mGrađani** | 1.0.18 | ✅ | ❔ | Icon: ❔. NIAS login page works since Mac.apk v1.0.1723 (it was blank before). |
 | **Mindustry** | 8-fdroid-160.5 | ✅ | ✅ | Online multiplayer currently inop |
 | **Mindustry** | 8-fdroid-158 | ✅ | ✅ |  |
-| **Minecraft** | 1.26.60.4 | ✅ | ✅ | Works on v1.0.2377 (owner check, 2026-11-04). Multiplayer works (joined a server). On v1.0.2303 this version crashed at startup (10-29 update check). |
+| **Minecraft** | 1.26.60.4 | ⚠️ | ✅ | Works on v1.0.2377 (owner check, 2026-11-04). Multiplayer works (joined a server). On v1.0.2303 this version crashed at startup (10-29 update check). Known issue: the mouse does not act as touch when looking around in game; a planned optional control will make it do so. |
 | **Minecraft** | 1.26.52.3 | ✅ | ❔ |  |
-| **Minecraft** | 1.26.45.1 | ✅ | ✅ | Boots, renders and Xbox sign-in works. |
-| **NewPipe** | 0.29.0 | ⚠️ | ✅ | Some videos play with sound only and buffer constantly |
+| **Minecraft** | 1.26.45.1 | ⚠️ | ✅ | Boots, renders and Xbox sign-in works; Known issue: the mouse does not act as touch when looking around in game; a planned optional control will make it do so. |
+| **NewPipe** | 0.29.0 | ⚠️ | ✅ | Some videos play with sound only and buffer constantly. Known issue: video buffering stalls (same as other apps), fix planned. |
 | **Now in Android** | 0.1.2 | ✅ | ✅ |  |
 | **Open Sudoku** | 4.7.0 | ✅ | ❔ |  |
 | **OpenGD** | 1.0 | ✅ | ✅ |  |
@@ -80,16 +81,18 @@ Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-11-04.
 | **Rhythm** | 5.5.499.1302-gh | ✅ | ✅ | Icon: ❔. Music player. Play and pause from macOS Now Playing work. |
 | **Rocket League Sideswipe** | 1.12.5 | ✅ | ✅ | Works with a game controller. Sign in with Epic Games and online matches work. Can also be installed from the Epic Games Store app. The first launch after an install shows a black screen for a while before the game starts. |
 | **Rocks 'n' Diamonds** | 4.2.2.0 | ✅ | ✅ |  |
+| **Saber** | 1.36.1 | ❌ | ❔ | Icon: ❔. Draws its screen: ❌. Known issue: black screen on launch, fix planned. |
 | **Shattered Pixel Dungeon** | 3.3.8 | ✅ | ✅ |  |
 | **Signal** | 8.20.4 | ✅ | ❔ |  |
 | **Simple Solitaire Collection** | 3.13 | ✅ | ❔ |  |
+| **SmartTube** | 32.56 | ❔ | ❔ | Icon: ❔. Draws its screen: ❔. Not tested. |
 | **Smash Hit** | 1.5.14 | ✅ | ✅ |  |
 | **SolitaireCG** | 4.1 | ✅ | ❔ |  |
-| **Subway Surfers** | 3.69.1 | ✅ | ✅ |  |
+| **Subway Surfers** | 3.69.1 | ⚠️ | ✅ | Known issue: the mouse does not act as touch in game; a planned optional control will make it do so. |
 | **Subway Surfers** | 3.62.0 | ✅ | ✅ |  |
 | **Super Retro Mega Wars** | 0.32.5 | ✅ | ✅ |  |
 | **Telegram** | 12.9.1 | ✅ | ❔ |  |
-| **Temple Run 2** | 1.133.0 | ✅ | ✅ | Loading crash fixed in v1.0.1726. Tilt Control steers the runner. |
+| **Temple Run 2** | 1.133.0 | ⚠️ | ✅ | Loading crash fixed in v1.0.1726. Tilt Control steers the runner. Known issue: the mouse does not act as touch in game; a planned optional control will make it do so. |
 | **Thunderbird** | 23.1 | ⚠️ | ❔ | Sign in with Google works but log in to Thunderbird fails. |
 | **Thunderbird** | 21.0 | ⚠️ | ❔ |  |
 | **TIC-80** | 1.01.00 | ✅ | ✅ |  |

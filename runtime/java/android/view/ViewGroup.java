@@ -728,13 +728,26 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
     public void setOnHierarchyChangeListener(OnHierarchyChangeListener l) { this.hierarchyListener = l; }
     public OnHierarchyChangeListener getOnHierarchyChangeListener() { return hierarchyListener; }
 
-    // Animation cache flags (deprecated AOSP API; some libs still set).
-    public boolean isAnimationCacheEnabled() { return false; }
-    public void setAnimationCacheEnabled(boolean enabled) {}
-    public boolean isAlwaysDrawnWithCacheEnabled() { return false; }
-    public void setAlwaysDrawnWithCacheEnabled(boolean enabled) {}
-    public int getPersistentDrawingCache() { return 0; }
-    public void setPersistentDrawingCache(int drawingCacheToKeep) {}
+    // Animation cache flags (deprecated AOSP API; some libs still set and read back).
+    // AOSP initViewGroup(): FLAG_ANIMATION_CACHE and FLAG_ALWAYS_DRAWN_WITH_CACHE
+    // are both set and mPersistentDrawingCache = PERSISTENT_SCROLLING_CACHE, so a
+    // fresh ViewGroup reports true / true / 2. (Deprecated since M, ignored by
+    // drawing, but the getters still answer with these defaults.)
+    public static final int PERSISTENT_NO_CACHE = 0x0;
+    public static final int PERSISTENT_ANIMATION_CACHE = 0x1;
+    public static final int PERSISTENT_SCROLLING_CACHE = 0x2;
+    public static final int PERSISTENT_ALL_CACHES = 0x3;
+    private boolean mAnimationCacheEnabled = true;
+    private boolean mAlwaysDrawnWithCacheEnabled = true;
+    private int mPersistentDrawingCache = PERSISTENT_SCROLLING_CACHE;
+    public boolean isAnimationCacheEnabled() { return mAnimationCacheEnabled; }
+    public void setAnimationCacheEnabled(boolean enabled) { mAnimationCacheEnabled = enabled; }
+    public boolean isAlwaysDrawnWithCacheEnabled() { return mAlwaysDrawnWithCacheEnabled; }
+    public void setAlwaysDrawnWithCacheEnabled(boolean enabled) { mAlwaysDrawnWithCacheEnabled = enabled; }
+    public int getPersistentDrawingCache() { return mPersistentDrawingCache; }
+    public void setPersistentDrawingCache(int drawingCacheToKeep) {
+        mPersistentDrawingCache = drawingCacheToKeep & PERSISTENT_ALL_CACHES;
+    }
     /** AOSP FLAG_SPLIT_MOTION_EVENTS (ViewGroup.java:392), set in
      *  initViewGroup() (ViewGroup.java:714-716):
      *

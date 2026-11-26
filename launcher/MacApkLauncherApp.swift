@@ -151,6 +151,26 @@ struct MacApkLauncherApp: App {
         DispatchQueue.main.async { HelpMenuRemover.install() }
     }
 
+    /// Come forward once the first window exists, if launching left Mac.apk
+    /// behind. AppKit asks to make the app frontmost while it finishes
+    /// launching, before SwiftUI has made the window, and the window server
+    /// refuses an app that "presents 0 windows" (system log, 2026-11-14:
+    /// "CPS: The requested process (pid = 6873) presents 0 windows, is not a
+    /// UI element and is frontable"). Normally the window follows within the
+    /// same moment; on the first launch after an install or update, while
+    /// macOS checks the new program, it came two seconds later, and Mac.apk
+    /// opened behind the app the user launched it from, last in Command-Tab,
+    /// until a second launch (owner, 2026-11-14). Only within ten seconds of
+    /// launch and only when nothing else became active by the user's hand:
+    /// NSApp.activate() is a request under cooperative activation, which
+    /// macOS declines once the user has moved to another app.
+    private func activateWhenFirstWindowAppears() {
+        guard !NSApp.isActive,
+              let launched = NSRunningApplication.current.launchDate,
+              Date().timeIntervalSince(launched) < 10 else { return }
+        NSApp.activate()
+    }
+
     var body: some Scene {
         WindowGroup("Mac.apk") {
             LauncherView()
@@ -168,7 +188,10 @@ struct MacApkLauncherApp: App {
                 // none exists (Mac.apk running with its window closed), and
                 // onOpenURL below hides that one.
                 .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
-                .onAppear { model.windowAppearedAt = Date() }
+                .onAppear {
+                    model.windowAppearedAt = Date()
+                    activateWhenFirstWindowAppears()
+                }
                 // onOpenURL fires when the user opens an .apk via Finder's
                 // "Open With > Mac.apk" or by dropping it on the Dock icon.
                 // The URL is a file://, so we extract the path and stash it.
@@ -1468,6 +1491,15 @@ struct EnvEditor: View {
     @State private var text: String = ""
     @State private var problems: [String] = []
     @State private var loaded: Bool = false
+    /// The "Saved" label, shown from Apply until the text is edited again or
+    /// a few seconds pass.
+    @State private var showSaved: Bool = false
+    /// The editor's border in the icon's colour, for a moment after Apply.
+    @State private var flashBorder: Bool = false
+    /// Bumped by each Apply, so a timer from an earlier one leaves a newer
+    /// confirmation alone.
+    @State private var confirmSavedCount: Int = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1475,7 +1507,12 @@ struct EnvEditor: View {
                 .font(.system(.caption, design: .monospaced))
                 .frame(minHeight: 72)
                 .overlay(RoundedRectangle(cornerRadius: 5)
-                    .stroke(Color.secondary.opacity(0.3)))
+                    .stroke(flashBorder ? savedColor : Color.secondary.opacity(0.3),
+                            lineWidth: flashBorder ? 2 : 1))
+                .onChange(of: text) { _, _ in
+                    // An edit after Apply is not saved yet: drop the label.
+                    if showSaved { setSaved(false) }
+                }
             if !problems.isEmpty {
                 // Warn, do not block: an unknown-looking key may simply be
                 // one this build of the launcher has not heard of.
@@ -1491,6 +1528,19 @@ struct EnvEditor: View {
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer()
+                // Always in the layout, shown by opacity, so the caption beside
+                // it does not reflow on each Apply. Only the icon is coloured;
+                // the words stay in the primary colour for contrast.
+                Label {
+                    Text(savedText)
+                } icon: {
+                    Image(systemName: problems.isEmpty
+                          ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(savedColor)
+                }
+                .font(.caption)
+                .opacity(showSaved ? 1 : 0)
+                .accessibilityHidden(!showSaved)
                 Button("Apply") { apply() }
                     .controlSize(.small)
             }
@@ -1506,6 +1556,48 @@ struct EnvEditor: View {
         let parsed = Self.parse(text)
         problems = parsed.problems
         env = parsed.env
+        confirmSaved()
+    }
+
+    /// The checkmark's green, or orange beside the warning icon. The border
+    /// flash uses it too (owner, 2026-11-14: the outline should match the
+    /// check).
+    private var savedColor: Color { problems.isEmpty ? .green : .orange }
+
+    /// "Saved", or "Saved, 2 warnings" when lines were ignored or questioned
+    /// (the warnings themselves are listed above the button).
+    private var savedText: String {
+        problems.isEmpty ? "Saved"
+            : "Saved, \(problems.count) " + (problems.count == 1 ? "warning" : "warnings")
+    }
+
+    /// Shows the "Saved" label and flashes the border, then clears both, and
+    /// asks VoiceOver to say so. The label stays about four seconds, long
+    /// enough to read; the border starts to fade back at 0.8 seconds.
+    private func confirmSaved() {
+        confirmSavedCount += 1
+        let count = confirmSavedCount
+        setSaved(true)
+        animate(.easeOut(duration: 0.15)) { flashBorder = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            guard count == confirmSavedCount else { return }
+            animate(.easeInOut(duration: 0.4)) { flashBorder = false }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            guard count == confirmSavedCount else { return }
+            setSaved(false)
+        }
+        AccessibilityNotification.Announcement("Environment overrides " + savedText.lowercased())
+            .post()
+    }
+
+    private func setSaved(_ on: Bool) {
+        animate(.easeInOut(duration: 0.25)) { showSaved = on }
+    }
+
+    /// withAnimation, or the plain change when Reduce Motion is on.
+    private func animate(_ animation: Animation, _ change: () -> Void) {
+        if reduceMotion { change() } else { withAnimation(animation, change) }
     }
 
     static func text(from env: [String: String]) -> String {
@@ -2883,6 +2975,26 @@ struct LauncherView: View {
                         }
                     }
                 }
+                // Android's fingerprint and screen-lock checks, answered by
+                // macOS (runtime/src/user_verification_bridge.mm). The runtime
+                // reads this from a file, like the Mac folders switch, because a
+                // Dock-launched app gets no environment from here. Default ON
+                // (owner, GitHub #41); the file means OFF. An app's own
+                // MACAPK_USER_VERIFICATION_HOST override wins either way.
+                Section("Touch ID") {
+                    Toggle("Let Android apps use Touch ID and your Mac password",
+                           isOn: touchIdBinding)
+                    Text("Apps that offer fingerprint or screen-lock sign-in can ask macOS to "
+                       + "check it's you, with Touch ID or your Mac password. Apps never see "
+                       + "your fingerprint or password, only whether the check passed. "
+                       + "Takes effect the next time each app opens. To choose for one app, "
+                       + "add a line to its \"Environment overrides\" in the app's info: "
+                       + "MACAPK_USER_VERIFICATION_HOST=0 turns it off for that app, and "
+                       + "MACAPK_USER_VERIFICATION_HOST=1 turns it on for that app even with "
+                       + "this switch off. Without Touch ID, apps get your Mac password.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
                 if model.devMenuRevealed {
                     Section("App files") {
                         // The path itself is deliberately NOT rendered here
@@ -3880,16 +3992,24 @@ struct LauncherView: View {
         !FileManager.default.fileExists(atPath: macFoldersOffFile.path)
     private var macFoldersBinding: Binding<Bool> {
         Binding(get: { macFoldersOn }, set: { on in
-            let f = Self.macFoldersOffFile
-            if on {
-                try? FileManager.default.removeItem(at: f)
-            } else {
-                try? FileManager.default.createDirectory(
-                    at: f.deletingLastPathComponent(), withIntermediateDirectories: true)
-                FileManager.default.createFile(atPath: f.path, contents: Data())
-            }
-            macFoldersOn = !FileManager.default.fileExists(atPath: f.path)
+            macFoldersOn = !Self.setMarkerFile(Self.macFoldersOffFile, present: !on)
         })
+    }
+
+    /// Creates or removes one of the empty marker files the runtime reads for a
+    /// Settings switch, and returns whether it exists afterwards (so the switch
+    /// shows the real state if the write failed).
+    @discardableResult
+    private static func setMarkerFile(_ file: URL, present: Bool) -> Bool {
+        let fm = FileManager.default
+        if present {
+            try? fm.createDirectory(at: file.deletingLastPathComponent(),
+                                    withIntermediateDirectories: true)
+            fm.createFile(atPath: file.path, contents: Data())
+        } else {
+            try? fm.removeItem(at: file)
+        }
+        return fm.fileExists(atPath: file.path)
     }
 
     /// The "Use Google GMS" switch: ON when the file exists (default OFF). The
@@ -3901,16 +4021,23 @@ struct LauncherView: View {
         FileManager.default.fileExists(atPath: googleGmsFile.path)
     private var googleGmsBinding: Binding<Bool> {
         Binding(get: { googleGmsOn }, set: { on in
-            let f = Self.googleGmsFile
-            if on {
-                try? FileManager.default.createDirectory(
-                    at: f.deletingLastPathComponent(), withIntermediateDirectories: true)
-                FileManager.default.createFile(atPath: f.path, contents: Data())
-            } else {
-                try? FileManager.default.removeItem(at: f)
-            }
-            googleGmsOn = FileManager.default.fileExists(atPath: f.path)
+            googleGmsOn = Self.setMarkerFile(Self.googleGmsFile, present: on)
             setSystemBroker(enabled: googleGmsOn)
+        })
+    }
+
+    /// The "Touch ID" switch: ON by default; the file no-touch-id exists when it
+    /// is OFF (the runtime reads the same file, user_verification_bridge.mm,
+    /// On()). Named for "off" so a use-touch-id file left by the opt-in build
+    /// is never read as a setting.
+    private static var noTouchIdFile: URL {
+        Paths.supportDir.appendingPathComponent("no-touch-id")
+    }
+    @State private var touchIdOn: Bool =
+        !FileManager.default.fileExists(atPath: noTouchIdFile.path)
+    private var touchIdBinding: Binding<Bool> {
+        Binding(get: { touchIdOn }, set: { on in
+            touchIdOn = !Self.setMarkerFile(Self.noTouchIdFile, present: !on)
         })
     }
 
@@ -4620,6 +4747,25 @@ struct LauncherView: View {
         }
     }
 
+    /// The same hand-off for an app opened as its bundle. Observed (owner,
+    /// 2026-11-13): an app opened from this window opened behind it, last in
+    /// Command-Tab, though openApplication is asked to activate it. The likely
+    /// reason: the bundle's stub execv's the runtime, and the runtime's own
+    /// activate when its window appears is refused while this launcher stays
+    /// the active app, since the launcher never yielded to it. Opened from Finder or Spotlight it came forward,
+    /// as LaunchServices grants that itself. Yielding until the app is active
+    /// covers the exec; it stops once the app is active or has quit, once the
+    /// launcher is no longer the active app (the user moved on: the chain
+    /// ends at the first tick that finds it inactive and is not restarted),
+    /// or after about 15 seconds.
+    private func yieldActivation(toLaunched app: NSRunningApplication, attempt: Int = 0) {
+        guard !app.isTerminated, !app.isActive, NSApp.isActive, attempt < 30 else { return }
+        NSApp.yieldActivation(to: app)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) {
+            self.yieldActivation(toLaunched: app, attempt: attempt + 1)
+        }
+    }
+
     private func stopRunning() {
         if let p = model.process, p.isRunning {
             p.terminate()
@@ -4723,6 +4869,7 @@ struct LauncherView: View {
                     return
                 }
                 self.model.runningApps[running.processIdentifier] = (running, label)
+                self.yieldActivation(toLaunched: running)
                 if let dirName = app?.dirName ?? (NSDictionary(contentsOf:
                         bundle.appendingPathComponent("Contents/Info.plist"))?["MacapkDirName"] as? String) {
                     self.tailRunLog(dirName: dirName, since: started,

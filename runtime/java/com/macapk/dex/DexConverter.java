@@ -1052,7 +1052,42 @@ public final class DexConverter {
     static int classAccessFlags(DexClass cls) {
         int f = cls.accessFlags() & CLASS_FLAGS_MASK;
         if (!cls.isInterface()) f |= ClassFileWriter.ACC_SUPER;
+        if (INNER_CLASS_PUBLIC) {
+            DexFile.Annotation inner = systemAnnotation(cls.annotations(), A_INNER_CLASS);
+            if (inner != null) {
+                DexFile.Value flagsV = inner.element("accessFlags");
+                int innerFlags = flagsV == null ? cls.accessFlags() : flagsV.asInt();
+                f = normalizeInnerClassAccess(f, innerFlags);
+            }
+        }
         return f;
+    }
+
+    /**
+     * DEX2JVM_INNER_CLASS_PUBLIC (default ON; =0 keeps the raw class_def flag).
+     *
+     * A member class can carry a class_def_item without ACC_PUBLIC while its
+     * InnerClass system annotation says public or protected. The InnerClasses
+     * attribute we emit still carries the annotation's flags, so
+     * Class.getModifiers() reports public, and java.lang.reflect.Proxy accepts
+     * the interface; but the JVM's linkage check reads the classfile's own
+     * access_flags. Proxy then defines its class in a dynamic module and fails
+     * with IllegalAccessError ("cannot access its superinterface"). Promoting
+     * the classfile flag to match the declared member flag makes the two views
+     * agree. Class.getModifiers() is unchanged (it reads the InnerClasses
+     * entry, which is untouched), only widening is done, and private or
+     * package-private members stay as they were.
+     */
+    static final boolean INNER_CLASS_PUBLIC =
+            !"0".equals(System.getenv("DEX2JVM_INNER_CLASS_PUBLIC"));
+
+    static int normalizeInnerClassAccess(int classFlags, int innerClassFlags) {
+        if ((classFlags & ClassFileWriter.ACC_PUBLIC) == 0
+                && (innerClassFlags & (ClassFileWriter.ACC_PUBLIC
+                        | ClassFileWriter.ACC_PROTECTED)) != 0) {
+            classFlags |= ClassFileWriter.ACC_PUBLIC;
+        }
+        return classFlags;
     }
 
     static void applyConstantValue(ClassFileWriter.FieldWriter fw, DexFile.Value v, String desc) {

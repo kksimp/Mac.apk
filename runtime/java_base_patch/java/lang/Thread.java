@@ -1545,6 +1545,20 @@ public class Thread implements Runnable {
      * @throws IllegalThreadStateException if the thread has already been started
      */
     void start(ThreadContainer container) {
+        // MACAPK: HotSpot's ThreadPoolExecutor starts a worker with
+        // container.start(t), which lands here and never calls a subclass
+        // override of start(). AOSP libcore's ThreadPoolExecutor.addWorker calls
+        // t.start(), so apps whose ThreadFactory returns a Thread subclass that
+        // overrides start() rely on that override running. ByteDance's pthread
+        // ThreadProxy (com.ss.android.ugc.bytex.pthread) is one: its start()
+        // hands the worker to SuperThreadPool. Skipped, the proxy starts as an
+        // empty thread, the pool's worker never runs, and every task queued on
+        // it waits forever (Tomato Novel's Application.onCreate blocks on one).
+        // Do what ART does and call the override.
+        if (getClass() != Thread.class && StartOverride.CACHE.get(getClass())) {
+            start();
+            return;
+        }
         synchronized (this) {
             // zero status corresponds to state "NEW".
             if (holder.threadStatus != 0)
@@ -1570,6 +1584,21 @@ public class Thread implements Runnable {
                 }
             }
         }
+    }
+
+    // MACAPK: in its own class so Thread's static initialization (which runs
+    // during VM bootstrap) is unchanged; loaded on the first container start.
+    private static final class StartOverride {
+        static final ClassValue<Boolean> CACHE = new ClassValue<>() {
+            @Override
+            protected Boolean computeValue(Class<?> type) {
+                try {
+                    return type.getMethod("start").getDeclaringClass() != Thread.class;
+                } catch (NoSuchMethodException e) {
+                    return false;
+                }
+            }
+        };
     }
 
     private native void start0();

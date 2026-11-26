@@ -12005,7 +12005,8 @@ size_t Image::apply_stack_canary_neutralization() {
     std::string knobs;
     for (const char* k : { "MACAPK_CANARY_WIDE_RELOAD", "MACAPK_CANARY_MARKER_FIX",
                            "MACAPK_CANARY_MARK", "MACAPK_NO_CANARY_LOOP_CLEAR",
-                           "MACAPK_CANARY_OUTLINED_MRS" }) {
+                           "MACAPK_CANARY_OUTLINED_MRS",
+                           "MACAPK_CANARY_RELOAD_BLOCK_LOCAL" }) {
         const char* v = std::getenv(k);
         knobs += k; knobs += '='; knobs += v ? v : "\x01"; knobs += ';';
     }
@@ -12606,9 +12607,45 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
         for (int i = 0; i <= 18; ++i) is_tpidr[i] = false;
         is_tpidr[30] = false;
     };
+    // Registers whose is_tpidr bit came ONLY from a reload of the TPIDR spill
+    // slot (`ldr Xt,[sp,#slot]`), not from an `mrs` or an outlined prologue.
+    //
+    // WHY. A reload of the spilled guard pointer belongs to ONE path: the
+    // compiler emits it in an epilogue block right before that block's guard
+    // check. The scan is linear, so without this mask the "holds TPIDR" fact
+    // survives that block's unconditional `b` and leaks into whatever block is
+    // laid out next, where the same callee-saved register holds an ordinary
+    // value again. The next `ldr Xt,[Xr,#0x28]` there is a real object-field
+    // load, and rewriting it to `mov Xt,#0` hands the guest a null.
+    //
+    // MEASURED on libhermesvm.so (React Native 0.88.1 / Expo 58, Patchwork
+    // 1.13.0), one function of Hermes' JS compiler:
+    //     0x117228  mrs  x8, TPIDR_EL0
+    //     0x117234  str  x8, [sp, #0x28]       <- guard pointer spilled
+    //     0x117b38  ldr  x19, [sp, #0x28]      <- reload on an epilogue path
+    //     0x117b6c  b    0x118304              <- that path leaves here
+    //     0x117b70  ...                        <- new block, x19 = `this` again
+    //     0x117ce0  ldr  x8, [x19, #0x28]      <- field load, patched to mov #0
+    //     0x117cf8  ldr  x8, [x8, #0x28]       <- null deref
+    // MACAPK_CANARY_TRACE=1 logged "dataflow 0x117ce0" and "dataflow 0x117d08".
+    // Expo's createClass -> evaluateJavaScript ran the compiler through that
+    // null, and Hermes crashed in memmove on the JS thread.
+    //
+    // The function-wide facts (`mrs`, outlined prologue) are untouched: those
+    // registers keep TPIDR across blocks on purpose. A real guard load that is
+    // reached only by a `b` from the reload's block is still caught by the
+    // epilogue_guard_check backstop (reload + compare + branch).
+    //
+    // MACAPK_CANARY_RELOAD_BLOCK_LOCAL=0 restores the old behaviour.
+    static const bool kReloadBlockLocal = [] {
+        const char* e = std::getenv("MACAPK_CANARY_RELOAD_BLOCK_LOCAL");
+        return !(e && *e == '0');
+    }();
+    uint32_t tp_reload_mask = 0;
     auto clear_all = [&]() {
         for (int i = 0; i < 32; ++i) is_tpidr[i] = false;
         tpidr_slot_off = -1;
+        tp_reload_mask = 0;
     };
 
     // Opcode-prefix helpers. The masks pick out enough bits to
@@ -12720,7 +12757,10 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
             if (j == 0xD65F03C0u) {               // ret -- clean return path
                 if (found)
                     for (int r = 19; r <= 28; ++r)
-                        if (cand[r]) is_tpidr[r] = true;
+                        if (cand[r]) {
+                            is_tpidr[r] = true;
+                            tp_reload_mask &= ~(1u << r);   // a real TPIDR, not a reload
+                        }
                 return;
             }
             // mrs Xn, TPIDR_EL0 -- Xn holds the thread pointer.
@@ -13009,6 +13049,7 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
             if ((insn & 0xFFFFFFE0u) == 0xD53BD040u) {
                 uint32_t rt = insn & 0x1Fu;
                 is_tpidr[rt] = true;
+                tp_reload_mask &= ~(1u << rt);   // a real TPIDR, not a reload
                 func_has_tpidr_mrs = true;   // this function is stack-protected
                 if (zero_tp) {
                     *p = 0xD2800000u | rt;   // mov Xt, #0 -- force tp=0 (TLSDESC)
@@ -13038,6 +13079,8 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
                 int off = (int)(((insn >> 10) & 0xFFFu) * 8u);
                 uint32_t rt = insn & 0x1Fu;
                 is_tpidr[rt] = (tpidr_slot_off >= 0 && off == tpidr_slot_off);
+                if (is_tpidr[rt]) tp_reload_mask |= (1u << rt);
+                else              tp_reload_mask &= ~(1u << rt);
                 continue;
             }
             // str Xt, [sp, #imm] (unsigned-offset, 64-bit): record the slot when
@@ -13164,6 +13207,16 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
             if ((insn & 0xFFFFFC1Fu) == 0xD63F0000u) {
                 clear_caller_saved();
                 continue;
+            }
+
+            // Unconditional `b`: the next instruction starts a block this path
+            // never falls into, so a TPIDR reload made on this path does not
+            // hold there (see tp_reload_mask).
+            if (kReloadBlockLocal && (insn & 0xFC000000u) == 0x14000000u
+                && tp_reload_mask) {
+                for (int r = 0; r < 32; ++r)
+                    if (tp_reload_mask & (1u << r)) is_tpidr[r] = false;
+                tp_reload_mask = 0;
             }
 
             // Branches with no destination register -- leave state.

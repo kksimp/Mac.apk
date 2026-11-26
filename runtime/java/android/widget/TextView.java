@@ -4136,6 +4136,25 @@ public class TextView extends View
         int[] qm = macapkLineVertical(g.fm, 0, java.util.Collections.singletonList(drawStr), p);
         g.qLineH = mIncludePad ? (qm[3] - qm[2]) : (qm[1] - qm[0]);
         g.qAscent = -(mIncludePad ? qm[2] : qm[0]);
+        // The one-line twin of the wrapped path's MACAPK_TEXTVIEW_SPAN_LINES fix:
+        // take the line's height and baseline from the span-aware Layout when the
+        // text carries a MetricAffectingSpan or LineHeightSpan. `g.fm` is the BASE
+        // paint's metrics, and React Native puts all text styling in spans on a
+        // TextView whose own paint stays at the default face, so this path placed
+        // the baseline from Roboto while onMeasure (span-aware) sized the view
+        // from the span's face. MEASURED on an icon-font glyph (Material Design
+        // Icons, head top -0.885em, 22dp at 2x = 44px): onMeasure gave the view
+        // 45px with the baseline at 39, this path drew it at Roboto's top, 47,
+        // so every @expo/vector-icons glyph sat ~0.17em low and the bottom of
+        // the circle in `timer-outline` was cut off by the view's own bounds.
+        if (MACAPK_TEXTVIEW_SPAN_LINES) {
+            float[][] sg = macapkSpanLineGeometry(disp, p, viewW, java.util.Collections.singletonList(
+                    new int[] { 0, s.length() }), 1);
+            if (sg != null) {
+                g.qLineH = Math.round(sg[0][1] - sg[0][0]);
+                g.qAscent = -Math.round(sg[1][0]);
+            }
+        }
         // Gate MACAPK_TEXT_CARET: an un-ellipsized line is positioned by its
         // SPAN-AWARE width (fullW), the width macapkDrawLine paints and the
         // layout the caret reads from measures. The base-paint measure put a

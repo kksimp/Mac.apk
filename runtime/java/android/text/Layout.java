@@ -456,6 +456,22 @@ public abstract class Layout {
         final android.text.Spanned sp = (android.text.Spanned) text;
         if (mVertWorkPaint == null) mVertWorkPaint = new android.text.TextPaint();
         int above = m[0], below = m[1], top = m[2], bottom = m[3];
+        // MACAPK_TEXT_SPAN_VERT_EXACT (default ON; =0 restores the old union with
+        // the base paint). A run that a MetricAffectingSpan covers is measured
+        // with the span-applied paint ONLY: AOSP's MeasuredParagraph resets its
+        // work paint to the base paint and applies the run's spans, and
+        // StaticLayout takes the line's extent from those runs, so the base
+        // paint's own face and size never enter a fully spanned line. Seeding
+        // the union with the base metrics did exactly that. React Native puts
+        // every style in spans but ALSO sets the view's paint to the font size
+        // in the default face, so an icon-font glyph (Material Design Icons,
+        // head top -0.885em) got Roboto's top (-1.056em): MEASURED at 44px, the
+        // line's top went from -39 to -47, the glyph drew 8px low and React
+        // Native's padding-box clip cut off the bottom of every
+        // @expo/vector-icons icon. The base metrics still count whenever some
+        // run carries no metric span (that run IS measured with the base paint).
+        final boolean exact = MACAPK_TEXT_SPAN_VERT_EXACT;
+        boolean seeded = !exact;
         final android.graphics.Paint.FontMetricsInt fm =
             new android.graphics.Paint.FontMetricsInt();
         int runStart = start;
@@ -466,6 +482,19 @@ public abstract class Layout {
             mVertWorkPaint.set(paint);
             android.text.style.MetricAffectingSpan[] spans =
                 sp.getSpans(runStart, runEnd, android.text.style.MetricAffectingSpan.class);
+            if (exact && (spans == null || spans.length == 0)) {
+                // An unspanned run: the base metrics (with their fallback-face
+                // widening) are this run's own, so they join the union here.
+                if (!seeded) {
+                    above = m[0]; below = m[1]; top = m[2]; bottom = m[3];
+                    seeded = true;
+                } else {
+                    above = Math.min(above, m[0]); below = Math.max(below, m[1]);
+                    top = Math.min(top, m[2]);     bottom = Math.max(bottom, m[3]);
+                }
+                runStart = runEnd;
+                continue;
+            }
             android.text.style.ReplacementSpan replacement = null;
             if (spans != null) {
                 for (android.text.style.MetricAffectingSpan s : spans) {
@@ -493,14 +522,22 @@ public abstract class Layout {
             } else {
                 mVertWorkPaint.getFontMetricsInt(fm);
             }
-            if (fm.ascent  < above)  above  = fm.ascent;
-            if (fm.descent > below)  below  = fm.descent;
-            if (fm.top     < top)    top    = fm.top;
-            if (fm.bottom  > bottom) bottom = fm.bottom;
+            if (!seeded) {
+                above = fm.ascent; below = fm.descent; top = fm.top; bottom = fm.bottom;
+                seeded = true;
+            } else {
+                if (fm.ascent  < above)  above  = fm.ascent;
+                if (fm.descent > below)  below  = fm.descent;
+                if (fm.top     < top)    top    = fm.top;
+                if (fm.bottom  > bottom) bottom = fm.bottom;
+            }
             runStart = runEnd;
         }
         return new int[]{above, below, top, bottom};
     }
+
+    static final boolean MACAPK_TEXT_SPAN_VERT_EXACT =
+        !"0".equals(System.getenv("MACAPK_TEXT_SPAN_VERT_EXACT"));
 
     // ---- line breaking -------------------------------------------------
     private void ensureLines() {

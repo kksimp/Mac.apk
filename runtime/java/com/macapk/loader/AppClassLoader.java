@@ -1933,6 +1933,8 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
     // lost a race against the exposure pass and the app killed itself.
     private final java.util.concurrent.ConcurrentHashMap<String, Object> soLoadLocks =
         new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.Set<String> absoluteLinkedDependencies =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private static boolean hasElfMagic(File input) {
         if (input == null || !input.isFile()) return false;
@@ -1955,12 +1957,56 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
     public void macapkLoadNative(String path) {
         if (path == null) throw new NullPointerException("path");
         File f = new File(path);
+        if (!f.isAbsolute())
+            throw new UnsatisfiedLinkError("Expecting an absolute path of the library: " + path);
         String n = f.getName();
         boolean isStandardSo = n.startsWith("lib") && n.endsWith(".so") && n.length() > 6;
         if (!f.isFile() || (!isStandardSo && !hasElfMagic(f))) {
             loadIntoThisLoader(path);
             return;
         }
+        // System.load(path) has the same ELF dependency contract as
+        // System.loadLibrary(name). Resolve providers shipped by this APK
+        // before the requested library's native constructors relocate it.
+        linkAbsoluteLoadDependencies(f, new java.util.HashSet<>());
+        loadIntoThisLoader(translateNativeForPath(f).getAbsolutePath());
+    }
+
+    /** Maps the APK-bundled part of an absolute-path load's DT_NEEDED
+     *  closure, deepest first. This is native linker work: it must not run
+     *  a provider's JNI_OnLoad until the guest explicitly loads that provider.
+     *  System libraries continue to be resolved by the Bionic shim. */
+    private boolean linkAbsoluteLoadDependencies(File source, java.util.Set<File> seen) {
+        File key;
+        try { key = source.getCanonicalFile(); }
+        catch (IOException e) { key = source.getAbsoluteFile(); }
+        if (!seen.add(key)) return false;
+        for (String soname : ElfReader.readDtNeeded(source)) {
+            if (!soname.startsWith("lib") || !soname.endsWith(".so")
+                    || soname.length() <= 6 || !soname.equals(new File(soname).getName()))
+                continue;
+            File dep = locateApkSo(soname.substring(3, soname.length() - 3));
+            if (dep == null || !dep.isFile()) continue;
+            if (linkAbsoluteLoadDependencies(dep, seen)) {
+                File cached = translateNativeForPath(dep);
+                String path = cached.getAbsolutePath();
+                if (!absoluteLinkedDependencies.contains(path)) {
+                    linkDependencyOnly(cached);
+                    // Publish only after dlopen returns. Concurrent loads may
+                    // map the same dependency but neither can skip an in-flight
+                    // map; repeated calls do not accumulate new dlopen handles.
+                    absoluteLinkedDependencies.add(path);
+                }
+            }
+        }
+        return true;
+    }
+
+    /** Shares the absolute-path cache and identity stamps between the root
+     *  ELF and its implicitly mapped dependencies. */
+    private File translateNativeForPath(File f) {
+        String n = f.getName();
+        boolean isStandardSo = n.startsWith("lib") && n.endsWith(".so") && n.length() > 6;
         String fileBase;
         String libname;
         if (isStandardSo) {
@@ -1979,14 +2025,14 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         synchronized (lock) {
             if (!(soSourceMatches(cached, f) && cached.exists() && nativeIdMatches(cached))) {
                 if (!translate(f, cached, libBias.getOrDefault(libname, 0L))) {
-                    throw new UnsatisfiedLinkError("Mac.apk could not translate " + path);
+                    throw new UnsatisfiedLinkError("Mac.apk could not translate " + f.getAbsolutePath());
                 }
                 writeNativeIdStamp(cached);
                 writeSoSourceStamp(cached, f);
                 NativeLog.i(TAG, "macapkLoadNative: translated " + n + " on demand for System.load");
             }
         }
-        loadIntoThisLoader(cached.getAbsolutePath());
+        return cached;
     }
 
     /** Recognised R-class subtype names. Each corresponds to a `<public type="...">`

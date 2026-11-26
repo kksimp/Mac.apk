@@ -31,7 +31,12 @@ public final class MacApkNativeLoad {
 
     public static void load(String path) { loadFrom(callerLoader(), path); }
 
-    public static void runtimeLoad(Runtime r, String path) { loadFrom(callerLoader(), path); }
+    public static void runtimeLoad(Runtime r, String path) {
+        // The converter turns invokevirtual into invokestatic. Preserve the
+        // original receiver null check before doing any loading.
+        if (r == null) throw new NullPointerException("runtime");
+        loadFrom(callerLoader(), path);
+    }
 
     /**
      * The ClassLoader of the guest class whose {@code System.load} is running on

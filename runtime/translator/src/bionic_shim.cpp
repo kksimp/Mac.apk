@@ -50494,29 +50494,47 @@ extern "C" long __macapk_arm64_raw_syscall(long number, long a1, long a2,
 // causes CCSprite::create to fail silently and the caller to addChild
 // a NULL pointer).
 //
-// We implement setjmp/longjmp from scratch with naked functions:
-// save x19..x28, x29, x30, sp, d8..d15. That's 160 bytes -- well
-// under Bionic's 256-byte buffer. We zero-fill the unused tail in
-// setjmp so old contents don't get treated as state on a subsequent
-// longjmp.
+// Keep the existing register-save ABI. The remaining opaque buffer space
+// carries the signal mask for Bionic's setjmp/sigsetjmp contract. The arm64
+// jmp_buf is 32 LP64 words (256 bytes) and sigjmp_buf is 33 words (AOSP
+// libc/include/setjmp.h). The mask metadata must fit in the smaller buffer.
+// Always use our normal sigprocmask bridge so the runtime's claimed signals
+// remain subject to the existing filtering policy.
+namespace {
+struct MacApkJumpMask {
+    uint64_t mask;
+    uint64_t saved;
+};
+constexpr size_t kJumpMaskOffset = 168;
+static_assert(kJumpMaskOffset + sizeof(MacApkJumpMask) <= 256);
+}
+extern "C" __attribute__((used, noinline, visibility("hidden")))
+int macapk_jump_capture_signal_mask(void* env, int save_mask) {
+    MacApkJumpMask state{};
+    const int previous_errno = errno;
+    if (save_mask && __macapk_arm64_sigprocmask(2, nullptr, &state.mask) == 0)
+        state.saved = 1;
+    std::memcpy(static_cast<unsigned char*>(env) + kJumpMaskOffset,
+                &state, sizeof(state));
+    errno = previous_errno;
+    return 0;
+}
+extern "C" __attribute__((used, noinline, visibility("hidden")))
+void macapk_jump_restore_signal_mask(const void* env) {
+    MacApkJumpMask state{};
+    std::memcpy(&state, static_cast<const unsigned char*>(env) + kJumpMaskOffset,
+                sizeof(state));
+    if (state.saved == 1) {
+        const int previous_errno = errno;
+        __macapk_arm64_sigprocmask(2, &state.mask, nullptr);
+        errno = previous_errno;
+    }
+}
+
+// AOSP setjmp is the signal-mask-saving variant, unlike _setjmp.
 __attribute__((naked))
 extern "C" int __macapk_arm64_setjmp(void* /*env*/) {
-    __asm__ volatile(
-        "stp x19, x20, [x0, #0]\n"
-        "stp x21, x22, [x0, #16]\n"
-        "stp x23, x24, [x0, #32]\n"
-        "stp x25, x26, [x0, #48]\n"
-        "stp x27, x28, [x0, #64]\n"
-        "stp x29, x30, [x0, #80]\n"
-        "mov x1, sp\n"
-        "str x1, [x0, #96]\n"
-        "stp d8, d9, [x0, #104]\n"
-        "stp d10, d11, [x0, #120]\n"
-        "stp d12, d13, [x0, #136]\n"
-        "stp d14, d15, [x0, #152]\n"
-        "mov x0, #0\n"
-        "ret\n"
-    );
+    __asm__ volatile("mov w1, #1\nb ___macapk_arm64_sigsetjmp\n");
 }
 __attribute__((naked, noreturn))
 extern "C" void __macapk_arm64_longjmp(void* /*env*/, int /*val*/) {
@@ -50531,6 +50549,8 @@ extern "C" void __macapk_arm64_longjmp(void* /*env*/, int /*val*/) {
         "stp x0, x1, [sp, #-16]!\n"
         "ldr x0, [x0, #96]\n"
         "bl ___macapk_sigchain_note_longjmp\n"
+        "ldr x0, [sp]\n"
+        "bl _macapk_jump_restore_signal_mask\n"
         "ldp x0, x1, [sp], #16\n"
         "ldp x19, x20, [x0, #0]\n"
         "ldp x21, x22, [x0, #16]\n"
@@ -50550,11 +50570,8 @@ extern "C" void __macapk_arm64_longjmp(void* /*env*/, int /*val*/) {
         "ret\n"
     );
 }
-// sigsetjmp/siglongjmp: same wire-up. Bionic's sigjmp_buf is the
-// same 256-byte layout as jmp_buf. We don't honor the savemask flag
-// (we don't track signal masks per-jmp_buf); apps that depend on it
-// for signal-handler return semantics would notice, but cocos2d-x /
-// libpng / libstdc++ exception paths don't.
+// The register save path is the same for both Bionic entry points. Capture
+// the optional signal mask after saving the caller's execution context.
 __attribute__((naked))
 extern "C" int __macapk_arm64_sigsetjmp(void* /*env*/, int /*savemask*/) {
     __asm__ volatile(
@@ -50570,24 +50587,14 @@ extern "C" int __macapk_arm64_sigsetjmp(void* /*env*/, int /*savemask*/) {
         "stp d10, d11, [x0, #120]\n"
         "stp d12, d13, [x0, #136]\n"
         "stp d14, d15, [x0, #152]\n"
-        "mov x0, #0\n"
-        "ret\n"
+        "b _macapk_jump_capture_signal_mask\n"
     );
 }
-// _setjmp / _longjmp (added 2026-09-27). Bionic's arm64 setjmp.S defines
-// `_setjmp` as `mov w1, #0; b sigsetjmp` and `_longjmp` as an ALIAS of
-// siglongjmp (bionic/libc/arch-arm64/bionic/setjmp.S: "ENTRY(_setjmp) mov w1,
-// #0; b sigsetjmp", "ALIAS_SYMBOL_WEAK_FOR_NATIVE_BRIDGE(_longjmp,
-// siglongjmp)"), with the same 256-byte buffer. Our setjmp never saves the mask
-// anyway, so they are the same code as the pair above. Without a shim, both
-// bound to libSystem's own, whose buffer layout is not Bionic's, and a guest
-// signal handler leaving by `_longjmp` would skip the libsigchain bookkeeping
-// in __macapk_arm64_longjmp. Measured 2026-09-27: 0 of the 102 installed arm64
-// libraries import either (setjmp 8, longjmp 7, sigsetjmp 2, siglongjmp 2), so
-// no existing binding changes.
+// _setjmp is Bionic's no-mask-save variant. All longjmp entry points
+// restore a signal mask only when their matching save recorded one.
 __attribute__((naked))
 extern "C" int __macapk_arm64__setjmp(void* /*env*/) {
-    __asm__ volatile("b ___macapk_arm64_setjmp\n");
+    __asm__ volatile("mov w1, #0\nb ___macapk_arm64_sigsetjmp\n");
 }
 __attribute__((naked, noreturn))
 extern "C" void __macapk_arm64__longjmp(void* /*env*/, int /*val*/) {
@@ -51648,6 +51655,8 @@ extern "C" void __macapk_arm64_siglongjmp(void* /*env*/, int /*val*/) {
         "stp x0, x1, [sp, #-16]!\n"
         "ldr x0, [x0, #96]\n"
         "bl ___macapk_sigchain_note_longjmp\n"
+        "ldr x0, [sp]\n"
+        "bl _macapk_jump_restore_signal_mask\n"
         "ldp x0, x1, [sp], #16\n"
         "ldp x19, x20, [x0, #0]\n"
         "ldp x21, x22, [x0, #16]\n"

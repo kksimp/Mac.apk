@@ -35311,6 +35311,10 @@ extern "C" int __macapk_arm64_sigaltstack(const void* ss_in, void* oss_out) {
         std::memset(&host, 0, sizeof(host));
         if (ss->ss_flags & kLinuxSsDisable) {
             host.ss_flags = SS_DISABLE;
+            // Darwin validates ss_size even for SS_DISABLE. The guest's
+            // disabled stack has size zero, which is valid on Linux but
+            // would otherwise make the host reject the disable with ENOMEM.
+            host.ss_size = MINSIGSTKSZ;
         } else {
             if (!ss->ss_sp) { errno = EINVAL; return -1; }
             if (ss->ss_size >= static_cast<uint64_t>(MINSIGSTKSZ)) {

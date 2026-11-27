@@ -1521,6 +1521,30 @@ public struct RegistrySettings: Equatable {
     }
 }
 
+/// Settings > Windows > "Open single-orientation apps like a phone". Default
+/// OFF, which is Android 16 on a tablet: an app that targets SDK 36 and asks
+/// for one orientation is made resizable and opens as wide as the screen
+/// (universal resizability), and an older one gets a 4:3 letterbox box. ON is
+/// a phone: the orientation the app asks for is kept (MACAPK_UNIVERSAL_
+/// RESIZABLE=off) and its box has a phone's 2:1 shape (MACAPK_LETTERBOX_ASPECT,
+/// window_policy.h), so a reading app built for upright use opens tall and
+/// narrow. Apps that work in any orientation are not touched.
+///
+/// Kept in the registry, like bundleNameShowsVersion, because the stub is what
+/// launches an app from the Dock or Finder and it does not see the launcher's
+/// UserDefaults. Applied beneath the app's own environment overrides, so one
+/// app can still opt out with MACAPK_UNIVERSAL_RESIZABLE=sdk36.
+public enum OrientedAppsShape {
+    public static let settingKey = "orientedAppsAsPhone"
+    public static let phoneEnvironment: [String: String] = [
+        "MACAPK_UNIVERSAL_RESIZABLE": "off",
+        "MACAPK_LETTERBOX_ASPECT": "2",
+    ]
+    static func environment(in settings: RegistrySettings) -> [String: String] {
+        RegistryStore.setting(settingKey, in: settings) == "1" ? phoneEnvironment : [:]
+    }
+}
+
 extension RegistrySettings: Codable {
     public init(from decoder: Decoder) throws {
         let raw = (try? decoder.singleValueContainer().decode([String: JSONValue].self)) ?? [:]

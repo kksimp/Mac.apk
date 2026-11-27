@@ -5078,6 +5078,25 @@ CocoaContentBudget CocoaQueryContentBudget() {
     return b;
 }
 
+bool CocoaLaunchSize(int* w_pt, int* h_pt, int* want_w, int* want_h) {
+    const char* e = std::getenv("MACAPK_WINDOW_SIZE");
+    if (!e || !*e) return false;
+    int w = 0, h = 0;
+    if (!winpolicy::ParseLaunchSize(e, &w, &h)) {
+        // Once: the budget is queried at every decision and Cmd+R.
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr, "[macapk] MACAPK_WINDOW_SIZE=%s not understood (WxH, points) -- "
+                         "the window opens at its usual size\n", e);
+        return false;
+    }
+    const CocoaContentBudget cb = CocoaQueryContentBudget();
+    winpolicy::FitLaunchSize(w, h, cb.ok ? cb.w_pt : 0, cb.ok ? cb.h_pt : 0, w_pt, h_pt);
+    if (want_w) *want_w = w;
+    if (want_h) *want_h = h;
+    return true;
+}
+
 bool CocoaPolicyDisplayBudget(winpolicy::DisplayBudget* out, std::string* desc) {
     const CocoaContentBudget cb = CocoaQueryContentBudget();
     const float scale = cb.ok ? cb.scale : 2.0f;
@@ -5093,7 +5112,15 @@ bool CocoaPolicyDisplayBudget(winpolicy::DisplayBudget* out, std::string* desc) 
                       scale, sw_dp > 0 ? " (display sw pinned)" : "");
     } else {
         if (!cb.ok) { if (desc) *desc = "no screen"; return false; }
-        std::snprintf(buf, sizeof buf, "%dx%dpt @%gx", w_pt, h_pt, scale);
+        int want_w = 0, want_h = 0;
+        if (CocoaLaunchSize(&w_pt, &h_pt, &want_w, &want_h)) {
+            // The per-app launch size (#133): the display the policy decides
+            // on is the window the user asked for, fitted into this screen.
+            std::snprintf(buf, sizeof buf, "%dx%dpt @%gx from MACAPK_WINDOW_SIZE=%dx%d "
+                          "(screen %dx%dpt)", w_pt, h_pt, scale, want_w, want_h, cb.w_pt, cb.h_pt);
+        } else {
+            std::snprintf(buf, sizeof buf, "%dx%dpt @%gx", w_pt, h_pt, scale);
+        }
     }
     out->width_px = (int)std::lround(w_pt * scale);
     out->height_px = (int)std::lround(h_pt * scale);

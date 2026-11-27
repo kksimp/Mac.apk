@@ -791,6 +791,26 @@ int ParsePolicySwitch(const std::string& value);
 // display. False (and nothing written) when the text is not of that form.
 bool ParseBudgetOverride(const std::string& value, int* w_pt, int* h_pt, int* sw_dp);
 
+// MACAPK_WINDOW_SIZE=<W>x<H>, POINTS: the size this app's window opens at
+// (issue #133), set per app in the launcher's info sheet ("Window size at
+// launch", saved with the app's environment overrides). It is the launch
+// bounds of a desktop-windowing task (ActivityOptions.setLaunchBounds): the
+// policy decides on a display of that size instead of the whole screen, so a
+// free app opens at exactly W x H and a fixed-orientation app gets its
+// letterbox box inside it -- the same box it would get on a W x H tablet.
+// The user can still drag or zoom the window afterwards; it is the LAUNCH
+// size only. MACAPK_WINDOW_BUDGET, the exact diagnostic, wins when both are
+// set. False (and nothing written) when the text is not WxH.
+bool ParseLaunchSize(const std::string& value, int* w_pt, int* h_pt);
+// The launch size that fits a `screen_w` x `screen_h` point content budget:
+// scaled down with its aspect ratio kept when either side is too big (a
+// 1920x1080 request on a 1710x960 panel opens 1706x960, still 16:9), and
+// raised to kMinLaunchSidePt per side (AOSP's default_minimal_size_resizable_
+// task, DIMENS16:895, the smallest a user drag may leave) but never past the
+// screen.
+constexpr int kMinLaunchSidePt = 220;
+void FitLaunchSize(int want_w, int want_h, int screen_w, int screen_h, int* w_pt, int* h_pt);
+
 // ---- the per-app Cmd+R preference -----------------------------------------
 // <android_root>/.macapk/window_pref/<package>, one word: "portrait" or
 // "default". Read before the window opens; written by Cmd+R.

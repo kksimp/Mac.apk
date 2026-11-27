@@ -102,7 +102,7 @@ public class Application extends ContextWrapper
         // an instance Mac.apk never attached -- default packageName
         // "com.macapk.unknown", EMPTY serviceMap/providerMap -- so every
         // Application.getInstance() after a module loaded returned an empty app.
-        // That broke service resolution: ServiceRegistry.resolveImplicit ->
+        // That broke service resolution: ServiceRegistry.resolveViaPm ->
         // getInstance().getPackageManager().queryIntentServices returned 0 for a
         // GMS-package action (e.g. com.google.android.gms.droidguard.service.START),
         // so bindService answered false and GMS's own DroidGuard client logged

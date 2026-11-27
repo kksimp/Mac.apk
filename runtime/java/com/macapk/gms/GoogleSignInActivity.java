@@ -7,7 +7,9 @@
 //  - action com.google.android.gms.auth.GOOGLE_SIGN_IN, started for result 40962
 //    by the app's own SignInHubActivity, request in the `config` extra;
 //  - EXTRA_PENDING, started by the framework CredentialManager for a
-//    GetGoogleIdOption / GetSignInWithGoogleOption.
+//    GetGoogleIdOption / GetSignInWithGoogleOption;
+//  - AuthTokenService.EXTRA_TOKEN, the userRecoveryIntent of a getToken whose
+//    scopes the user has not approved: one account, those scopes, RESULT_OK.
 //
 // The click on an account IS the consent step: only then is the token minted
 // with has_permission=1, for the calling app's own identity. Cancel (the button
@@ -35,6 +37,7 @@ public class GoogleSignInActivity extends Activity {
     private android.os.Parcelable mConfig;     // legacy: the app's SignInConfiguration
     private boolean mFinished;
     private boolean mIdentity;                 // One Tap / getSignInIntent start (IdentitySignInService)
+    private boolean mToken;                    // getToken consent (AuthTokenService recovery Intent)
     private volatile boolean mBusy;
     private TextView mStatus;
     private String mAppLabel;
@@ -48,6 +51,9 @@ public class GoogleSignInActivity extends Activity {
             if (in != null && in.getBooleanExtra(IdentitySignInService.EXTRA_IDENTITY, false)) {
                 mIdentity = true;
                 mRequest = IdentitySignInService.requestFrom(in);
+            } else if (in != null && in.getBooleanExtra(AuthTokenService.EXTRA_TOKEN, false)) {
+                mToken = true;
+                mRequest = AuthTokenService.requestFrom(in);
             } else if (id != 0L) {
                 mPending = GoogleSignInBroker.pending(id);
                 mRequest = mPending != null ? mPending.request : null;
@@ -98,16 +104,16 @@ public class GoogleSignInActivity extends Activity {
         } catch (Throwable t) {
             mAppLabel = getPackageName();
         }
-        List<String> offered = GoogleSignInBroker.eligibleAccounts(mRequest);
+        List<String> offered = offered();
         GoogleSignInBroker.log("chooser: " + mRequest + " accounts=" + offered.size()
-                + (mIdentity ? " (identity)" : ""));
+                + (mIdentity ? " (identity)" : mToken ? " (token consent)" : ""));
         if (mIdentity && mRequest.kind == GoogleSignInBroker.Kind.GOOGLE_ID && mRequest.filterByAuthorized
                 && mRequest.autoSelect && offered.size() == 1
                 && GoogleSignInBroker.autoSignInAllowed(offered.get(0), mRequest.callerPkg)
                 && GoogleSignInBroker.usedOnThisDevice(offered.get(0), mRequest.callerPkg)) {
             // One Tap auto-select for a returning user: sign in without a sheet.
             GoogleSignInBroker.log("chooser: auto-select (returning user, no UI)");
-            onAccountPicked(offered.get(0));
+            onAccountPicked(offered.get(0), false);
             return;
         }
         buildUi();
@@ -128,6 +134,14 @@ public class GoogleSignInActivity extends Activity {
         return t;
     }
 
+    /** The accounts this screen offers: a getToken consent is for the one account
+     *  the token was asked for. */
+    private List<String> offered() {
+        List<String> all = GoogleSignInBroker.eligibleAccounts(mRequest);
+        if (mToken) all.retainAll(java.util.Collections.singleton(mRequest.accountHint));
+        return all;
+    }
+
     private void buildUi() {
         final int ink = 0xFF202124, sub = 0xFF5F6368, blue = 0xFF1A73E8, line = 0xFFDADCE0;
         ScrollView scroll = new ScrollView(this);
@@ -146,7 +160,7 @@ public class GoogleSignInActivity extends Activity {
                 ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
 
         card.addView(text("Sign in with Google", 14, sub, false));
-        List<String> accounts = GoogleSignInBroker.eligibleAccounts(mRequest);
+        List<String> accounts = offered();
         TextView title = text(accounts.isEmpty() ? "Add a Google account" : "Choose an account", 24, ink, false);
         title.setPadding(0, dp(16), 0, dp(4));
         card.addView(title);
@@ -167,7 +181,7 @@ public class GoogleSignInActivity extends Activity {
             row.addView(text(a, 14, sub, false));
             row.setClickable(true);
             row.setOnClickListener(new View.OnClickListener() {
-                @Override public void onClick(View v) { onAccountPicked(a); }
+                @Override public void onClick(View v) { onAccountPicked(a, true); }
             });
             card.addView(row);
             View sep = new View(this);
@@ -184,8 +198,17 @@ public class GoogleSignInActivity extends Activity {
         });
         card.addView(add);
 
-        TextView consent = text("To continue, Google will share your name and email address with "
-                + mAppLabel + ".", 13, sub, false);
+        // Name every scope beyond the basic profile: picking an account here is the
+        // consent GoogleAuthUtil.getToken is later answered from (AuthTokenService).
+        List<String> extra = new java.util.ArrayList<>(mRequest.scopes);
+        extra.removeAll(java.util.Arrays.asList(GoogleSignInBroker.SCOPE_EMAIL,
+                GoogleSignInBroker.SCOPE_PROFILE, GoogleSignInBroker.SCOPE_OPENID));
+        String what = mToken
+                ? "To continue, Google will give " + mAppLabel + " access to: " + String.join(", ", mRequest.scopes)
+                : "To continue, Google will share your name and email address with " + mAppLabel + "."
+                        + (extra.isEmpty() ? "" : " " + mAppLabel + " will also get access to: "
+                                + String.join(", ", extra));
+        TextView consent = text(what, 13, sub, false);
         consent.setPadding(0, dp(16), 0, dp(8));
         card.addView(consent);
 
@@ -213,16 +236,22 @@ public class GoogleSignInActivity extends Activity {
 
     // ------------------------------------------------------------- actions
 
-    private void onAccountPicked(final String account) {
+    /** `clicked`: the user clicked this account row (One Tap's auto-select did not). */
+    private void onAccountPicked(final String account, final boolean clicked) {
         if (mBusy || mFinished) return;
         mBusy = true;
-        GoogleSignInBroker.log("chooser: user picked " + GoogleAuthenticator.redact(account));
+        GoogleSignInBroker.log("chooser: " + (clicked ? "user picked " : "auto-selected ")
+                + GoogleAuthenticator.redact(account));
         setStatus("Signing in…");
         final String sig = GoogleSignInBroker.appCertSha1(this, mRequest.callerPkg);
         Thread t = new Thread(new Runnable() {
             @Override public void run() {
                 final GoogleSignInBroker.Result res =
                         GoogleSignInBroker.signIn(mRequest, account, sig, true);
+                // Only the click is the consent getToken may later be answered from.
+                if (clicked && res.ok()) {
+                    GoogleSignInBroker.recordConsent(account, mRequest.callerPkg, sig, mRequest.scopes);
+                }
                 GoogleSignInBroker.log("chooser: sign-in " + (res.ok() ? "OK" : "FAILED status="
                         + res.status + " (" + res.error + ")") + " idToken=" + (res.idToken != null)
                         + " authCode=" + (res.serverAuthCode != null));
@@ -303,6 +332,15 @@ public class GoogleSignInActivity extends Activity {
             Intent data = IdentitySignInService.resultIntent(res, code, error);
             setResult(ok ? RESULT_OK : RESULT_CANCELED, data);
             GoogleSignInBroker.log("chooser: identity result " + (ok ? "OK sign_in_credential" : "status=" + code));
+            finish();
+            return;
+        }
+        if (mToken) {
+            // GoogleAuthUtil's recovery contract: RESULT_OK, and the app calls getToken
+            // again, which signIn's recorded consent now answers.
+            boolean ok = res != null && res.ok();
+            setResult(ok ? RESULT_OK : RESULT_CANCELED, new Intent());
+            GoogleSignInBroker.log("chooser: token consent " + (ok ? "OK" : "status=" + status));
             finish();
             return;
         }

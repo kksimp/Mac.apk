@@ -6350,6 +6350,7 @@ public final class MacApkPackageManager extends PackageManager {
         if (ri == null && macapkStandInsActive()) ri = macapkResolveGmsMeasurementService(intent);
         if (ri == null && macapkStandInsActive()) ri = macapkResolveGmsIdentityService(intent);
         if (ri == null && macapkStandInsActive()) ri = macapkResolveGmsLocationService(intent);
+        if (ri == null && macapkStandInsActive()) ri = macapkResolveGmsAuthTokenService(intent);
         if (ri != null) out.add(ri);
         if (intent == null) return out;
 
@@ -6447,6 +6448,7 @@ public final class MacApkPackageManager extends PackageManager {
         if (ri == null && macapkStandInsActive()) ri = macapkResolveGmsMeasurementService(intent);
         if (ri == null && macapkStandInsActive()) ri = macapkResolveGmsIdentityService(intent);
         if (ri == null && macapkStandInsActive()) ri = macapkResolveGmsLocationService(intent);
+        if (ri == null && macapkStandInsActive()) ri = macapkResolveGmsAuthTokenService(intent);
         if (ri != null) return ri;
         // Fall through to the hosted package's own services (v1.0.1177). This
         // is the call firebase-messaging's ServiceStarter makes to locate the
@@ -6642,6 +6644,33 @@ public final class MacApkPackageManager extends PackageManager {
     }
     private static final String IDENTITY_SIGNIN_SERVICE_CLASS =
             "com.macapk.gms.IdentitySignInService";
+
+    /** com.google.android.gms's token service: GoogleAuthUtil.getToken binds the
+     *  EXPLICIT component com.google.android.gms/.auth.GetToken (no action).
+     *  Answered by com.macapk.gms.AuthTokenService for the calling app's own
+     *  identity and the scopes its user approved. Same gate as the sign-in it
+     *  builds on (GoogleSignInBroker.enabled()). */
+    private ResolveInfo macapkResolveGmsAuthTokenService(Intent intent) {
+        ComponentName explicit = intent != null ? intent.getComponent() : null;
+        if (explicit == null || !GMS_PACKAGE.equals(explicit.getPackageName())
+                || !com.macapk.gms.AuthTokenService.COMPONENT_CLASS.equals(explicit.getClassName())) {
+            return null;
+        }
+        if (!com.macapk.gms.GoogleSignInBroker.enabled()) return null;
+        android.content.pm.ServiceInfo si = new android.content.pm.ServiceInfo();
+        si.packageName = GMS_PACKAGE;
+        si.name = AUTH_TOKEN_SERVICE_CLASS;
+        si.exported = true;
+        si.enabled = true;
+        si.applicationInfo = gmsPackageInfo().applicationInfo;
+        ResolveInfo ri = new ResolveInfo();
+        ri.serviceInfo = si;
+        ri.resolvePackageName = GMS_PACKAGE;
+        ri.isDefault = true;
+        ri.match = android.content.IntentFilter.MATCH_CATEGORY_EMPTY;
+        return ri;
+    }
+    private static final String AUTH_TOKEN_SERVICE_CLASS = "com.macapk.gms.AuthTokenService";
 
     /** com.google.android.gms's fused location service: the bind an app's own
      *  play-services-location (or microG's client) makes on

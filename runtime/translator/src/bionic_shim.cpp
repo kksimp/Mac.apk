@@ -33951,7 +33951,7 @@ extern "C" char* __macapk_arm64___fgets_chk(char* s, int n, FILE* stream,
                                                 size_t /*dst_len*/) {
     return fgets(s, n, stream);
 }
-// Linux eventfd(2) / timerfd(2) over a self-connected UDP loopback socket.
+// Linux eventfd(2) / timerfd(2): originally self-connected UDP loopback sockets.
 //
 // macOS has neither eventfd nor timerfd. The portable single-fd equivalent is
 // a UDP socket bound to 127.0.0.1:ephemeral and then connect()ed to its OWN
@@ -33965,7 +33965,7 @@ extern "C" char* __macapk_arm64___fgets_chk(char* s, int n, FILE* stream,
 // implemented) and aborted. A single fd (vs pipe2's two) is required because
 // the guest read()s, write()s, AND epolls the SAME descriptor.
 //
-// ⚠ CORRECTED 2026-09-28 (the eventfd half; timerfd still uses this socket). This used to go on: "write is unshimmed (-> libSystem)
+// ⚠ CORRECTED 2026-09-28 (eventfd counter mode). This used to go on: "write is unshimmed (-> libSystem)
 // and __macapk_arm64_read forwards, so no read/write interception is needed.
 // Counter-accumulation differs slightly from real eventfd ..., but the only
 // observable effect is an occasional extra spurious wake". Both halves were
@@ -34062,7 +34062,7 @@ static bool macapk_eventfd_is_semaphore(int fd) {
 //
 // The carrier is an AF_UNIX datagram socket bound to a unique $TMPDIR name,
 // connected to ITSELF, then unlinked -- NOT the loopback UDP socket the =0 arm
-// (and timerfd) use. The reason is measured, not taste: a loopback UDP send()
+// used. The reason is measured, not taste: a loopback UDP send()
 // returns BEFORE the datagram reaches the receive queue (it is delivered via
 // the loopback interface's input thread), so a write() followed at once by
 // read() or epoll_wait(0) on the same thread saw NOTHING -- 5479 of 6000
@@ -34254,10 +34254,13 @@ static std::shared_ptr<MacapkEventfd> macapk_efd_lookup(int fd) {
     return nullptr;
 }
 // dup()/dup3()/F_DUPFD: the new fd names the SAME eventfd (the kernel shares one
-// eventfd_ctx), so it shares the counter too.
-static void macapk_efd_dup(int oldfd, int newfd) {
+// eventfd_ctx), so it shares the counter too. Timerfds likewise share their
+// schedule; let both registries observe a successful descriptor copy.
+static void macapk_timerfd_note_dup(int oldfd, int newfd);
+static void macapk_note_fd_dup(int oldfd, int newfd) {
     if (newfd < 0) return;
     if (auto st = macapk_efd_lookup(oldfd)) macapk_efd_register(newfd, std::move(st));
+    macapk_timerfd_note_dup(oldfd, newfd);
 }
 // Carrier reconciliation (review issue 2 of
 // docs/eventfd-counter-and-rw-errno_2026-09-28.md): st.mu held, errno-neutral.
@@ -34544,87 +34547,265 @@ extern "C" int __macapk_arm64_memfd_create(const char* name, unsigned int flags)
     return fd;
 }
 
-// timerfd: same self-socket as the fd the guest epolls/reads; a libdispatch
-// timer source writes an 8-byte expiration count to it when it fires.
+// timerfd: a pollable datagram carrier and one shared schedule per timer.
+// The timer state belongs to the open timer, not to a particular fd alias.
 #ifndef MACAPK_TFD_TIMER_ABSTIME
 #define MACAPK_TFD_TIMER_ABSTIME 1   // Bionic value
 #endif
 struct macapk_itimerspec { struct timespec it_interval; struct timespec it_value; };
-static std::mutex g_timerfd_mu;
-static std::unordered_map<int, dispatch_source_t> g_timerfd_src;
-// fd -> the BIONIC clockid the timer was created with. timerfd_settime's
-// TFD_TIMER_ABSTIME deadline is an absolute point on THAT clock, and
-// CLOCK_REALTIME (epoch seconds, ~1.8e9 today) and CLOCK_MONOTONIC (boot- or,
-// for us, process-relative) are never interchangeable: measuring a realtime
-// deadline against a monotonic "now" arms the timer roughly 56 years out, so
-// the alarm is created and armed successfully and then simply never fires.
-static std::unordered_map<int, int> g_timerfd_clock;
+extern "C++" {
+namespace {
+struct MacapkTimerfd {
+    std::mutex mu;
+    std::string name;       // identity of the carrier shared by fd aliases
+    int notify_fd = -1;     // owned notification endpoint for the timer source
+    int clock_id = 1;       // Bionic clock id
+    dispatch_source_t source = nullptr;
+    uint64_t generation = 0;
+    uint64_t deadline_ns = 0;
+    uint64_t interval_ns = 0;
+    bool armed = false;
+    bool wall_clock = false;
 
-static uint64_t macapk_ts_to_ns(const struct timespec& t) {
-    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+    ~MacapkTimerfd() {
+        if (source) { dispatch_source_cancel(source); dispatch_release(source); }
+        if (notify_fd >= 0) ::close(notify_fd);
+    }
+};
+// As with the eventfd registry, keep these alive during process shutdown.
+std::mutex& timerfd_map_mu() { static auto* m = new std::mutex; return *m; }
+std::unordered_map<int, std::shared_ptr<MacapkTimerfd>>& timerfd_map() {
+    static auto* m = new std::unordered_map<int, std::shared_ptr<MacapkTimerfd>>;
+    return *m;
+}
+std::atomic<size_t> g_timerfd_entries{0};
+}  // namespace
+}  // extern "C++"
+
+static void macapk_timerfd_register_locked(int fd, const std::shared_ptr<MacapkTimerfd>& st) {
+    auto [it, inserted] = timerfd_map().emplace(fd, st);
+    if (!inserted) it->second = st;
+    else g_timerfd_entries.fetch_add(1, std::memory_order_release);
+}
+static void macapk_timerfd_forget_locked(int fd) {
+    if (timerfd_map().erase(fd)) g_timerfd_entries.fetch_sub(1, std::memory_order_release);
+}
+static std::shared_ptr<MacapkTimerfd> macapk_timerfd_lookup(int fd) {
+    if (!g_timerfd_entries.load(std::memory_order_acquire)) return nullptr;
+    std::lock_guard<std::mutex> lk(timerfd_map_mu());
+    auto it = timerfd_map().find(fd);
+    if (it == timerfd_map().end()) return nullptr;
+    if (macapk_efd_is_carrier(fd, it->second->name)) return it->second;
+    macapk_timerfd_forget_locked(fd);
+    return nullptr;
+}
+static void macapk_timerfd_note_dup(int oldfd, int newfd) {
+    if (newfd < 0 || oldfd == newfd || !g_timerfd_entries.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lk(timerfd_map_mu());
+    auto old = timerfd_map().find(oldfd);
+    if (old != timerfd_map().end() && macapk_efd_is_carrier(newfd, old->second->name)) {
+        // Copy before inserting: the map can rehash.
+        auto st = old->second;
+        macapk_timerfd_register_locked(newfd, st);
+    } else {
+        auto replacement = timerfd_map().find(newfd);
+        if (replacement != timerfd_map().end() && !macapk_efd_is_carrier(newfd, replacement->second->name))
+            macapk_timerfd_forget_locked(newfd);
+    }
+}
+static int macapk_close_with_timerfd(int fd) {
+    if (!g_timerfd_entries.load(std::memory_order_acquire)) return ::close(fd);
+    std::shared_ptr<MacapkTimerfd> retire;
+    int r;
+    {
+        std::lock_guard<std::mutex> lk(timerfd_map_mu());
+        auto it = timerfd_map().find(fd);
+        r = ::close(fd);
+        if (r == 0 && it != timerfd_map().end()) {
+            retire = it->second;
+            macapk_timerfd_forget_locked(fd);
+        }
+    }
+    // If this was the last alias, retire the source outside the map lock.
+    return r;
+}
+extern "C" int __macapk_arm64_close(int fd) {
+    return macapk_close_with_timerfd(fd);
 }
 
-extern "C" int __macapk_arm64_timerfd_create(int clockid, int flags) {
-    // TFD_NONBLOCK / TFD_CLOEXEC share the O_* bit values; honor them instead
-    // of forcing both on, so a guest that wants a blocking read() on the timer
-    // fd (wait until it expires) gets one rather than an immediate EAGAIN.
-    int fd = macapk_make_self_socket((flags & kBionicFdNonblock) != 0,
-                                     (flags & kBionicFdCloexec) != 0);
-    if (fd < 0) { errno = ENOSYS; return -1; }
-    { std::lock_guard<std::mutex> lk(g_timerfd_mu);
-      g_timerfd_clock[fd] = clockid; }
+static constexpr uint64_t kTimerNsPerSec = 1000000000ull;
+static bool macapk_timerfd_valid(const struct timespec& t) {
+    return t.tv_sec >= 0 && t.tv_nsec >= 0 && (uint64_t)t.tv_nsec < kTimerNsPerSec;
+}
+static uint64_t macapk_timerfd_ns(const struct timespec& t) {
+    // libdispatch accepts signed nanosecond offsets; saturate oversized times
+    // rather than wrapping into a different deadline.
+    const uint64_t max = INT64_MAX;
+    if ((uint64_t)t.tv_sec > (max - (uint64_t)t.tv_nsec) / kTimerNsPerSec) return max;
+    return (uint64_t)t.tv_sec * kTimerNsPerSec + (uint64_t)t.tv_nsec;
+}
+static uint64_t macapk_timerfd_add_ns(uint64_t a, uint64_t b) {
+    return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+}
+static struct timespec macapk_timerfd_ts(uint64_t ns) {
+    return {static_cast<time_t>(ns / kTimerNsPerSec), static_cast<long>(ns % kTimerNsPerSec)};
+}
+static uint64_t macapk_timerfd_now(const MacapkTimerfd& t) {
+    // dispatch_time is based on mach_absolute_time (uptime). Absolute
+    // realtime timers use dispatch_walltime and must be measured on realtime.
+    return ::clock_gettime_nsec_np(t.wall_clock ? CLOCK_REALTIME : CLOCK_UPTIME_RAW);
+}
+static dispatch_time_t macapk_timerfd_start(const MacapkTimerfd& t) {
+    if (t.wall_clock) {
+        auto target = macapk_timerfd_ts(t.deadline_ns);
+        return dispatch_walltime(&target, 0);
+    }
+    uint64_t now = macapk_timerfd_now(t);
+    uint64_t delta = t.deadline_ns > now ? t.deadline_ns - now : 0;
+    return dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(std::min(delta, (uint64_t)INT64_MAX)));
+}
+static macapk_itimerspec macapk_timerfd_setting_locked(const MacapkTimerfd& t) {
+    uint64_t left = 0;
+    if (t.armed) {
+        uint64_t now = macapk_timerfd_now(t);
+        if (now < t.deadline_ns) left = t.deadline_ns - now;
+        else if (t.interval_ns) left = t.interval_ns - ((now - t.deadline_ns) % t.interval_ns);
+    }
+    return {macapk_timerfd_ts(t.interval_ns), macapk_timerfd_ts(left)};
+}
+static void macapk_timerfd_drain_locked(const MacapkTimerfd& t) {
+    int saved = errno;
+    uint64_t unused;
+    for (;;) {
+        ssize_t n = ::recv(t.notify_fd, &unused, sizeof(unused), MSG_DONTWAIT);
+        if (n >= 0 || errno == EINTR) continue;
+        break;
+    }
+    errno = saved;
+}
+static void macapk_timerfd_schedule_locked(MacapkTimerfd& t) {
+    dispatch_source_set_timer(t.source, macapk_timerfd_start(t), DISPATCH_TIME_FOREVER, 0);
+}
+static void macapk_timerfd_fire(const std::shared_ptr<MacapkTimerfd>& st, uint64_t generation) {
+    std::lock_guard<std::mutex> lk(st->mu);
+    if (st->generation != generation || !st->armed) return;
+    uint64_t now = macapk_timerfd_now(*st);
+    if (now < st->deadline_ns) {
+        // A clock adjustment or early callback: wait for the actual deadline.
+        macapk_timerfd_schedule_locked(*st);
+        return;
+    }
+    uint64_t expirations = 1;
+    if (st->interval_ns) {
+        const uint64_t elapsed = now - st->deadline_ns;
+        expirations = macapk_timerfd_add_ns(expirations, elapsed / st->interval_ns);
+        // Advance on the original cadence, not the callback's arrival time.
+        st->deadline_ns = macapk_timerfd_add_ns(now, st->interval_ns - elapsed % st->interval_ns);
+        macapk_timerfd_schedule_locked(*st);
+    } else {
+        st->armed = false;
+    }
+    // Preserve the existing 8-byte notification carrier. A late callback can
+    // report multiple elapsed periods; queuing/reading separate notifications
+    // remains the previous datagram behavior.
+    (void)::send(st->notify_fd, &expirations, sizeof(expirations), MSG_DONTWAIT);
+}
+
+static int macapk_timerfd_create_host(int clockid, int flags) {
+    auto st = std::make_shared<MacapkTimerfd>();
+    st->clock_id = clockid;
+    int fd = macapk_efd_make_carrier((flags & kBionicFdNonblock) != 0,
+                                     (flags & kBionicFdCloexec) != 0, &st->name);
+    if (fd < 0) return -1;
+    st->notify_fd = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (st->notify_fd < 0) {
+        int saved = errno;
+        ::close(fd);
+        errno = saved;
+        return -1;
+    }
+    std::lock_guard<std::mutex> lk(timerfd_map_mu());
+    macapk_timerfd_register_locked(fd, st);
     return fd;
 }
-extern "C" int __macapk_arm64_timerfd_settime(int fd, int flags,
-        const void* newvalp, void* oldvalp) {
-    if (oldvalp) std::memset(oldvalp, 0, sizeof(macapk_itimerspec));  // we don't report old
-    const macapk_itimerspec* nv = (const macapk_itimerspec*)newvalp;
-    std::lock_guard<std::mutex> lk(g_timerfd_mu);
-    auto it = g_timerfd_src.find(fd);
-    if (it != g_timerfd_src.end()) {
-        dispatch_source_cancel(it->second);
-        dispatch_release(it->second);
-        g_timerfd_src.erase(it);
+static int macapk_timerfd_settime_host(int fd, int flags, const void* newvalp, void* oldvalp) {
+    if (!newvalp) { errno = EFAULT; return -1; }
+    const macapk_itimerspec nv = *static_cast<const macapk_itimerspec*>(newvalp);
+    if (!macapk_timerfd_valid(nv.it_value) || !macapk_timerfd_valid(nv.it_interval)) {
+        errno = EINVAL; return -1;
     }
-    if (!nv || (nv->it_value.tv_sec == 0 && nv->it_value.tv_nsec == 0)) {
-        return 0;  // disarm
+    auto st = macapk_timerfd_lookup(fd);
+    if (!st) { if (::fcntl(fd, F_GETFD) >= 0) errno = EINVAL; return -1; }
+    std::lock_guard<std::mutex> lk(st->mu);
+    uint64_t value_ns = macapk_timerfd_ns(nv.it_value);
+    uint64_t deadline = 0;
+    bool wall_clock = false;
+    dispatch_source_t src = nullptr;
+    if (value_ns) {
+        // The absolute value is expressed on the guest's selected clock.
+        // For non-wall timers translate that clock to dispatch's uptime epoch.
+        wall_clock = (flags & MACAPK_TFD_TIMER_ABSTIME) && (st->clock_id == 0 || st->clock_id == 8);
+        if (wall_clock) {
+            deadline = value_ns;
+        } else if (flags & MACAPK_TFD_TIMER_ABSTIME) {
+            struct timespec now;
+            if (__macapk_arm64_clock_gettime(st->clock_id, &now) != 0) return -1;
+            uint64_t guest_now = macapk_timerfd_ns(now);
+            uint64_t host_now = ::clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            if (value_ns >= guest_now) deadline = macapk_timerfd_add_ns(host_now, value_ns - guest_now);
+            else deadline = host_now - std::min(host_now, guest_now - value_ns);
+        } else {
+            deadline = macapk_timerfd_add_ns(::clock_gettime_nsec_np(CLOCK_UPTIME_RAW), value_ns);
+        }
+        src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                     dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0));
+        if (!src) { errno = ENOMEM; return -1; }
     }
-    uint64_t interval_ns = macapk_ts_to_ns(nv->it_interval);
-    dispatch_time_t start;
-    if (flags & MACAPK_TFD_TIMER_ABSTIME) {
-        // it_value is an absolute time on the clock the fd was CREATED with;
-        // convert to a delta measured against that same clock. Going through
-        // __macapk_arm64_clock_gettime (rather than the host clock_gettime)
-        // matters twice over: it picks CLOCK_REALTIME vs CLOCK_MONOTONIC by the
-        // guest's own clockid, and its CLOCK_MONOTONIC is the REBASED,
-        // process-relative epoch the guest itself reads -- which is the epoch a
-        // guest-computed monotonic deadline is expressed in.
-        int cid = 1;   // CLOCK_MONOTONIC, the timerfd default in practice
-        { auto cit = g_timerfd_clock.find(fd);
-          if (cit != g_timerfd_clock.end()) cid = cit->second; }
-        struct timespec now;
-        __macapk_arm64_clock_gettime(cid, &now);
-        uint64_t target = macapk_ts_to_ns(nv->it_value);
-        uint64_t now_ns = macapk_ts_to_ns(now);
-        uint64_t delta = target > now_ns ? (target - now_ns) : 0;
-        start = dispatch_time(DISPATCH_TIME_NOW, (int64_t)delta);
-    } else {
-        start = dispatch_time(DISPATCH_TIME_NOW, (int64_t)macapk_ts_to_ns(nv->it_value));
+    // Capture old settings before changing the state. Copying nv above also
+    // supports callers using the same structure for input and old settings.
+    const macapk_itimerspec old = macapk_timerfd_setting_locked(*st);
+    ++st->generation;
+    if (st->source) { dispatch_source_cancel(st->source); dispatch_release(st->source); }
+    st->source = src;
+    macapk_timerfd_drain_locked(*st);       // reset unread notifications on settime
+    st->interval_ns = macapk_timerfd_ns(nv.it_interval);
+    st->deadline_ns = deadline;
+    st->wall_clock = wall_clock;
+    st->armed = value_ns != 0;
+    if (src) {
+        std::weak_ptr<MacapkTimerfd> weak = st;
+        const uint64_t generation = st->generation;
+        dispatch_source_set_event_handler(src, ^{
+            if (auto state = weak.lock()) macapk_timerfd_fire(state, generation);
+        });
+        macapk_timerfd_schedule_locked(*st);
+        dispatch_resume(src);
     }
-    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0);
-    dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-    dispatch_source_set_timer(src, start,
-        interval_ns ? interval_ns : DISPATCH_TIME_FOREVER, 0);
-    dispatch_source_set_event_handler(src, ^{
-        uint64_t one = 1; (void)::write(fd, &one, sizeof(one));
-    });
-    dispatch_resume(src);
-    g_timerfd_src[fd] = src;
+    if (oldvalp) *static_cast<macapk_itimerspec*>(oldvalp) = old;
     return 0;
 }
-extern "C" int __macapk_arm64_timerfd_gettime(int /*fd*/, void* curr) {
-    if (curr) std::memset(curr, 0, sizeof(macapk_itimerspec));
+static int macapk_timerfd_gettime_host(int fd, void* curr) {
+    if (!curr) { errno = EFAULT; return -1; }
+    auto st = macapk_timerfd_lookup(fd);
+    if (!st) { if (::fcntl(fd, F_GETFD) >= 0) errno = EINVAL; return -1; }
+    std::lock_guard<std::mutex> lk(st->mu);
+    *static_cast<macapk_itimerspec*>(curr) = macapk_timerfd_setting_locked(*st);
     return 0;
+}
+extern "C" int __macapk_arm64_timerfd_create(int clockid, int flags) {
+    int r = macapk_timerfd_create_host(clockid, flags);
+    if (r < 0) errno = errno_mac2lin(errno);
+    return r;
+}
+extern "C" int __macapk_arm64_timerfd_settime(int fd, int flags, const void* newvalp, void* oldvalp) {
+    int r = macapk_timerfd_settime_host(fd, flags, newvalp, oldvalp);
+    if (r < 0) errno = errno_mac2lin(errno);
+    return r;
+}
+extern "C" int __macapk_arm64_timerfd_gettime(int fd, void* curr) {
+    int r = macapk_timerfd_gettime_host(fd, curr);
+    if (r < 0) errno = errno_mac2lin(errno);
+    return r;
 }
 
 // pread64: Bionic's 64-bit-offset positional read. On arm64-darwin off_t is
@@ -44929,7 +45110,7 @@ static short macapk_mac_to_lin_locktype(short lt) {
 extern "C" int __macapk_arm64_fcntl(int fd, int cmd, void* arg) {
     switch (cmd) {
         case 0: { int r = ::fcntl(fd, F_DUPFD, (int)(intptr_t)arg);        // F_DUPFD
-                  macapk_efd_dup(fd, r); return r; }
+                  macapk_note_fd_dup(fd, r); return r; }
         case 1: return ::fcntl(fd, F_GETFD);                               // F_GETFD
         case 2: return ::fcntl(fd, F_SETFD, (int)(intptr_t)arg);           // F_SETFD
         case 3: { int r = ::fcntl(fd, F_GETFL);                            // F_GETFL
@@ -44939,7 +45120,7 @@ extern "C" int __macapk_arm64_fcntl(int fd, int cmd, void* arg) {
         case 8: return ::fcntl(fd, F_SETOWN, (int)(intptr_t)arg);          // Linux F_SETOWN(8)
         case 9: return ::fcntl(fd, F_GETOWN);                              // Linux F_GETOWN(9)
         case 1030: { int r = ::fcntl(fd, F_DUPFD_CLOEXEC, (int)(intptr_t)arg); // F_DUPFD_CLOEXEC
-                     macapk_efd_dup(fd, r); return r; }
+                     macapk_note_fd_dup(fd, r); return r; }
         case 5: case 6: case 7: {                                          // F_GETLK/SETLK/SETLKW
             if (!arg) { errno = EFAULT; return -1; }
             macapk_bionic_flock* lf = (macapk_bionic_flock*)arg;
@@ -48978,7 +49159,7 @@ extern "C" uint64_t __macapk_logcap_rotations(void) {
 // there was no __macapk_arm64_dup / __macapk_arm64_dup2 at all: the Stage-6
 // loader's by-name resolver fell through to libSystem's real dup()/dup2(),
 // which duplicates the fd correctly at the KERNEL level but never calls
-// macapk_efd_dup, so an eventfd alias made this way was NOT registered in
+// macapk_note_fd_dup, so an eventfd alias made this way was NOT registered in
 // efd_map and every access through it fell back to a raw ::read/::write on
 // the carrier instead of the counter (review issue 1 of
 // docs/eventfd-counter-and-rw-errno_2026-09-28.md; dup3/F_DUPFD already did
@@ -48986,7 +49167,7 @@ extern "C" uint64_t __macapk_logcap_rotations(void) {
 extern "C" int __macapk_arm64_dup(int oldfd) {
     const int r = ::dup(oldfd);
     if (r < 0) return -1;             // errno set by dup(); face translates it
-    macapk_efd_dup(oldfd, r);
+    macapk_note_fd_dup(oldfd, r);
     return r;
 }
 extern "C" int __macapk_arm64_dup2(int oldfd, int newfd) {
@@ -48997,7 +49178,7 @@ extern "C" int __macapk_arm64_dup2(int oldfd, int newfd) {
     macapk_liblog_note_fd_replace(newfd);
     const int r = ::dup2(oldfd, newfd);
     if (r < 0) return -1;
-    macapk_efd_dup(oldfd, r);
+    macapk_note_fd_dup(oldfd, r);
     return r;
 }
 // int dup3(int oldfd, int newfd, int flags) -- macOS has no dup3(); emulate with dup2 + O_CLOEXEC.
@@ -49010,7 +49191,7 @@ extern "C" int __macapk_arm64_dup3(int oldfd, int newfd, int flags) {
     macapk_liblog_note_fd_replace(newfd);                     // liblog keeps the real stderr
     if (::dup2(oldfd, newfd) < 0) return -1;                  // errno set by dup2
     if (flags & 0x80000) ::fcntl(newfd, F_SETFD, FD_CLOEXEC); // O_CLOEXEC (Bionic arm64 = 0x80000)
-    macapk_efd_dup(oldfd, newfd);                             // an eventfd alias shares the counter
+    macapk_note_fd_dup(oldfd, newfd);                             // an eventfd alias shares the counter
     return newfd;
 }
 
@@ -50260,7 +50441,7 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         // and cannot close it leaks an fd every iteration, and one that cannot
         // seek reads the wrong bytes, so neither is a tolerable -ENOSYS.
         case 57:  __macapk_arm64_forget_dirfd((int)a1);  // drop any DIR* we opened behind it
-                  return (long)::close((int)a1);  // close: no Bionic/Darwin ABI delta
+                  return (long)macapk_close_with_timerfd((int)a1);
         case 61:  return __macapk_arm64_getdents64((int)a1, (void*)macapk_untag_ptr((void*)a2), (size_t)a3);  // getdents64
         // 172/173/174/175/176/177 were NOT wired, so a guest using the RAW svc path (which
         // pairip does deliberately, to dodge libc hooks) got -1 from getpid() -- a value no
@@ -50359,19 +50540,15 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         // sites and NOT ONE of them is 85/86/87, so routing them here is the
         // complete fix for this family rather than half of one.
         //
-        // The implementations are the existing self-socket-backed timerfds
-        // (see __macapk_arm64_timerfd_create); they honour TFD_NONBLOCK /
-        // TFD_CLOEXEC and keep the per-fd clockid that TFD_TIMER_ABSTIME needs.
-        // They already report failure the libc way (return -1 with errno set),
-        // which is the convention this function returns to its caller, so their
-        // result passes straight through.
+        // The host-errno cores share the same timer schedule with the named
+        // libc shims. The raw syscall face handles errno translation once.
         case 85:   // timerfd_create(clockid, flags)
-            return __macapk_arm64_timerfd_create((int)a1, (int)a2);
+            return macapk_timerfd_create_host((int)a1, (int)a2);
         case 86:   // timerfd_settime(fd, flags, new_value, old_value)
-            return __macapk_arm64_timerfd_settime((int)a1, (int)a2,
-                                                  (const void*)a3, (void*)macapk_untag_ptr((void*)a4));
+            return macapk_timerfd_settime_host((int)a1, (int)a2,
+                                               (const void*)a3, (void*)macapk_untag_ptr((void*)a4));
         case 87:   // timerfd_gettime(fd, curr_value)
-            return __macapk_arm64_timerfd_gettime((int)a1, (void*)macapk_untag_ptr((void*)a2));
+            return macapk_timerfd_gettime_host((int)a1, (void*)macapk_untag_ptr((void*)a2));
         default:
             return macapk_router_unimplemented(number, __builtin_return_address(0));
     }
@@ -52089,7 +52266,7 @@ uint32_t __macapk_shim_lseek(uint32_t fd, uint32_t offset,
 }
 
 uint32_t __macapk_shim_close(uint32_t fd, uint32_t, uint32_t, uint32_t) {
-    return static_cast<uint32_t>(::close(static_cast<int>(fd)));
+    return static_cast<uint32_t>(macapk_close_with_timerfd(static_cast<int>(fd)));
 }
 
 // pipe(fds[2]) -- 2026-07-28, lane A's parity audit rank #1: the PROVEN
@@ -52272,7 +52449,7 @@ uint32_t __macapk_shim_sched_getscheduler(uint32_t pid, uint32_t, uint32_t,
     return static_cast<uint32_t>(
         __macapk_arm64_sched_getscheduler(static_cast<pid_t>(pid)));
 }
-// No pointer args at all (the eventfd/timerfd UDP-loopback emulation is
+// No pointer args at all (the eventfd/timerfd socket emulation is
 // entirely fd-based) -- a pure passthrough.
 uint32_t __macapk_shim_eventfd(uint32_t initval, uint32_t flags, uint32_t,
                                   uint32_t) {
@@ -52850,7 +53027,7 @@ uint32_t __macapk_shim_fcntl(uint32_t ufd, uint32_t ucmd, uint32_t arg,
     const int iarg = static_cast<int>(arg);
     switch (cmd) {
         case 0: { int r = ::fcntl(fd, F_DUPFD, iarg);                      // F_DUPFD
-                  macapk_efd_dup(fd, r); return static_cast<uint32_t>(r); }
+                  macapk_note_fd_dup(fd, r); return static_cast<uint32_t>(r); }
         case 1: return static_cast<uint32_t>(::fcntl(fd, F_GETFD));        // F_GETFD
         case 2: return static_cast<uint32_t>(::fcntl(fd, F_SETFD, iarg));  // F_SETFD
         case 3: { int r = ::fcntl(fd, F_GETFL);                            // F_GETFL
@@ -52861,7 +53038,7 @@ uint32_t __macapk_shim_fcntl(uint32_t ufd, uint32_t ucmd, uint32_t arg,
         case 8: return static_cast<uint32_t>(::fcntl(fd, F_SETOWN, iarg)); // F_SETOWN
         case 9: return static_cast<uint32_t>(::fcntl(fd, F_GETOWN));       // F_GETOWN
         case 1030: { int r = ::fcntl(fd, F_DUPFD_CLOEXEC, iarg);           // F_DUPFD_CLOEXEC
-                     macapk_efd_dup(fd, r); return static_cast<uint32_t>(r); }
+                     macapk_note_fd_dup(fd, r); return static_cast<uint32_t>(r); }
         case 5: case 6: case 7:                                            // struct flock
         case 12: case 13: case 14: {                                       // struct flock64
             if (!arg) { errno = EFAULT; return static_cast<uint32_t>(-1); }

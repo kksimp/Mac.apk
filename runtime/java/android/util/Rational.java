@@ -29,13 +29,22 @@ public final class Rational extends Number implements Comparable<Rational> {
         } else if (numerator == 0) {
             mNumerator = 0; mDenominator = 1;          // canonical zero
         } else {
-            int g = gcd(Math.abs(numerator), Math.abs(denominator));
+            int g = gcd(numerator, denominator);
             mNumerator = numerator / g;
             mDenominator = denominator / g;
         }
     }
 
-    private static int gcd(int a, int b) { while (b != 0) { int t = b; b = a % b; a = t; } return a == 0 ? 1 : a; }
+    private static int gcd(int a, int b) {
+        while (b != 0) {
+            int t = b;
+            b = a % b;
+            a = t;
+        }
+        // Normalize the gcd at the end. Taking abs before Euclid's loop does
+        // not make Integer.MIN_VALUE positive and can leave a negative gcd.
+        return Math.abs(a);
+    }
 
     public int getNumerator()   { return mNumerator; }
     public int getDenominator() { return mDenominator; }
@@ -45,14 +54,24 @@ public final class Rational extends Number implements Comparable<Rational> {
     public boolean isFinite()   { return mDenominator != 0; }
     public boolean isZero()     { return isFinite() && mNumerator == 0; }
 
-    @Override public float floatValue()   { return (float) doubleValue(); }
+    @Override public float floatValue()   { return (float) mNumerator / (float) mDenominator; }
     @Override public double doubleValue()  {
         if (isNaN()) return Double.NaN;
         if (isInfinite()) return mNumerator > 0 ? Double.POSITIVE_INFINITY : Double.NEGATIVE_INFINITY;
         return (double) mNumerator / (double) mDenominator;
     }
-    @Override public int intValue()  { return mDenominator == 0 ? 0 : mNumerator / mDenominator; }
-    @Override public long longValue(){ return mDenominator == 0 ? 0L : (long) mNumerator / mDenominator; }
+    @Override public int intValue() {
+        if (mDenominator != 0) return mNumerator / mDenominator;
+        if (mNumerator > 0) return Integer.MAX_VALUE;
+        if (mNumerator < 0) return Integer.MIN_VALUE;
+        return 0;
+    }
+    @Override public long longValue() {
+        if (mDenominator != 0) return (long) mNumerator / mDenominator;
+        if (mNumerator > 0) return Long.MAX_VALUE;
+        if (mNumerator < 0) return Long.MIN_VALUE;
+        return 0L;
+    }
     @Override public short shortValue() { return (short) intValue(); }
     @Override public byte byteValue()   { return (byte) intValue(); }
 
@@ -69,10 +88,17 @@ public final class Rational extends Number implements Comparable<Rational> {
     }
 
     @Override public int compareTo(Rational another) {
+        if (another == null) throw new NullPointerException("another must not be null");
         if (equals(another)) return 0;
         if (isNaN()) return 1;
         if (another.isNaN()) return -1;
-        return Double.compare(doubleValue(), another.doubleValue());
+        if (isInfinite()) return mNumerator > 0 ? 1 : -1;
+        if (another.isInfinite()) return another.mNumerator > 0 ? -1 : 1;
+        // Two int products fit in a long. Compare them directly rather than
+        // rounding both rational values to doubles or subtracting the products.
+        long left = (long) mNumerator * another.mDenominator;
+        long right = (long) another.mNumerator * mDenominator;
+        return Long.compare(left, right);
     }
 
     @Override public String toString() {
@@ -82,11 +108,12 @@ public final class Rational extends Number implements Comparable<Rational> {
     }
 
     public static Rational parseRational(String string) throws NumberFormatException {
-        if (string == null) throw new NumberFormatException("String must not be null");
+        if (string == null) throw new NullPointerException("string must not be null");
         if (string.equals("NaN")) return NaN;
         if (string.equals("Infinity")) return POSITIVE_INFINITY;
         if (string.equals("-Infinity")) return NEGATIVE_INFINITY;
-        int sep = string.indexOf('/');
+        int sep = string.indexOf(':');
+        if (sep < 0) sep = string.indexOf('/');
         if (sep < 0) throw new NumberFormatException("Invalid Rational: \"" + string + "\"");
         try {
             int n = Integer.parseInt(string.substring(0, sep));

@@ -3,6 +3,7 @@ typedef unsigned long u64;
 typedef struct { long sec, nsec; } timespec_;
 typedef struct { timespec_ interval, value; } itimerspec_;
 typedef struct { int fd; short events, revents; } pollfd_;
+typedef struct { void* base; unsigned long length; } iovec_;
 enum { REALTIME_ID=0, MONOTONIC_ID=1, NONBLOCK=0x800, CLOEXEC=0x80000,
        ABSTIME=1, POLL_IN=1, F_DUPFD_CLOEXEC_LINUX=1030 };
 extern int timerfd_create(int,int);
@@ -12,6 +13,9 @@ extern int clock_gettime(int,timespec_*);
 extern int nanosleep(const timespec_*,timespec_*);
 extern int poll(pollfd_*,unsigned long,int);
 extern long read(int,void*,unsigned long);
+extern long readv(int,const iovec_*,int);
+extern long write(int,const void*,unsigned long);
+extern int socketpair(int,int,int,int[2]);
 extern int close(int);
 extern int dup(int);
 extern int dup2(int,int);
@@ -178,12 +182,110 @@ finish:
     if (syscall(57L,(long)fd,0L,0L,0L,0L,0L) && !rc) rc=114;
     return rc;
 }
-static int close_long_timer(void) {
+static long read_count(int fd,u64* count,int mode) {
+    if (mode==1) {
+        iovec_ iov[2]={{(char*)count,4},{(char*)count+4,4}};
+        return readv(fd,iov,2);
+    }
+    if (mode==2) return syscall(63L,(long)fd,count,8L,0L,0L,0L);
+    return read(fd,count,sizeof(*count));
+}
+static int periodic_accumulation(int mode) {
+    int fd=timerfd_create(MONOTONIC_ID,NONBLOCK|CLOEXEC), rc=0;
+    if (fd<0) return 120;
+    const itimerspec_ arm={{0,40000000L},{0,30000000L}};
+    u64 count=0;
+    if (timerfd_settime(fd,0,&arm,0)) { rc=121; goto finish; }
+    sleep_ms(190);
+    if (ready(fd,500)!=1 || read_count(fd,&count,mode)!=sizeof(count) || count<3) { rc=122; goto finish; }
+    // There may be a new expiration, but the previous accumulation is consumed.
+    count=0;
+    long result=read_count(fd,&count,mode);
+    if (result==-1) { if (*__errno()!=11) rc=123; }
+    else if (result!=sizeof(count) || count>2 || !count) rc=124;
+finish: done(fd); return rc;
+}
+static int blocking_vector_wakeup(void) {
+    int fd=timerfd_create(MONOTONIC_ID,CLOEXEC), rc=0;
+    if (fd<0) return 130;
+    const itimerspec_ arm={{0,0},{0,40000000L}};
+    u64 count=0;
+    if (timerfd_settime(fd,0,&arm,0)) { rc=131; goto finish; }
+    if (read_count(fd,&count,1)!=sizeof(count) || count!=1 || ready(fd,0)!=0) rc=132;
+finish: done(fd); return rc;
+}
+static int short_scalar_read(void) {
+    int fd=timerfd_create(MONOTONIC_ID,NONBLOCK|CLOEXEC), rc=0;
+    if (fd<0) return 140;
+    const itimerspec_ arm={{0,0},{0,40000000L}};
+    unsigned int small=0;
+    u64 count=0;
+    if (timerfd_settime(fd,0,&arm,0) || ready(fd,1000)!=1) { rc=141; goto finish; }
+    if (read(fd,&small,sizeof(small))!=-1 || *__errno()!=22) { rc=142; goto finish; }
+    if (read(fd,&count,sizeof(count))!=sizeof(count) || count!=1 || ready(fd,0)!=0) rc=143;
+finish: done(fd); return rc;
+}
+static int short_vector_read(void) {
+    int fd=timerfd_create(MONOTONIC_ID,NONBLOCK|CLOEXEC), rc=0;
+    if (fd<0) return 150;
+    const itimerspec_ arm={{0,0},{0,40000000L}};
+    unsigned int small=0x12345678u;
+    iovec_ iov={&small,sizeof(small)};
+    u64 count=0;
+    if (readv(fd,&iov,1)!=-1 || *__errno()!=22 || small!=0x12345678u) { rc=150; goto finish; }
+    if (timerfd_settime(fd,0,&arm,0) || ready(fd,1000)!=1) { rc=151; goto finish; }
+    if (readv(fd,&iov,1)!=-1 || *__errno()!=22 || small!=0x12345678u) { rc=152; goto finish; }
+    if (read_count(fd,&count,1)!=sizeof(count) || count!=1 || ready(fd,0)!=0) rc=153;
+finish: done(fd); return rc;
+}
+static int periodic_count_alias(void) {
+    int fd=timerfd_create(MONOTONIC_ID,NONBLOCK|CLOEXEC), alias=-1, rc=0;
+    if (fd<0) return 160;
+    const itimerspec_ arm={{0,40000000L},{0,30000000L}};
+    u64 count=0;
+    alias=dup(fd);
+    if (alias<0 || timerfd_settime(fd,0,&arm,0)) { rc=161; goto finish; }
+    sleep_ms(190);
+    if (ready(alias,500)!=1 || read(alias,&count,sizeof(count))!=sizeof(count) || count<3) { rc=162; goto finish; }
+    if (timerfd_settime(fd,0,&clear,0) || ready(fd,0)!=0 || ready(alias,0)!=0) rc=163;
+finish: done(fd); done(alias); return rc;
+}
+static int absolute_past_count(int clock_id) {
+    int fd=timerfd_create(clock_id,NONBLOCK|CLOEXEC), rc=0;
+    if (fd<0) return 170;
+    itimerspec_ arm={{0,50000000L},{0,0}};
+    if (clock_gettime(clock_id,&arm.value)) { rc=171; goto finish; }
+    if (arm.value.sec==0 && arm.value.nsec<=200000000L) {
+        sleep_ms(250);
+        if (clock_gettime(clock_id,&arm.value)) { rc=172; goto finish; }
+    }
+    arm.value.nsec-=200000000L;
+    if (arm.value.nsec<0) { --arm.value.sec; arm.value.nsec+=1000000000L; }
+    u64 count=0;
+    if (timerfd_settime(fd,ABSTIME,&arm,0) || ready(fd,1000)!=1 ||
+        read(fd,&count,sizeof(count))!=sizeof(count) || count<4) rc=173;
+finish: done(fd); return rc;
+}
+static int ordinary_io_with_timer(void) {
+    int fd=timerfd_create(MONOTONIC_ID,NONBLOCK|CLOEXEC), pair[2]={-1,-1}, rc=0;
+    if (fd<0) return 180;
+    const itimerspec_ arm={{0,0},{2,0}};
+    const u64 pattern=0x123456789abcdef0UL;
+    u64 value=0;
+    if (timerfd_settime(fd,0,&arm,0) || socketpair(1,1,0,pair)) { rc=181; goto finish; }
+    if (write(pair[0],&pattern,sizeof(pattern))!=sizeof(pattern) ||
+        read_count(pair[1],&value,1)!=sizeof(value) || value!=pattern) { rc=182; goto finish; }
+    value=0;
+    if (write(pair[0],&pattern,sizeof(pattern))!=sizeof(pattern) ||
+        read(pair[1],&value,sizeof(value))!=sizeof(value) || value!=pattern) rc=183;
+finish: done(fd); if (pair[0]>=0) close(pair[0]); if (pair[1]>=0) close(pair[1]); return rc;
+}
+static int close_long_timer(int use_syscall) {
     int fd=timerfd_create(MONOTONIC_ID,NONBLOCK|CLOEXEC);
     if (fd<0) return 80;
     const itimerspec_ arm={{0,0},{120,0}};
     if (timerfd_settime(fd,0,&arm,0)) { done(fd); return 81; }
-    if (close(fd)) return 82;
+    if (use_syscall ? syscall(57L,(long)fd,0L,0L,0L,0L,0L) : close(fd)) return 82;
     return 0;
 }
 static int disarmed_interval(void) {
@@ -213,7 +315,18 @@ __attribute__((visibility("default"))) int fixture_timer(int kind) {
         case 12: return independent_timers();
         case 13: return periodic_repeated_wakeup();
         case 14: return syscall_state();
-        case 15: return close_long_timer();
+        case 15: return periodic_accumulation(0);
+        case 16: return periodic_accumulation(1);
+        case 17: return periodic_accumulation(2);
+        case 18: return blocking_vector_wakeup();
+        case 19: return short_scalar_read();
+        case 20: return short_vector_read();
+        case 21: return periodic_count_alias();
+        case 22: return absolute_past_count(MONOTONIC_ID);
+        case 23: return absolute_past_count(REALTIME_ID);
+        case 24: return ordinary_io_with_timer();
+        case 25: return close_long_timer(0);
+        case 26: return close_long_timer(1);
         default: return 99;
     }
 }

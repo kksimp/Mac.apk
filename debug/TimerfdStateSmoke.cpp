@@ -18,9 +18,13 @@ int main(int argc, char** argv) {
     const char* names[] = {"relative countdown and old settings", "periodic state and wakeup",
         "blocking one-shot wakeup", "rearm clears pending expirations", "monotonic absolute time",
         "realtime absolute time", "dup aliases share state", "fcntl aliases share state", "disarm retains interval", "same input and old settings storage", "dup2 aliases share state", "dup3 aliases share state",
-        "independent timers", "repeated periodic wakeup", "named and syscall timer state"};
+        "independent timers", "repeated periodic wakeup", "named and syscall timer state",
+        "periodic count accumulation (read)", "periodic count accumulation (readv)",
+        "periodic count accumulation (syscall read)", "blocking vector wakeup", "short scalar read retains count",
+        "short vector read retains count", "periodic counts shared by aliases", "past monotonic deadline counts",
+        "past realtime deadline counts", "ordinary socket I/O with active timer"};
     int failed=0;
-    for (int i=0; i<15; ++i) {
+    for (int i=0; i<25; ++i) {
         int result=0;
         for (int round=0; round<5 && !result; ++round) result=test(i);
         if (result) { std::fprintf(stderr,"FAIL %s code=%d\n", names[i], result); ++failed; }
@@ -31,7 +35,7 @@ int main(int argc, char** argv) {
     // waiting for the timer to expire. All runtime initialization is complete.
     const int before=fd_count();
     int close_result=0;
-    for (int i=0; i<30 && !close_result; ++i) close_result=test(15);
+    for (int i=0; i<30 && !close_result; ++i) close_result=test(25+(i%2));
     const int after=fd_count();
     if (close_result || after!=before) {
         std::fprintf(stderr,"FAIL active timer close resources code=%d before=%d after=%d\n",close_result,before,after);

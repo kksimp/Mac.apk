@@ -27612,8 +27612,9 @@ extern "C" ssize_t __macapk_arm64_recvmsg(int fd, void* lmsg_raw, int flags) {
     return rc;
 }
 
+static ssize_t macapk_timerfd_readv_or_host(int fd, const struct iovec* iov, int cnt);
 extern "C" ssize_t __macapk_arm64_readv(int fd, const struct iovec* iov, int cnt) {
-    ssize_t rc = ::readv(fd, iov, cnt);
+    ssize_t rc = macapk_timerfd_readv_or_host(fd, iov, cnt);
     int e = errno;
     if (net_trace_on() && g_net_trace_n.fetch_add(1) < net_trace_cap()) {
         int st = 0; socklen_t sl = sizeof st;
@@ -34440,9 +34441,10 @@ static int macapk_eventfd_create_host(unsigned int initval, int flags) {
 }
 // The read/write cores every face shares (host errno): an eventfd goes to the
 // counter, anything else to libSystem.
+static ssize_t macapk_timerfd_read_or_host(int fd, void* buf, size_t n);
 static ssize_t macapk_read_host(int fd, void* buf, size_t n) {
     if (auto st = macapk_efd_lookup(fd)) return macapk_efd_read_host(fd, *st, buf, n);
-    return ::read(fd, buf, n);
+    return macapk_timerfd_read_or_host(fd, buf, n);
 }
 static ssize_t macapk_write_host(int fd, const void* buf, size_t n) {
     if (auto st = macapk_efd_lookup(fd)) return macapk_efd_write_host(fd, *st, buf, n);
@@ -34578,20 +34580,31 @@ std::unordered_map<int, std::shared_ptr<MacapkTimerfd>>& timerfd_map() {
     static auto* m = new std::unordered_map<int, std::shared_ptr<MacapkTimerfd>>;
     return *m;
 }
-std::atomic<size_t> g_timerfd_entries{0};
+// Ordinary file reads must stay on the fast path even while timers are active.
+std::atomic<uint64_t> g_timerfd_bits[kEfdBitmapFds / 64];
+std::atomic<int> g_timerfd_high{0};
+inline bool timerfd_maybe(int fd) {
+    if (fd < 0) return false;
+    if (fd < kEfdBitmapFds)
+        return (g_timerfd_bits[fd >> 6].load(std::memory_order_acquire) >> (fd & 63)) & 1u;
+    return g_timerfd_high.load(std::memory_order_acquire) > 0;
+}
 }  // namespace
 }  // extern "C++"
 
 static void macapk_timerfd_register_locked(int fd, const std::shared_ptr<MacapkTimerfd>& st) {
     auto [it, inserted] = timerfd_map().emplace(fd, st);
-    if (!inserted) it->second = st;
-    else g_timerfd_entries.fetch_add(1, std::memory_order_release);
+    if (!inserted) { it->second = st; return; }
+    if (fd < kEfdBitmapFds) g_timerfd_bits[fd >> 6].fetch_or(1ull << (fd & 63), std::memory_order_release);
+    else g_timerfd_high.fetch_add(1, std::memory_order_release);
 }
 static void macapk_timerfd_forget_locked(int fd) {
-    if (timerfd_map().erase(fd)) g_timerfd_entries.fetch_sub(1, std::memory_order_release);
+    if (!timerfd_map().erase(fd)) return;
+    if (fd < kEfdBitmapFds) g_timerfd_bits[fd >> 6].fetch_and(~(1ull << (fd & 63)), std::memory_order_release);
+    else g_timerfd_high.fetch_sub(1, std::memory_order_release);
 }
 static std::shared_ptr<MacapkTimerfd> macapk_timerfd_lookup(int fd) {
-    if (!g_timerfd_entries.load(std::memory_order_acquire)) return nullptr;
+    if (!timerfd_maybe(fd)) return nullptr;
     std::lock_guard<std::mutex> lk(timerfd_map_mu());
     auto it = timerfd_map().find(fd);
     if (it == timerfd_map().end()) return nullptr;
@@ -34600,7 +34613,7 @@ static std::shared_ptr<MacapkTimerfd> macapk_timerfd_lookup(int fd) {
     return nullptr;
 }
 static void macapk_timerfd_note_dup(int oldfd, int newfd) {
-    if (newfd < 0 || oldfd == newfd || !g_timerfd_entries.load(std::memory_order_acquire)) return;
+    if (newfd < 0 || oldfd == newfd || (!timerfd_maybe(oldfd) && !timerfd_maybe(newfd))) return;
     std::lock_guard<std::mutex> lk(timerfd_map_mu());
     auto old = timerfd_map().find(oldfd);
     if (old != timerfd_map().end() && macapk_efd_is_carrier(newfd, old->second->name)) {
@@ -34614,7 +34627,7 @@ static void macapk_timerfd_note_dup(int oldfd, int newfd) {
     }
 }
 static int macapk_close_with_timerfd(int fd) {
-    if (!g_timerfd_entries.load(std::memory_order_acquire)) return ::close(fd);
+    if (!timerfd_maybe(fd)) return ::close(fd);
     std::shared_ptr<MacapkTimerfd> retire;
     int r;
     {
@@ -34644,7 +34657,7 @@ static uint64_t macapk_timerfd_ns(const struct timespec& t) {
     if ((uint64_t)t.tv_sec > (max - (uint64_t)t.tv_nsec) / kTimerNsPerSec) return max;
     return (uint64_t)t.tv_sec * kTimerNsPerSec + (uint64_t)t.tv_nsec;
 }
-static uint64_t macapk_timerfd_add_ns(uint64_t a, uint64_t b) {
+static uint64_t macapk_timerfd_saturating_add(uint64_t a, uint64_t b) {
     return a > UINT64_MAX - b ? UINT64_MAX : a + b;
 }
 static struct timespec macapk_timerfd_ts(uint64_t ns) {
@@ -34673,42 +34686,110 @@ static macapk_itimerspec macapk_timerfd_setting_locked(const MacapkTimerfd& t) {
     }
     return {macapk_timerfd_ts(t.interval_ns), macapk_timerfd_ts(left)};
 }
-static void macapk_timerfd_drain_locked(const MacapkTimerfd& t) {
+// The kernel carrier holds one pending uint64_t count. The timer source and
+// named read/readv paths serialize the short drain-and-repost operation.
+static uint64_t macapk_timerfd_take_pending_locked(const MacapkTimerfd& t) {
     int saved = errno;
-    uint64_t unused;
+    uint64_t count = 0;
     for (;;) {
-        ssize_t n = ::recv(t.notify_fd, &unused, sizeof(unused), MSG_DONTWAIT);
+        uint64_t item = 0;
+        ssize_t n = ::recv(t.notify_fd, &item, sizeof(item), MSG_DONTWAIT);
+        if (n == static_cast<ssize_t>(sizeof(item))) { count = macapk_timerfd_saturating_add(count, item); continue; }
         if (n >= 0 || errno == EINTR) continue;
         break;
     }
+    errno = saved;
+    return count;
+}
+static void macapk_timerfd_post_locked(const MacapkTimerfd& t, uint64_t count) {
+    int saved = errno;
+    while (::send(t.notify_fd, &count, sizeof(count), MSG_DONTWAIT) < 0 && errno == EINTR) {}
     errno = saved;
 }
 static void macapk_timerfd_schedule_locked(MacapkTimerfd& t) {
     dispatch_source_set_timer(t.source, macapk_timerfd_start(t), DISPATCH_TIME_FOREVER, 0);
 }
+static bool macapk_timerfd_collect_locked(MacapkTimerfd& t, uint64_t now) {
+    if (!t.armed || now < t.deadline_ns) return false;
+    uint64_t expirations = 1;
+    if (t.interval_ns) {
+        const uint64_t elapsed = now - t.deadline_ns;
+        expirations = macapk_timerfd_saturating_add(expirations, elapsed / t.interval_ns);
+        // Advance on the original cadence, not the callback's arrival time.
+        t.deadline_ns = macapk_timerfd_saturating_add(now, t.interval_ns - elapsed % t.interval_ns);
+        macapk_timerfd_schedule_locked(t);
+    } else {
+        t.armed = false;
+    }
+    uint64_t pending = macapk_timerfd_take_pending_locked(t);
+    macapk_timerfd_post_locked(t, macapk_timerfd_saturating_add(pending, expirations));
+    return true;
+}
 static void macapk_timerfd_fire(const std::shared_ptr<MacapkTimerfd>& st, uint64_t generation) {
     std::lock_guard<std::mutex> lk(st->mu);
     if (st->generation != generation || !st->armed) return;
-    uint64_t now = macapk_timerfd_now(*st);
-    if (now < st->deadline_ns) {
+    if (!macapk_timerfd_collect_locked(*st, macapk_timerfd_now(*st))) {
         // A clock adjustment or early callback: wait for the actual deadline.
         macapk_timerfd_schedule_locked(*st);
-        return;
     }
-    uint64_t expirations = 1;
-    if (st->interval_ns) {
-        const uint64_t elapsed = now - st->deadline_ns;
-        expirations = macapk_timerfd_add_ns(expirations, elapsed / st->interval_ns);
-        // Advance on the original cadence, not the callback's arrival time.
-        st->deadline_ns = macapk_timerfd_add_ns(now, st->interval_ns - elapsed % st->interval_ns);
-        macapk_timerfd_schedule_locked(*st);
-    } else {
-        st->armed = false;
+}
+
+extern "C++" {
+template <class Receive>
+static ssize_t macapk_timerfd_read_common(MacapkTimerfd& t, const Receive& receive) {
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(t.mu);
+            // Account for a deadline whose dispatch callback has not run yet.
+            if (t.armed) macapk_timerfd_collect_locked(t, macapk_timerfd_now(t));
+            ssize_t r = receive(t.notify_fd);
+            if (r >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK) ||
+                macapk_efd_nonblocking(t.notify_fd)) return r;
+        }
+        // A blocking read must wait without holding the schedule lock. Poll
+        // also preserves the ordinary interruptible wait semantics.
+        struct pollfd p = {t.notify_fd, POLLIN, 0};
+        if (::poll(&p, 1, -1) < 0) return -1;
+        if (p.revents & (POLLERR | POLLHUP | POLLNVAL)) { errno = EIO; return -1; }
     }
-    // Preserve the existing 8-byte notification carrier. A late callback can
-    // report multiple elapsed periods; queuing/reading separate notifications
-    // remains the previous datagram behavior.
-    (void)::send(st->notify_fd, &expirations, sizeof(expirations), MSG_DONTWAIT);
+}
+}  // extern "C++"
+static ssize_t macapk_timerfd_read_host(MacapkTimerfd& t, void* buf, size_t n) {
+    if (n < sizeof(uint64_t)) { errno = EINVAL; return -1; }
+    return macapk_timerfd_read_common(t, [&](int fd) {
+        return ::recv(fd, buf, sizeof(uint64_t), MSG_DONTWAIT);
+    });
+}
+static ssize_t macapk_timerfd_read_or_host(int fd, void* buf, size_t n) {
+    if (auto st = macapk_timerfd_lookup(fd)) return macapk_timerfd_read_host(*st, buf, n);
+    return ::read(fd, buf, n);
+}
+static ssize_t macapk_timerfd_readv_or_host(int fd, const struct iovec* iov, int cnt) {
+    auto st = macapk_timerfd_lookup(fd);
+    if (!st) return ::readv(fd, iov, cnt);
+    if (cnt <= 0 || cnt > IOV_MAX) { errno = EINVAL; return -1; }
+    // Copy only the supplied iovec metadata before waiting, just as readv
+    // imports the vector at syscall entry. Use a fault-returning self copy
+    // rather than dereferencing the caller's array in the runtime.
+    std::vector<struct iovec> vectors(static_cast<size_t>(cnt));
+    const mach_vm_size_t bytes = vectors.size() * sizeof(struct iovec);
+    mach_vm_size_t copied = 0;
+    if (mach_vm_read_overwrite(mach_task_self(), reinterpret_cast<mach_vm_address_t>(iov), bytes,
+                               reinterpret_cast<mach_vm_address_t>(vectors.data()), &copied) != KERN_SUCCESS ||
+        copied != bytes) { errno = EFAULT; return -1; }
+    size_t capacity = 0;
+    for (const auto& v : vectors) {
+        if (v.iov_len > static_cast<size_t>(SSIZE_MAX) - capacity) { errno = EINVAL; return -1; }
+        capacity += v.iov_len;
+    }
+    if (capacity < sizeof(uint64_t)) { errno = EINVAL; return -1; }
+    return macapk_timerfd_read_common(*st, [&](int notify_fd) {
+        // The kernel handles writing to the actual scatter/gather buffers.
+        struct msghdr msg = {};
+        msg.msg_iov = vectors.data();
+        msg.msg_iovlen = cnt;
+        return ::recvmsg(notify_fd, &msg, MSG_DONTWAIT);
+    });
 }
 
 static int macapk_timerfd_create_host(int clockid, int flags) {
@@ -34752,10 +34833,10 @@ static int macapk_timerfd_settime_host(int fd, int flags, const void* newvalp, v
             if (__macapk_arm64_clock_gettime(st->clock_id, &now) != 0) return -1;
             uint64_t guest_now = macapk_timerfd_ns(now);
             uint64_t host_now = ::clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-            if (value_ns >= guest_now) deadline = macapk_timerfd_add_ns(host_now, value_ns - guest_now);
+            if (value_ns >= guest_now) deadline = macapk_timerfd_saturating_add(host_now, value_ns - guest_now);
             else deadline = host_now - std::min(host_now, guest_now - value_ns);
         } else {
-            deadline = macapk_timerfd_add_ns(::clock_gettime_nsec_np(CLOCK_UPTIME_RAW), value_ns);
+            deadline = macapk_timerfd_saturating_add(::clock_gettime_nsec_np(CLOCK_UPTIME_RAW), value_ns);
         }
         src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                      dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0));
@@ -34767,7 +34848,7 @@ static int macapk_timerfd_settime_host(int fd, int flags, const void* newvalp, v
     ++st->generation;
     if (st->source) { dispatch_source_cancel(st->source); dispatch_release(st->source); }
     st->source = src;
-    macapk_timerfd_drain_locked(*st);       // reset unread notifications on settime
+    (void)macapk_timerfd_take_pending_locked(*st);  // reset unread notifications on settime
     st->interval_ns = macapk_timerfd_ns(nv.it_interval);
     st->deadline_ns = deadline;
     st->wall_clock = wall_clock;
@@ -45149,6 +45230,7 @@ extern "C" int __macapk_arm64_fcntl(int fd, int cmd, void* arg) {
 // kernel-faithful counter (macapk_efd_read_host).
 static ssize_t macapk_arm64_read_host(int fd, void* buf, size_t n) {
     if (auto st = macapk_efd_lookup(fd)) return macapk_efd_read_host(fd, *st, buf, n);
+    if (auto st = macapk_timerfd_lookup(fd)) return macapk_timerfd_read_host(*st, buf, n);
     // NET TRACE on SOCKET reads only (MACAPK_NET_TRACE). Meta's MNS/fizz does its
     // payload I/O with read/write/readv, NOT send/recv -- measured from the guest's
     // own UND lists: libstartup.so imports epoll_wait/epoll_ctl/select/readv and

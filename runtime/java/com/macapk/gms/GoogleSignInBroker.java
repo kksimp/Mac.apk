@@ -644,6 +644,27 @@ public final class GoogleSignInBroker {
         return res;
     }
 
+    private static final String CONSENT_PREFIX = "signin.scopes.";
+
+    /** The scopes the user approved for `pkg`, signed with `sig`, on `account` by
+     *  clicking the account in the chooser (recordConsent). This is what
+     *  AuthTokenService may answer a GoogleAuthUtil.getToken from, never more; an
+     *  APK re-signed by someone else starts with nothing. */
+    static java.util.Set<String> consentedScopes(String account, String pkg, String sig) {
+        java.util.Set<String> out = new java.util.LinkedHashSet<>();
+        String v = GmsStore.accountData(account, CONSENT_PREFIX + pkg + ":" + sig);
+        if (v != null) for (String s : v.trim().split(" ")) if (!s.isEmpty()) out.add(s);
+        return out;
+    }
+
+    /** Called by GoogleSignInActivity only when the USER clicked the account and
+     *  the sign-in for these scopes succeeded -- never by an automatic sign-in. */
+    static void recordConsent(String account, String pkg, String sig, List<String> scopes) {
+        java.util.Set<String> all = consentedScopes(account, pkg, sig);
+        if (!all.addAll(scopes)) return;
+        GmsStore.putAccountData(account, CONSENT_PREFIX + pkg + ":" + sig, String.join(" ", all));
+    }
+
     private static boolean absorb(Result res, Map<String, String> resp, String what) {
         if (resp == null) {
             String e = GoogleAuthClient.lastError();
@@ -686,7 +707,7 @@ public final class GoogleSignInBroker {
     }
 
     /** `Expiry` is ABSOLUTE epoch seconds (see fetchScopedToken). */
-    private static long absExpiry(Map<String, String> resp, long now) {
+    static long absExpiry(Map<String, String> resp, long now) {
         try {
             long e = Long.parseLong(resp.get("Expiry").trim());
             return e > now ? e : now + 3600;

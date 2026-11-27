@@ -255,19 +255,30 @@ public final class ServiceRegistry {
      *
      *  The PackageManager remains the ONLY authority on what an action resolves
      *  to; this method adds no matching rules of its own, so an action the PM
-     *  does not answer still finds nothing, exactly as before. */
+     *  does not answer still finds nothing, exactly as before.
+     *
+     *  An explicit component of ANOTHER package goes to the PackageManager too,
+     *  by its component alone: AOSP resolves an explicit component there as well
+     *  and ignores the action for it. In-process only the PM's stand-ins can
+     *  answer one: GoogleAuthUtil binds com.google.android.gms/.auth.GetToken by
+     *  name, and that class exists only as com.macapk.gms.AuthTokenService. A
+     *  component the PM does not answer keeps its own class name, as before. */
     private static String classNameOf(Intent intent) {
         if (intent == null) return null;
         ComponentName c = intent.getComponent();
-        if (c != null) return c.getClassName();
-        return resolveImplicit(intent);
+        if (c == null) return intent.getAction() != null ? resolveViaPm(intent) : null;
+        Context app = Application.getInstance();
+        if (app != null && !c.getPackageName().equals(app.getPackageName())) {
+            String cls = resolveViaPm(new Intent().setComponent(c));
+            if (cls != null) return cls;
+        }
+        return c.getClassName();
     }
 
-    /** Ask the PackageManager which Service an action-only Intent names.
+    /** Ask the PackageManager which Service an Intent names.
      *  Failure-tolerant on purpose: a context-less or manifest-less caller
      *  simply finds nothing, which is the pre-existing behaviour. */
-    private static String resolveImplicit(Intent intent) {
-        if (intent.getAction() == null) return null;
+    private static String resolveViaPm(Intent intent) {
         try {
             Context ctx = Application.getInstance();
             if (ctx == null) return null;
@@ -277,8 +288,9 @@ public final class ServiceRegistry {
             if (ri == null || ri.serviceInfo == null) return null;
             String cls = ri.serviceInfo.name;
             if (cls == null || cls.isEmpty()) return null;
-            com.macapk.loader.NativeLog.i("ServiceRegistry",
-                "implicit " + intent.getAction() + " -> " + cls);
+            com.macapk.loader.NativeLog.i("ServiceRegistry", (intent.getComponent() != null
+                    ? "explicit " + intent.getComponent().flattenToShortString()
+                    : "implicit " + intent.getAction()) + " -> " + cls);
             return cls;
         } catch (Throwable t) {
             return null;

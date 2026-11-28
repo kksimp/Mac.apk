@@ -29,6 +29,7 @@
 #include <cstring>
 #include "vk_window_surface_policy.h"  // MACAPK_VK_WINDOW_SURFACE decision (egl window-surface bridge)
 #include "macapk/linker_namespaces.h"  // Android linker namespaces (android_create_namespace & co)
+#include "macapk/sigill_trap_guard.h"  // SIGILL handler: same-site re-trap guard that ignores taken traps
 #include <climits>         // INT_MAX for the __ppoll_chk timeout clamp
 #include <exception>
 #include <cmath>             // std::fabs, std::isnan, std::isinf
@@ -14129,14 +14130,24 @@ chain:
         // The original v1.0.153 no-chain policy existed because a
         // chained JVM handler that SILENTLY RETURNS (without advancing
         // PC and without aborting) would leave the same instruction to
-        // re-trap forever. We defend against exactly that with a per-PC
-        // advance guard: a serviced deopt/not-entrant trap REDIRECTS PC
-        // (so our next entry is at a different PC -> the counter
-        // resets), and a genuinely fatal fault makes HotSpot abort on
-        // the first chain call (we never re-enter). Only a true
-        // silent-return loop re-enters at the SAME unadvanced PC; if
-        // that happens >= kMaxSamePcTraps times we fall back to SIG_DFL
-        // + re-raise so the OS still produces a clean crash dump. (The
+        // re-trap forever. We defend against exactly that with the
+        // per-PC re-trap guard below (macapk::SigillTrapGuard). What it
+        // counts is a trap the chain did NOT take: one that comes back
+        // with the interrupted pc unchanged. A trap HotSpot takes it
+        // takes by redirecting that pc (a deopt / not-entrant trap goes
+        // to the method's deopt handler), and that starts the count
+        // over; a genuinely fatal fault makes HotSpot abort on the first
+        // chain call (we never re-enter). The guard used to count every
+        // trap, and HotSpot's deopt trap legitimately arrives several
+        // times in a row at ONE pc: a thread that returns into a patched
+        // call before it attends to HotSpot's own deopt handshake traps
+        // there, is deoptimized, and as an interpreted frame returns
+        // without polling into the next frame of the same method, where
+        // its saved return address is that trap again. So the third frame
+        // of android.view.View.draw() under Douyin 32.2.6 killed the
+        // process (measured 2026-11-28; the header has the trace). When
+        // traps in a row at one pc do go untaken we still fall back to
+        // SIG_DFL + re-raise so the OS produces a clean crash dump. (The
         // separate v1.0.572 "capture our own handler as prev -> recurse"
         // hazard is prevented independently by reinstall_sigill_handler,
         // which only records prev when the currently-installed handler
@@ -14155,21 +14166,35 @@ chain:
             g_old_ill_sa.sa_handler = SIG_DFL;
         }
 
-        // Per-PC same-site re-trap guard. thread_local matches the
-        // existing raw-handler pattern (t_lifted_fault_pc above). count
-        // starts at 1 on a fresh PC; >= kMaxSamePcTraps means we have
-        // already chained (kMaxSamePcTraps-1) times on this exact PC
-        // without it advancing -> treat as a silent-return loop.
-        constexpr unsigned kMaxSamePcTraps = 3;
-        static thread_local uintptr_t t_ill_last_pc = 0;
-        static thread_local unsigned  t_ill_same_count = 0;
-        if (pc_log != 0 && pc_log == t_ill_last_pc) {
-            ++t_ill_same_count;
-        } else {
-            t_ill_last_pc = pc_log;
-            t_ill_same_count = 1;
-        }
-        const bool looping = (t_ill_same_count >= kMaxSamePcTraps);
+        // Per-PC re-trap guard; thread_local like the raw-handler pattern
+        // above (t_lifted_fault_pc). macapk::SigillTrapGuard has the why.
+        // Looping = this many traps in a row at this pc that the chain
+        // left where they were.
+        constexpr unsigned kMaxUnservicedTraps = 3;
+        static thread_local macapk::SigillTrapGuard t_ill_guard;
+        const bool looping = t_ill_guard.enter(pc_log, kMaxUnservicedTraps);
+        // Once the chain has returned: it took the trap when it moved the
+        // pc. Returns how many traps at this pc it has taken in a row.
+        auto note_chain = [&]() -> unsigned {
+            const uintptr_t pc_now =
+                uc->uc_mcontext ? uc->uc_mcontext->__ss.__pc : 0;
+            const unsigned taken = t_ill_guard.chained(pc_log, pc_now);
+            // The trap the guard used to cut off, the third at one pc: say so once
+            // per series, so that a run that gets past it can be told from one that
+            // never met it.
+            static std::atomic<int> noted{0};
+            if (taken == kMaxUnservicedTraps
+                && noted.fetch_add(1, std::memory_order_relaxed) < 16) {
+                std::fprintf(stderr,
+                    "[sigill-emu] trap at PC=%p insn=0x%08x: third in a row at this"
+                    " pc, all taken by the chained handler (a deoptimized method"
+                    " unwinding, one trap per frame). Chained; the guard that counted"
+                    " every trap re-raised here\n",
+                    (void*)pc_log, insn_log);
+                std::fflush(stderr);
+            }
+            return taken;
+        };
 
         // Chain to the saved prior SIGILL handler (HotSpot's, captured
         // post-JVM-init) unless we are looping on this PC. Mirrors the
@@ -14180,18 +14205,22 @@ chain:
             // guest code then reaches a recorded guest action (OpenSSL's
             // OPENSSL_cpuid_setup probe handler, which siglongjmps out) instead
             // of HotSpot's fatal-error path.
-            if (__macapk_sigchain_deliver(sig, info, ucontext)) return;
+            if (__macapk_sigchain_deliver(sig, info, ucontext)) {
+                note_chain();
+                return;
+            }
             const struct sigaction& prev = g_old_ill_sa;
             if (prev.sa_flags & SA_SIGINFO) {
                 if (prev.sa_sigaction) {
                     std::fprintf(stderr,
                         "[sigill-emu] un-emulated trap at PC=%p insn=0x%08x"
-                        " -- chaining to saved SIGILL handler %p (same-pc"
-                        " count=%u)\n",
+                        " -- chaining to saved SIGILL handler %p (unserviced"
+                        " in a row=%u)\n",
                         (void*)pc_log, insn_log,
-                        (void*)prev.sa_sigaction, t_ill_same_count);
+                        (void*)prev.sa_sigaction, t_ill_guard.unserviced_in_a_row());
                     std::fflush(stderr);
                     prev.sa_sigaction(sig, info, ucontext);
+                    note_chain();
                     return;
                 }
             } else if (prev.sa_handler == SIG_IGN) {
@@ -14201,9 +14230,9 @@ chain:
             } else if (prev.sa_handler != SIG_DFL && prev.sa_handler) {
                 std::fprintf(stderr,
                     "[sigill-emu] un-emulated trap at PC=%p insn=0x%08x"
-                    " -- chaining to saved SIGILL handler (same-pc"
-                    " count=%u)\n",
-                    (void*)pc_log, insn_log, t_ill_same_count);
+                    " -- chaining to saved SIGILL handler (unserviced"
+                    " in a row=%u)\n",
+                    (void*)pc_log, insn_log, t_ill_guard.unserviced_in_a_row());
                 std::fflush(stderr);
                 prev.sa_handler(sig);
                 return;

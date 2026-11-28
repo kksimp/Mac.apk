@@ -46476,7 +46476,9 @@ extern "C" int __macapk_arm64_epoll_ctl(int epfd, int op, int fd, void* evp) {
 // epoll_wait(epfd, events, maxevents, timeout_ms) -> kevent() with a timeout.
 // timeout<0 blocks forever (NULL timespec); ==0 polls; >0 is milliseconds.
 // kqueue reports EVFILT_READ and EVFILT_WRITE as separate kevents for the same
-// fd, so we coalesce by udata into one epoll_event per fd (epoll semantics).
+// fd, so coalesce by kevent.ident into one epoll_event per fd. The guest's
+// opaque data value is payload, not an identity: different registrations
+// may deliberately carry the same value.
 extern "C" int __macapk_arm64_epoll_wait(int epfd, void* evp, int maxevents,
                                           int timeout_ms) {
     if (maxevents <= 0) { errno = EINVAL; return -1; }
@@ -46525,6 +46527,10 @@ extern "C" int __macapk_arm64_epoll_wait(int epfd, void* evp, int maxevents,
     if (n < 0) return -1;
 
     int count = 0;
+    // Keep descriptor identities alongside the guest events while merging
+    // the separate read/write filters. Do not merge distinct descriptors
+    // just because the caller supplied the same opaque epoll data.
+    std::vector<uintptr_t> idents(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
         const struct kevent& k = kev[i];
         uint32_t e = 0;
@@ -46532,12 +46538,13 @@ extern "C" int __macapk_arm64_epoll_wait(int epfd, void* evp, int maxevents,
         if (k.filter == EVFILT_WRITE) e |= MACAPK_EPOLLOUT;
         if (k.flags & EV_EOF)   e |= MACAPK_EPOLLHUP;
         if (k.flags & EV_ERROR) e |= MACAPK_EPOLLERR;
-        // coalesce with an existing entry for the same fd (udata)
+        // Only filters belonging to the same descriptor share a slot.
         int slot = -1;
         for (int j = 0; j < count; ++j)
-            if (out[j].data == reinterpret_cast<uint64_t>(k.udata)) { slot = j; break; }
+            if (idents[j] == k.ident) { slot = j; break; }
         if (slot < 0) {
             slot = count++;
+            idents[slot] = k.ident;
             out[slot].events = 0;
             out[slot]._pad   = 0;
             out[slot].data   = reinterpret_cast<uint64_t>(k.udata);

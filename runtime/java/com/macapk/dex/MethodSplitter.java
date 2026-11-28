@@ -52,7 +52,8 @@
 // and a loop cannot grow it.
 //
 // WHAT MAKES A CUT LEGAL (all checked, none assumed)
-//   1. NO BACK EDGE crosses it. An edge from the suffix into the prefix would
+//   1. NO LOOP BACK EDGE crosses it. A proven terminal tail may be copied
+//      into the suffix on the last-resort replan. Any other edge back would
 //      have to become a call BACK into the caller, which recurses without bound
 //      in a loop. This is the condition that decides the whole transform, and
 //      on ChatMessageCell 6,992 of 17,486 positions satisfy it.
@@ -442,7 +443,14 @@ final class MethodSplitter {
     static final boolean CLONE_HANDLERS =
             !"0".equals(System.getenv("DEX2JVM_SPLIT_CLONE_HANDLERS"));
 
-    /** Longest handler block, in instructions, worth copying into a part. */
+    // A backwards jump to a short return/throw tail is not a loop. R8 shares
+    // these tails across large generated switch tables.
+    // Copy them only after the ordinary planner found no cut, and only in a
+    // method without try ranges: copies must retain exception propagation.
+    static final boolean CLONE_TAILS =
+            !"0".equals(System.getenv("DEX2JVM_SPLIT_CLONE_TAILS"));
+
+    /** Longest terminal block, in instructions, worth copying into a part. */
     private static final int MAX_CLONE_INSNS = 8;
 
     /** Set by the "no valid cut" refusal: the one refusal cloning can cure. */
@@ -593,19 +601,23 @@ final class MethodSplitter {
         /** Handler offset -> its block's DEX offsets, for each handler copied
          *  into the parts whose ranges use it. Empty unless the plan needed it. */
         private final Map<Integer, int[]> cloneBlocks;
+        private final Map<Integer, int[]> terminalTails;
         /** Any offset inside a cloned block -> that block's handler offset. */
         private final Map<Integer, Integer> cloneBlockOf = new HashMap<>();
 
         Plan(List<Part> parts) { this(parts, java.util.Collections.emptyList()); }
 
         Plan(List<Part> parts, List<String[]> spillFields) {
-            this(parts, spillFields, java.util.Collections.<Integer, int[]>emptyMap());
+            this(parts, spillFields, java.util.Collections.<Integer, int[]>emptyMap(),
+                    java.util.Collections.<Integer, int[]>emptyMap());
         }
 
-        Plan(List<Part> parts, List<String[]> spillFields, Map<Integer, int[]> cloneBlocks) {
+        Plan(List<Part> parts, List<String[]> spillFields, Map<Integer, int[]> cloneBlocks,
+             Map<Integer, int[]> terminalTails) {
             this.parts = parts;
             this.spillFields = spillFields;
             this.cloneBlocks = cloneBlocks;
+            this.terminalTails = terminalTails;
             for (Map.Entry<Integer, int[]> e : cloneBlocks.entrySet()) {
                 for (int o : e.getValue()) cloneBlockOf.put(o, e.getKey());
             }
@@ -621,6 +633,8 @@ final class MethodSplitter {
         /** The DEX offsets of a cloned handler's block, or null when the
          *  handler at {@code handlerOffset} is not cloned. */
         int[] cloneBlock(int handlerOffset) { return cloneBlocks.get(handlerOffset); }
+
+        int[] terminalTail(int dexOffset) { return terminalTails.get(dexOffset); }
 
         /** The cloned handler whose block contains {@code dexOffset}, or null. */
         Integer clonedHandlerContaining(int dexOffset) { return cloneBlockOf.get(dexOffset); }
@@ -715,10 +729,11 @@ final class MethodSplitter {
         Plan p = computeOnce(norm, types, locals, tries, deferredNew, thisUninit, bytecodeOf,
                 totalBytes, targetBytes, allowWiden, returnDescriptor, taken, methodTag,
                 spillAllowed, takenFields, receiverDescriptor, false);
-        if (p != null || !CLONE_HANDLERS || !Boolean.TRUE.equals(NO_CUT.get())) return p;
+        if (p != null || (!CLONE_HANDLERS && !CLONE_TAILS)
+                || !Boolean.TRUE.equals(NO_CUT.get())) return p;
         if (DEBUG) {
             System.err.println("[dex-split] " + methodTag
-                    + ": replanning with terminal handlers cloned per part");
+                    + ": replanning with terminal blocks cloned per part");
         }
         NO_CUT.set(Boolean.FALSE);
         return computeOnce(norm, types, locals, tries, deferredNew, thisUninit, bytecodeOf,
@@ -764,6 +779,10 @@ final class MethodSplitter {
         // part be entered at a point no dispatch id names.
         final Resolver resolve = new Resolver(off);
 
+        Map<Integer, int[]> tails = cloning && CLONE_TAILS && tries.isEmpty()
+                ? cloneableTails(norm, types, off, indexOf, resolve, deferredNew, thisUninit)
+                : java.util.Collections.<Integer, int[]>emptyMap();
+
         // (1) sufMin[p] = the lowest index any instruction at or after p can
         // reach. p is back-edge-free exactly when sufMin[p] >= p.
         int[] minTo = new int[n];
@@ -771,7 +790,8 @@ final class MethodSplitter {
             minTo[i] = i;
             for (int s : successors(norm.get(i))) {
                 int si = resolve.indexAtOrAfter(s);
-                if (si >= 0) minTo[i] = Math.min(minTo[i], si);
+                if (si >= 0 && !(si < i && tails.containsKey(s)))
+                    minTo[i] = Math.min(minTo[i], si);
             }
         }
         int[] sufMin = new int[n + 1];
@@ -782,11 +802,12 @@ final class MethodSplitter {
         // that must not be straddled -- except a handler that is CLONED into
         // each part that needs it (only on the replan; see CLONE_HANDLERS),
         // whose own block is kept whole instead.
-        Map<Integer, int[]> clones = cloning
+        Map<Integer, int[]> clones = cloning && CLONE_HANDLERS
                 ? cloneableHandlers(norm, types, tries, off, indexOf, resolve, deferredNew,
                                     thisUninit)
                 : java.util.Collections.<Integer, int[]>emptyMap();
-        if (cloning && clones.isEmpty()) return refuse("no handler can be cloned");
+        if (cloning && clones.isEmpty() && tails.isEmpty())
+            return refuse("no terminal block can be cloned");
         List<int[]> spans = new ArrayList<>();
         for (TypeInference.TryBlock t : tries) {
             int lo = Integer.MAX_VALUE, hi = -1;
@@ -802,6 +823,9 @@ final class MethodSplitter {
                 lo = Math.min(lo, x); hi = Math.max(hi, x);
             }
             if (hi >= 0) spans.add(new int[]{ lo, hi });
+        }
+        for (int[] block : tails.values()) {
+            spans.add(new int[]{ indexOf.get(block[0]), indexOf.get(block[block.length - 1]) });
         }
         for (int[] block : clones.values()) {
             Integer a = indexOf.get(block[0]), b = indexOf.get(block[block.length - 1]);
@@ -1184,7 +1208,9 @@ final class MethodSplitter {
             System.err.println("[dex-split] " + methodTag + ": " + clones.size()
                 + " terminal handler(s) cloned per part: " + hexKeys(clones));
         }
-        return new Plan(parts, spillFields, clones);
+        if (DEBUG && !tails.isEmpty()) System.err.println("[dex-split] " + methodTag
+                + ": terminal tail copies: " + hexKeys(tails));
+        return new Plan(parts, spillFields, clones, tails);
     }
 
     private static String hexKeys(Map<Integer, int[]> m) {
@@ -1286,6 +1312,56 @@ final class MethodSplitter {
                     int[] b = new int[block.size()];
                     for (int j = 0; j < b.length; j++) b[j] = block.get(j);
                     out.put(h, b);
+                    continue candidates;
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Backward targets with a short, straight-line path to method exit.
+     *  No interior branch entry, monitor, allocation, pending invoke result,
+     *  uninitialized reference, or try coverage may cross a copied tail. */
+    private static Map<Integer, int[]> cloneableTails(List<TypeInference.Insn> norm,
+            TypeInference.Result types, int[] off, Map<Integer, Integer> indexOf,
+            Resolver resolve, Map<Integer, Integer> deferredNew, Set<Integer> thisUninit) {
+        Map<Integer, int[]> out = new java.util.TreeMap<>();
+        Set<Integer> candidates = new TreeSet<>();
+        java.util.BitSet jumpedTo = new java.util.BitSet(norm.size());
+        for (int i = 0; i < norm.size(); i++) {
+            if (!types.isReachable(off[i])) continue;
+            for (int target : successors(norm.get(i))) {
+                int ti = resolve.indexAtOrAfter(target);
+                if (ti < 0 || target == norm.get(i).nextOffset) continue;
+                jumpedTo.set(ti);
+                if (ti < i && off[ti] == target) candidates.add(target);
+            }
+        }
+        candidates:
+        for (int target : candidates) {
+            int first = indexOf.get(target);
+            if (thisUninit != null && thisUninit.contains(target)) continue;
+            if (norm.get(first).family() == TypeInference.F_MOVE_RESULT) continue;
+            RegisterState state = types.entryState(target);
+            if (state == null) continue;
+            for (int r = 0; r < state.size(); r++) {
+                DexType t = state.get(r);
+                if (t == null || t.isDead() || (t.scalar() & DexType.OBJ) == 0) continue;
+                DexType.Ref ref = t.ref();
+                if (ref != null && (ref.kind == DexType.Ref.KIND_UNINIT
+                        || ref.kind == DexType.Ref.KIND_UNINIT_THIS)) continue candidates;
+            }
+            List<Integer> block = new ArrayList<>();
+            for (int i = first; i < norm.size() && i < first + MAX_CLONE_INSNS; i++) {
+                TypeInference.Insn in = norm.get(i);
+                if (!types.isReachable(in.offset) || (i > first && jumpedTo.get(i))
+                        || insideDeferredNew(in.offset, deferredNew) || !cloneSafe(in.family()))
+                    continue candidates;
+                block.add(in.offset);
+                if (in.family() == TypeInference.F_RETURN || in.family() == TypeInference.F_THROW) {
+                    int[] offsets = new int[block.size()];
+                    for (int j = 0; j < offsets.length; j++) offsets[j] = block.get(j);
+                    out.put(target, offsets);
                     continue candidates;
                 }
             }

@@ -770,7 +770,12 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
                 d.setIsRootNamespace(true);
                 decor = d; content = c;
                 if (appBackgroundSet) d.setBackground(appBackground);
-                else macapkApplyDialogBackground(d, mContext);
+                else {
+                    android.graphics.drawable.Drawable themeColour = MACAPK_DIALOG_THEME_COLOUR_BG
+                            ? macapkThemeWindowBackgroundColour(mContext) : null;
+                    if (themeColour != null) d.setBackground(themeColour);
+                    else macapkApplyDialogBackground(d, mContext);
+                }
                 // generateLayout's "remaining setup ... that only applies to
                 // top-level windows": `mDecor.setElevation(mElevation);`
                 // (android14 PhoneWindow.java:2736).
@@ -905,6 +910,43 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
          *
          *  The polarity comes from the app's own theme cascade, so a dark-themed
          *  app gets the dark panel without anything here knowing which app it is. */
+        /** MACAPK_DIALOG_THEME_COLOUR_BG (default ON; =0 restores the default
+         *  panel for every dialog without an app background).
+         *
+         *  AOSP PhoneWindow.generateLayout installs the dialog theme's
+         *  windowBackground as the window background for EVERY dialog. Here only
+         *  AlertDialog's traditional installer handed it over
+         *  (macapkSetThemeWindowBackground), so any other Dialog got the 16dp
+         *  inset, opaque colorBackgroundFloating panel. React Native's
+         *  transparent <Modal> is such a Dialog: its theme
+         *  (Theme.FullScreenDialog) binds windowBackground to
+         *  @android:color/transparent and the app draws its own scrim and sheet
+         *  inside. MEASURED on Patchwork 1.13.0's board Filter sheet: the panel's
+         *  opaque fill replaced the 32% scrim with a grey screen, and its 16dp
+         *  padding pushed the bottom-anchored sheet past the window's right and
+         *  bottom edges, cutting off the Done button and one top corner.
+         *
+         *  Same rule as AlertDialog.macapkThemeWindowBackgroundColour: only a
+         *  COLOUR is taken literally. A drawable windowBackground (the platform
+         *  dialog themes' inset shapes) keeps the panel, which stands in for it. */
+        static final boolean MACAPK_DIALOG_THEME_COLOUR_BG =
+            !"0".equals(System.getenv("MACAPK_DIALOG_THEME_COLOUR_BG"));
+
+        private static android.graphics.drawable.Drawable macapkThemeWindowBackgroundColour(Context c) {
+            try {
+                android.util.TypedValue tv = new android.util.TypedValue();
+                if (c == null || !c.getTheme().resolveAttribute(0x01010054 /* windowBackground */,
+                        tv, true)) {
+                    return null;
+                }
+                if (tv.type >= android.util.TypedValue.TYPE_FIRST_COLOR_INT
+                        && tv.type <= android.util.TypedValue.TYPE_LAST_COLOR_INT) {
+                    return new android.graphics.drawable.ColorDrawable(tv.data);
+                }
+            } catch (Throwable ignored) { }
+            return null;
+        }
+
         private static void macapkApplyDialogBackground(android.view.View d, Context c) {
             android.graphics.drawable.Drawable bg = macapkDialogBackground(c);
             if (bg == null) return;

@@ -11368,6 +11368,48 @@ uint64_t Image::first_data_vaddr_in(uint64_t lo, uint64_t hi) const {
     return hi;
 }
 
+// MACAPK_SVC_BRK_SKIP_INTEGRITY (default ON). Some native libraries verify
+// their own code before they do anything. One shape of that, measured in
+// Douyin 32.2.6's libmetasec_ml.so: 36 copies of one block, each between two
+// marker words, `F1 F6 77 FF` and `F1 F6 77 F0`, each CRC32'd against one
+// expected value. The block holds two `svc #0` words that are never executed;
+// they exist to be hashed. The svc -> BRK rewrite changes them, the CRC no
+// longer matches, and the library jumps to an unmapped page (pc = 0x1000 /
+// 0x4000 / 0x8000, sp = fp = 0x7b, lr = 0: the context in every crash report
+// of that app before this switch).
+//
+// So an image that carries such a marker pair keeps the bytes it checks:
+//   unset, or "image"   DEFAULT: every `svc #0` word of the image is left as it is
+//   "regions"           only the words between a marker pair are
+//   "0"                 the rewrite-everything behaviour
+// The whole image by default because a second check of that library hashes a
+// range holding another of its `svc #0` words: with "regions" the crash only
+// moved from the 0x4000 landing to the 0x8000 one.
+//
+// What the default costs is plain: an ordinary, executed `svc #0` in such an
+// image is left alone too, and an un-rewritten `svc #0` is serviced by the
+// SIGSYS handler in bionic_shim.cpp, which forwards a narrow set of syscalls
+// and answers -ENOSYS to the rest -- not by the SIGTRAP path the rewrite
+// leads to. "regions" is the setting for an image whose checks cover only its
+// marker regions. debug/check_svc_brk_integrity_image.sh covers all three.
+static bool macapk_svc_brk_skip_integrity() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_SVC_BRK_SKIP_INTEGRITY");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+// "regions" narrows the skip to the marker-delimited regions; any other
+// setting keeps the whole image.
+static bool macapk_svc_brk_skip_integrity_image() {
+    static const bool image = [] {
+        const char* e = std::getenv("MACAPK_SVC_BRK_SKIP_INTEGRITY");
+        return !(e && std::strcmp(e, "regions") == 0);
+    }();
+    return image;
+}
+
 size_t Image::apply_svc_brk_rewrite() {
     // DEFAULT-ON (opt out MACAPK_SVC_BRK=0). Validated on IG (boots to the main
     // feed, 5/5) and the protected sweep (12/12 alive, Stage-6 arm64 + ARM32).
@@ -11385,15 +11427,64 @@ size_t Image::apply_svc_brk_rewrite() {
     // the state alone no longer implies this gate); otherwise the whole-segment
     // scan, exactly as before.
     const bool exec_only = macapk_svc_brk_exec_only() && exec_ranges_state_ == 1;
+    const bool skip_integrity = macapk_svc_brk_skip_integrity();
+    const bool skip_whole_image = skip_integrity && macapk_svc_brk_skip_integrity_image();
     size_t n = 0, spared = 0, nosec_n = 0;
-    for (const auto& ph : phdrs_) {
+    size_t integrity_n = 0, integrity_regions = 0;
+
+    // Pass 1: marker-delimited static integrity regions, per PF_X segment.
+    std::vector<std::vector<std::pair<uint8_t*, uint8_t*> > > seg_integrity(phdrs_.size());
+    if (skip_integrity) {
+        constexpr uint32_t kMarkStart = 0xFF77F6F1u;   // F1 F6 77 FF
+        constexpr uint32_t kMarkEnd   = 0xF077F6F1u;   // F1 F6 77 F0
+        constexpr size_t   kMaxSpan   = 0x1000u;       // a runaway pair is not one region
+        for (size_t si = 0; si < phdrs_.size(); ++si) {
+            const auto& ph = phdrs_[si];
+            if (ph.p_type != PT_LOAD || !(ph.p_flags & PF_X)) continue;
+            uint8_t* lo = base_ + ph.p_vaddr;
+            uint8_t* hi = lo + ph.p_filesz;
+            for (uint8_t* q = lo; q + 4 <= hi; q += 4) {
+                uint32_t w = 0;
+                std::memcpy(&w, q, 4);
+                if (w != kMarkStart) continue;
+                uint8_t* r = q + 4;
+                uint8_t* rend = hi - 3;
+                if (rend > q + 4 + kMaxSpan) rend = q + 4 + kMaxSpan;
+                for (; r < rend; r += 4) {
+                    uint32_t v = 0;
+                    std::memcpy(&v, r, 4);
+                    if (v == kMarkEnd) break;
+                }
+                if (r >= rend) continue;
+                seg_integrity[si].emplace_back(q + 4, r);
+                ++integrity_regions;
+                q = r;                                     // continue after the end marker
+            }
+        }
+    }
+    const bool image_has_integrity = integrity_regions > 0;
+
+    // Pass 2: rewrite.
+    for (size_t si = 0; si < phdrs_.size(); ++si) {
+        const auto& ph = phdrs_[si];
         if (ph.p_type != PT_LOAD || !(ph.p_flags & PF_X)) continue;
         uint8_t* lo = base_ + ph.p_vaddr;
         uint8_t* hi = lo + ph.p_filesz;
+        const auto& integrity = seg_integrity[si];
         size_t seg_n = 0;
         for (uint32_t* p = reinterpret_cast<uint32_t*>(lo);
              reinterpret_cast<uint8_t*>(p + 1) <= hi; ++p) {
             if (*p != kSvc0) continue;
+            if (skip_integrity) {
+                bool inside = skip_whole_image && image_has_integrity;
+                if (!inside) {
+                    const uint8_t* pa = reinterpret_cast<const uint8_t*>(p);
+                    for (const auto& rg : integrity) {
+                        if (pa >= rg.first && pa < rg.second) { inside = true; break; }
+                    }
+                }
+                if (inside) { ++integrity_n; continue; }   // hashed data, never executed
+            }
             if (exec_only) {
                 bool nosec = false;
                 if (text_word_is_data(uint64_t(reinterpret_cast<uint8_t*>(p) - base_), &nosec)) {
@@ -11425,6 +11516,13 @@ size_t Image::apply_svc_brk_rewrite() {
             "section of the PF_X segment (treated as code: only a word positively inside "
             "a non-executable section is spared; MACAPK_SVC_BRK_EXEC_ONLY)\n",
             dbg_name_, nosec_n);
+    }
+    if (integrity_n || integrity_regions) {
+        std::fprintf(stderr,
+            "[arm64-native] %s: svc->BRK left %zu `svc #0` word(s) untouched in an image with "
+            "%zu static-integrity region(s) (self-checked code is kept byte-identical; %s; "
+            "MACAPK_SVC_BRK_SKIP_INTEGRITY)\n", dbg_name_, integrity_n, integrity_regions,
+            (skip_whole_image && image_has_integrity) ? "whole image" : "regions only");
     }
     return n;
 }

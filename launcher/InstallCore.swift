@@ -1584,6 +1584,16 @@ public struct Registry: Codable {
             .sorted { ($0.versionCode, $0.version) > ($1.versionCode, $1.version) }
     }
 
+    /// The saved environment overrides of the row `dirName` names -- the
+    /// "Environment overrides" of the control panel's info sheet -- or empty
+    /// when there is no such row (a bundle generated before dirName existed).
+    /// Keyed by dirName like every other row lookup: one package can have
+    /// several rows.
+    public func savedEnvironment(dirName: String?) -> [String: String] {
+        guard let dirName, let row = apps.first(where: { $0.dirName == dirName }) else { return [:] }
+        return row.env
+    }
+
     /// The record an update would supersede: highest versionCode, falling back
     /// to most-recently-touched when versionCode is unknown (0) for all of them,
     /// which is the case for every row migrated from v1.
@@ -1843,6 +1853,13 @@ public final class RegistryStore: @unchecked Sendable {
     public func loadReadOnly() throws -> Registry {
         localLock.lock(); defer { localLock.unlock() }
         return try loadLocked(migrateIfNeeded: false)
+    }
+
+    /// The saved environment overrides of the app `dirName` names, read
+    /// without writing. Empty when the row cannot be read or does not exist:
+    /// the caller then simply has nothing extra to export.
+    public func savedEnvironment(dirName: String?) -> [String: String] {
+        (try? loadReadOnly())?.savedEnvironment(dirName: dirName) ?? [:]
     }
 
     /// Read + reconcile, discarding the transition list.
@@ -5593,6 +5610,38 @@ public enum RuntimeInstall {
         }
         let rt = stagedRoot.appendingPathComponent("Resources/macapk-runtime")
         return FileManager.default.isExecutableFile(atPath: rt.path) ? rt : nil
+    }
+
+    /// Let an app's SAVED environment overrides name the runtime it runs on.
+    ///
+    /// `resolveRuntime()` and `ensureStaged()` read MACAPK_RUNTIME_ROOT from
+    /// the process environment: the A/B override a harness or a launchd agent
+    /// sets. An app's saved overrides arrive through the registry instead, and
+    /// the per-app stub used to export them at its step 8 -- after the runtime
+    /// was resolved. So a saved override was honoured on exactly one launch
+    /// path: the control panel, which also passes the saved env in
+    /// `NSWorkspace.OpenConfiguration.environment`. From the Dock, Finder or
+    /// Spotlight the app ran the staged runtime, and so did every sibling
+    /// process the system broker starts for the app (the same stub, started
+    /// with the broker's environment). One app on two runtimes is not only
+    /// surprising: the runtimes have different build ids and share one code
+    /// cache, so each process rebuilt what the other had just built.
+    ///
+    /// Calling this before the resolution closes that. It moves this one key
+    /// only: the stub itself reads MACAPK_CANONICAL_APP, MACAPK_EARLY_CHECKIN
+    /// and MACAPK_DIRNAME_MIGRATE before its step 8, and exporting the rest
+    /// here would silently change what they mean. The saved value replaces an
+    /// inherited one, which is what step 8 would have made true a moment
+    /// later anyway. Returns the root that was exported.
+    ///
+    /// It does not check that a runtime is there. An override that names
+    /// nothing must fail as itself: falling back to the staged runtime would
+    /// run a build the saved override was there to replace.
+    @discardableResult
+    public static func adoptSavedRuntimeRoot(_ savedEnv: [String: String]) -> String? {
+        guard let root = savedEnv["MACAPK_RUNTIME_ROOT"], !root.isEmpty else { return nil }
+        setenv("MACAPK_RUNTIME_ROOT", root, 1)
+        return root
     }
 
     // MARK: the payload manifest

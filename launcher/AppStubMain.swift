@@ -679,6 +679,29 @@ struct AppStubMain {
         var dirName = plist["MacapkDirName"] as? String
         stubLog("starting \(package) (\(label) \(versionName)) from \(bundleRoot.path)")
 
+        // 2b. The app's saved environment overrides, read once and EARLY.
+        //
+        //     Step 8 exports them to the runtime, as ever. One of them has to
+        //     reach THIS process before step 3, though: MACAPK_RUNTIME_ROOT.
+        //     RuntimeInstall.adoptSavedRuntimeRoot() has the why. Measured
+        //     2026-11-27 on Douyin 32.2.6, with a repaired runtime named in its
+        //     saved env, this is what each launch path ran:
+        //
+        //       launch path                      runtime the process ran
+        //       control panel "Open"              the override
+        //       Dock / Finder / Spotlight         the staged runtime
+        //       a sibling process the broker      the staged runtime
+        //       starts for the app
+        //
+        //     So the app ran on two runtimes at once. The broker started the
+        //     sibling four times in three minutes, and every start that found
+        //     the main process's stamp redid the cache they share ("cache MISS
+        //     ... classes.jar was converted by build X but this runtime is
+        //     build Y -- re-converting").
+        RegistryStore.shared.log = { stubLog($0) }
+        let savedEnv = RegistryStore.shared.savedEnvironment(dirName: dirName)
+        RuntimeInstall.adoptSavedRuntimeRoot(savedEnv)
+
         // 3. Resolve the ONE shared runtime.
         //
         //    ⚠ CONTRACT CHANGED 2026-08-12 (Runtime Install/Uninstall). We
@@ -805,31 +828,52 @@ struct AppStubMain {
         }
         guard let runtime = runtimeURL else {
             let st = RuntimeInstall.state(extraSources: appCandidates)
-            // Two genuinely different failures, and telling them apart is the
-            // difference between "press the button in Mac.apk" and "your
-            // install is broken". Say which one this is.
+            // Three genuinely different failures, and telling them apart is the
+            // difference between "press the button in Mac.apk", "your install
+            // is broken" and "this app points at a runtime that is gone". Say
+            // which one this is.
+            let title: String
             let body: String
-            if st.removedByUser {
+            if let override = ProcessInfo.processInfo.environment["MACAPK_RUNTIME_ROOT"],
+               !override.isEmpty {
+                // An A/B target -- inherited, or the app's saved one from step
+                // 2b -- that names no executable runtime is its own failure,
+                // whatever state the shared runtime is in. The staged runtime
+                // may be perfectly fine, and "Runtime: Install" would send the
+                // user to repair the wrong thing.
+                title = "\(label)'s runtime is missing"
+                body = "\(label) is set to run on a different Mac.apk runtime, but there is "
+                     + "none at\n\n\(override)\n\n"
+                     + "MACAPK_RUNTIME_ROOT is set either in \(label)'s Environment "
+                     + "overrides in Mac.apk or by whatever launched it."
+            } else if st.removedByUser {
+                title = "The Mac.apk runtime is not installed"
                 body = "The Mac.apk runtime is not installed, so \(label) cannot run.\n\n"
                      + "\(label) and its data are still installed and untouched. "
                      + "Open Mac.apk and choose Runtime: Install to make it work again."
             } else if !st.sourceAvailable {
+                title = "The Mac.apk runtime is not installed"
                 body = "\(label) runs on the Mac.apk runtime, but Mac.apk.app could not "
                      + "be found in /Applications, ~/Applications or via Launch Services, "
                      + "so there is nothing to install the runtime from. "
                      + "Install Mac.apk and try again."
             } else {
+                title = "The Mac.apk runtime is not installed"
                 body = "\(label) runs on the Mac.apk runtime, but it could not be "
                      + "staged from Mac.apk.app. Open Mac.apk and choose "
                      + "Runtime: Install to repair it."
             }
-            fatalAlert("The Mac.apk runtime is not installed", body,
-                       exitCode: 66, openMacApk: macapkApp)
+            fatalAlert(title, body, exitCode: 66, openMacApk: macapkApp)
         }
         // The runtime's identity stamp (JAVA_ID/NATIVE_ID, written by the
-        // build and staged with the payload). One log line that makes a
+        // build and staged with the payload, or shipped with a
+        // MACAPK_RUNTIME_ROOT override). One log line that makes a
         // stale-runtime run diagnosable after the fact; never computed here.
-        if let ids = RuntimeInstall.buildId(at: RuntimeInstall.stagedRoot) {
+        // Read from the runtime about to be exec'd (its Contents-shaped root,
+        // two levels up from the binary): under an override the STAGED stamp
+        // described a build this launch never runs.
+        let runtimeRoot = runtime.deletingLastPathComponent().deletingLastPathComponent()
+        if let ids = RuntimeInstall.buildId(at: runtimeRoot) {
             stubLog("runtime identity: "
                     + ids.split(whereSeparator: \.isNewline).joined(separator: " "))
         } else {
@@ -1092,13 +1136,11 @@ struct AppStubMain {
         // The app's saved environment overrides (the info sheet's "Environment
         // overrides" and its toggles such as "Run in Android TV mode") apply to
         // THIS app on every launch path. They used to reach it only from the
-        // launcher window, so a Dock or Finder launch ignored them.
-        if let dirName,
-           let reg = try? RegistryStore.shared.loadReadOnly(),
-           let row = reg.apps.first(where: { $0.dirName == dirName }) {
-            for (k, v) in row.env {
-                setenv(k, v, 1)
-            }
+        // launcher window, so a Dock or Finder launch ignored them. This is the
+        // snapshot from step 2b: `dirName` may have been migrated since (step
+        // 6b), which moves the row and keeps its env.
+        for (k, v) in savedEnv {
+            setenv(k, v, 1)
         }
         //
         //    SELF-HEAL THE BUNDLE ICON FIRST. A bundle can legitimately reach

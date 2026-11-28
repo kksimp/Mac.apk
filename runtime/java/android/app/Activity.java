@@ -2108,7 +2108,25 @@ public class Activity extends ContextThemeWrapper
 
         @Override public android.view.View getDecorView() {
             ensureDecor();
-            return decor;
+            android.view.View d = decor;
+            // AOSP's DecorView ENCLOSES android.R.id.content, so code that asks
+            // the decor for that id always finds it on a device (ImmersionBar:
+            // getDecorView().findViewById(android.R.id.content).getFitsSystemWindows()).
+            // `decor` here is whatever the last setContentView(View) installed
+            // (an AppCompat sub-decor, see setContentView), and once that view
+            // has a parent it is a view INSIDE the tree: a frame with this id
+            // above it is what the caller is asking for. Measured on Douyin
+            // 32.2.6's login page (DYLoginActivity): getDecorView() returned the
+            // installed root, the root's parent carried android.R.id.content,
+            // root.findViewById(0x1020002) was null, and onCreate died with a
+            // NullPointerException in ImmersionBar.fitsWindowsAboveLOLLIPOP (a
+            // blank page). A decor with no parent, one under a parent without
+            // that id, and one under a non-View parent are returned as before.
+            if (d != null && d.getParent() instanceof android.view.View pv
+                    && pv.getId() == 0x01020002) {
+                d = pv;
+            }
+            return d;
         }
         /** v1.0.100: AOSP semantic -- return decor IFF already created, no
          *  side effect. F-Droid's MainActivity.onCreate checks this to skip

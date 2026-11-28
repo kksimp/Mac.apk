@@ -34362,6 +34362,10 @@ static ssize_t macapk_efd_read_host(int fd, MacapkEventfd& st, void* buf, size_t
             // condition_variable, so a blocking cross-process read is not
             // covered here -- see the docs note's residual risks.
             st.cv.wait(lk, [&] { return st.count != 0; });
+            // A writer posted readiness while the lock was released for the
+            // wait. Reconcile that token before consuming the counter so an
+            // emptied eventfd is not left readable by poll/epoll.
+            macapk_efd_drain_locked(fd, st);
         }
         v = st.semaphore ? 1 : st.count;
         st.count -= v;
